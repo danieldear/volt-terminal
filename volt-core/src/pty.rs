@@ -9,7 +9,7 @@ use crate::performer::Performer;
 
 pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
-    writer: Box<dyn std::io::Write + Send>,
+    writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     pub event_tx: mpsc::UnboundedSender<CoreEvent>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
@@ -48,13 +48,14 @@ impl Pty {
         }
         let child = pair.slave.spawn_command(cmd)?;
 
-        let writer = pair.master.take_writer()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let performer = Arc::new(Mutex::new(Performer::new(cols as usize, rows as usize)));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         // Background reader thread — reads PTY output, feeds VTE parser, fires events
         let mut reader = pair.master.try_clone_reader()?;
         let performer_clone = Arc::clone(&performer);
+        let writer_clone = Arc::clone(&writer);
         let event_tx_clone = event_tx.clone();
         std::thread::spawn(move || {
             let mut parser = Parser::new();
@@ -63,9 +64,20 @@ impl Pty {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let mut p = performer_clone.lock().unwrap();
-                        for &b in &buf[..n] {
-                            parser.advance(&mut *p, b);
+                        let pending = {
+                            let mut p = performer_clone.lock().unwrap();
+                            for &b in &buf[..n] {
+                                parser.advance(&mut *p, b);
+                            }
+                            std::mem::take(&mut p.pending_writes)
+                        };
+                        // Write any queued responses (e.g. cursor position reports) back to the PTY
+                        if !pending.is_empty() {
+                            use std::io::Write;
+                            let mut w = writer_clone.lock().unwrap();
+                            for bytes in pending {
+                                let _ = w.write_all(&bytes);
+                            }
                         }
                         let _ = event_tx_clone.send(CoreEvent::GridUpdated);
                         on_data(); // wake the winit event loop immediately
@@ -89,7 +101,7 @@ impl Pty {
     /// Write bytes to the PTY (keyboard input)
     pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
-        self.writer.write_all(bytes)
+        self.writer.lock().unwrap().write_all(bytes)
     }
 
     /// Resize the PTY

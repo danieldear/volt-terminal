@@ -10,6 +10,8 @@ pub struct Performer {
     current_bold: bool,
     current_italic: bool,
     current_underline: bool,
+    /// Bytes to write back to the PTY (e.g. cursor position reports).
+    pub pending_writes: Vec<Vec<u8>>,
 }
 
 impl Performer {
@@ -21,6 +23,7 @@ impl Performer {
             current_bold: false,
             current_italic: false,
             current_underline: false,
+            pending_writes: Vec::new(),
         }
     }
 
@@ -200,6 +203,15 @@ impl Perform for Performer {
                         Cell::default()
                     };
                     *self.grid.cell_mut(c, row) = src;
+                }
+            }
+            'n' => {
+                // DSR — device status report
+                if Self::param(params, 0) == 6 {
+                    // CPR — cursor position report: respond with ESC[row;colR (1-based)
+                    let row = self.grid.cursor_row + 1;
+                    let col = self.grid.cursor_col + 1;
+                    self.pending_writes.push(format!("\x1b[{};{}R", row, col).into_bytes());
                 }
             }
             'r' => {
@@ -385,6 +397,15 @@ mod tests {
         let mut p = Performer::new(80, 24);
         feed(&mut p, b"AB\x08");
         assert_eq!(p.grid.cursor_col, 1);
+    }
+
+    #[test]
+    fn test_cursor_position_report() {
+        let mut p = Performer::new(80, 24);
+        p.grid.cursor_row = 3;
+        p.grid.cursor_col = 7;
+        feed(&mut p, b"\x1b[6n");
+        assert_eq!(p.pending_writes, vec![b"\x1b[4;8R".to_vec()]);
     }
 
     #[test]
