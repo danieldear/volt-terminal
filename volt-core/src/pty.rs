@@ -64,23 +64,28 @@ impl Pty {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let pending = {
-                            let mut p = performer_clone.lock().unwrap();
-                            for &b in &buf[..n] {
+                        // Process byte-by-byte so responses (e.g. CPR) are flushed immediately
+                        for &b in &buf[..n] {
+                            let pending = {
+                                let mut p = performer_clone.lock().unwrap();
                                 parser.advance(&mut *p, b);
-                            }
-                            std::mem::take(&mut p.pending_writes)
-                        };
-                        // Write any queued responses (e.g. cursor position reports) back to the PTY
-                        if !pending.is_empty() {
-                            use std::io::Write;
-                            let mut w = writer_clone.lock().unwrap();
-                            for bytes in pending {
-                                let _ = w.write_all(&bytes);
+                                if p.pending_writes.is_empty() {
+                                    None
+                                } else {
+                                    Some(std::mem::take(&mut p.pending_writes))
+                                }
+                            };
+                            if let Some(pending) = pending {
+                                use std::io::Write;
+                                let mut w = writer_clone.lock().unwrap();
+                                for bytes in pending {
+                                    let _ = w.write_all(&bytes);
+                                }
+                                let _ = w.flush();
                             }
                         }
                         let _ = event_tx_clone.send(CoreEvent::GridUpdated);
-                        on_data(); // wake the winit event loop immediately
+                        on_data();
                     }
                 }
             }

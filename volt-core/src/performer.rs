@@ -5,11 +5,16 @@ use volt_config::Color;
 
 pub struct Performer {
     pub grid: Grid,
+    use_alt_screen: bool,
+    alt_grid: Grid,
+    saved_cursor_col: usize,
+    saved_cursor_row: usize,
     current_fg: CellColor,
     current_bg: CellColor,
     current_bold: bool,
     current_italic: bool,
     current_underline: bool,
+    pub cursor_visible: bool,
     /// Bytes to write back to the PTY (e.g. cursor position reports).
     pub pending_writes: Vec<Vec<u8>>,
 }
@@ -18,13 +23,24 @@ impl Performer {
     pub fn new(cols: usize, rows: usize) -> Self {
         Self {
             grid: Grid::new(cols, rows),
+            use_alt_screen: false,
+            alt_grid: Grid::new(cols, rows),
+            saved_cursor_col: 0,
+            saved_cursor_row: 0,
             current_fg: CellColor::Default,
             current_bg: CellColor::Default,
             current_bold: false,
             current_italic: false,
             current_underline: false,
+            cursor_visible: true,
             pending_writes: Vec::new(),
         }
+    }
+
+    /// Resize both the main and alt screen grids.
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.grid.resize(cols, rows);
+        self.alt_grid.resize(cols, rows);
     }
 
     fn make_cell(&self, c: char) -> Cell {
@@ -49,6 +65,30 @@ impl Performer {
 
     fn param(params: &vte::Params, idx: usize) -> u16 {
         params.iter().nth(idx).and_then(|s| s.first().copied()).unwrap_or(0)
+    }
+
+    fn enter_alt_screen(&mut self) {
+        if !self.use_alt_screen {
+            self.saved_cursor_col = self.grid.cursor_col;
+            self.saved_cursor_row = self.grid.cursor_row;
+            let cols = self.grid.cols;
+            let rows = self.grid.rows;
+            self.alt_grid.resize(cols, rows);
+            std::mem::swap(&mut self.grid, &mut self.alt_grid);
+            self.grid.erase_all();
+            self.grid.cursor_col = 0;
+            self.grid.cursor_row = 0;
+            self.use_alt_screen = true;
+        }
+    }
+
+    fn exit_alt_screen(&mut self) {
+        if self.use_alt_screen {
+            std::mem::swap(&mut self.grid, &mut self.alt_grid);
+            self.grid.cursor_col = self.saved_cursor_col.min(self.grid.cols.saturating_sub(1));
+            self.grid.cursor_row = self.saved_cursor_row.min(self.grid.rows.saturating_sub(1));
+            self.use_alt_screen = false;
+        }
     }
 }
 
@@ -84,10 +124,11 @@ impl Perform for Performer {
     fn csi_dispatch(
         &mut self,
         params: &vte::Params,
-        _intermediates: &[u8],
+        intermediates: &[u8],
         _ignore: bool,
         action: char,
     ) {
+        let private = intermediates.contains(&b'?');
         match action {
             'A' => {
                 // cursor up
@@ -205,10 +246,49 @@ impl Perform for Performer {
                     *self.grid.cell_mut(c, row) = src;
                 }
             }
+            '@' => {
+                // insert blank characters — shift existing chars right
+                let n = Self::param(params, 0).max(1) as usize;
+                let row = self.grid.cursor_row;
+                let col = self.grid.cursor_col;
+                let cols = self.grid.cols;
+                for c in (col..cols).rev() {
+                    let src = if c >= col + n {
+                        *self.grid.cell(c - n, row)
+                    } else {
+                        Cell::default()
+                    };
+                    *self.grid.cell_mut(c, row) = src;
+                }
+            }
+            'X' => {
+                // erase N characters at cursor position (no cursor movement)
+                let n = Self::param(params, 0).max(1) as usize;
+                let row = self.grid.cursor_row;
+                let col = self.grid.cursor_col;
+                let cols = self.grid.cols;
+                for c in col..(col + n).min(cols) {
+                    *self.grid.cell_mut(c, row) = Cell::default();
+                }
+            }
+            'S' => {
+                // scroll up (pan up): content moves up, blank lines appear at bottom
+                let n = Self::param(params, 0).max(1) as usize;
+                let top = self.grid.scroll_top;
+                let bot = self.grid.scroll_bottom;
+                self.grid.scroll_up(top, bot, n);
+            }
+            'T' => {
+                // scroll down (pan down): content moves down, blank lines appear at top
+                let n = Self::param(params, 0).max(1) as usize;
+                let top = self.grid.scroll_top;
+                let bot = self.grid.scroll_bottom;
+                self.grid.scroll_down(top, bot, n);
+            }
             'n' => {
                 // DSR — device status report
                 if Self::param(params, 0) == 6 {
-                    // CPR — cursor position report: respond with ESC[row;colR (1-based)
+                    // CPR: respond with ESC[row;colR (1-based)
                     let row = self.grid.cursor_row + 1;
                     let col = self.grid.cursor_col + 1;
                     self.pending_writes.push(format!("\x1b[{};{}R", row, col).into_bytes());
@@ -226,6 +306,30 @@ impl Perform for Performer {
                 }
                 self.grid.cursor_col = 0;
                 self.grid.cursor_row = 0;
+            }
+            's' => {
+                // save cursor position (ANSI)
+                self.saved_cursor_col = self.grid.cursor_col;
+                self.saved_cursor_row = self.grid.cursor_row;
+            }
+            'u' => {
+                // restore cursor position (ANSI)
+                self.grid.cursor_col = self.saved_cursor_col.min(self.grid.cols.saturating_sub(1));
+                self.grid.cursor_row = self.saved_cursor_row.min(self.grid.rows.saturating_sub(1));
+            }
+            'h' if private => {
+                match Self::param(params, 0) {
+                    1049 => self.enter_alt_screen(),
+                    25   => self.cursor_visible = true,
+                    _    => {}
+                }
+            }
+            'l' if private => {
+                match Self::param(params, 0) {
+                    1049 => self.exit_alt_screen(),
+                    25   => self.cursor_visible = false,
+                    _    => {}
+                }
             }
             'm' => {
                 // SGR
@@ -249,7 +353,6 @@ impl Perform for Performer {
                         100..=107 => self.current_bg = CellColor::Indexed(p as u8 - 100 + 8),
                         38 | 48 => {
                             let is_fg = p == 38;
-                            // Colon form: 38:5:n or 38:2:r:g:b (sub-params in same entry)
                             if subparams.len() >= 3 && subparams[1] == 5 {
                                 let idx = subparams[2] as u8;
                                 if is_fg { self.current_fg = CellColor::Indexed(idx); }
@@ -258,7 +361,6 @@ impl Perform for Performer {
                                 let c = Color::rgb(subparams[2] as u8, subparams[3] as u8, subparams[4] as u8);
                                 if is_fg { self.current_fg = CellColor::Rgb(c); }
                                 else      { self.current_bg = CellColor::Rgb(c); }
-                            // Semicolon form: 38;5;n or 38;2;r;g;b (separate params, consume from iterator)
                             } else if let Some(next) = iter.next() {
                                 match next.first().copied().unwrap_or(0) {
                                     5 => {
@@ -293,17 +395,25 @@ impl Perform for Performer {
     fn unhook(&mut self) {}
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        // OSC 0 / OSC 2: set window title
         if params.len() >= 2 && (params[0] == b"0" || params[0] == b"2") {
             let _title = String::from_utf8_lossy(params[1]).to_string();
-            // title event will be wired up in Task 5 when we have a channel
         }
     }
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
         match byte {
+            b'7' => {
+                // DEC save cursor
+                self.saved_cursor_col = self.grid.cursor_col;
+                self.saved_cursor_row = self.grid.cursor_row;
+            }
+            b'8' => {
+                // DEC restore cursor
+                self.grid.cursor_col = self.saved_cursor_col.min(self.grid.cols.saturating_sub(1));
+                self.grid.cursor_row = self.saved_cursor_row.min(self.grid.rows.saturating_sub(1));
+            }
             b'M' => {
-                // reverse index: scroll region down by 1 if at scroll_top, else move cursor up
+                // reverse index
                 if self.grid.cursor_row == self.grid.scroll_top {
                     let top = self.grid.scroll_top;
                     let bottom = self.grid.scroll_bottom;
@@ -359,7 +469,7 @@ mod tests {
     fn test_csi_cursor_position() {
         let mut p = Performer::new(80, 24);
         feed(&mut p, b"\x1b[5;10H");
-        assert_eq!(p.grid.cursor_row, 4); // 1-based -> 0-based
+        assert_eq!(p.grid.cursor_row, 4);
         assert_eq!(p.grid.cursor_col, 9);
     }
 
@@ -385,7 +495,7 @@ mod tests {
     #[test]
     fn test_sgr_indexed_color() {
         let mut p = Performer::new(80, 24);
-        feed(&mut p, b"\x1b[31mA"); // red fg = index 1
+        feed(&mut p, b"\x1b[31mA");
         match p.grid.cell(0, 0).fg {
             crate::cell::CellColor::Indexed(1) => {}
             other => panic!("expected Indexed(1), got {:?}", other),
@@ -400,18 +510,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_position_report() {
-        let mut p = Performer::new(80, 24);
-        p.grid.cursor_row = 3;
-        p.grid.cursor_col = 7;
-        feed(&mut p, b"\x1b[6n");
-        assert_eq!(p.pending_writes, vec![b"\x1b[4;8R".to_vec()]);
-    }
-
-    #[test]
     fn test_sgr_colon_form_rgb() {
         let mut p = Performer::new(80, 24);
-        // 38:2:255:0:128 — colon-separated RGB fg
         feed(&mut p, b"\x1b[38:2:255:0:128mA");
         match p.grid.cell(0, 0).fg {
             crate::cell::CellColor::Rgb(c) => {
@@ -421,5 +521,58 @@ mod tests {
             }
             other => panic!("expected Rgb, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_cursor_position_report() {
+        let mut p = Performer::new(80, 24);
+        p.grid.cursor_row = 3;
+        p.grid.cursor_col = 7;
+        feed(&mut p, b"\x1b[6n");
+        assert_eq!(p.pending_writes, vec![b"\x1b[4;8R".to_vec()]);
+    }
+
+    #[test]
+    fn test_alt_screen_switch() {
+        let mut p = Performer::new(80, 24);
+        feed(&mut p, b"Hello");
+        assert_eq!(p.grid.cell(0, 0).c, 'H');
+
+        // Enter alt screen — grid should be cleared
+        feed(&mut p, b"\x1b[?1049h");
+        assert!(p.use_alt_screen);
+        assert_eq!(p.grid.cell(0, 0).c, ' ');
+
+        // Write something on alt screen
+        feed(&mut p, b"Alt");
+        assert_eq!(p.grid.cell(0, 0).c, 'A');
+
+        // Leave alt screen — main screen restored
+        feed(&mut p, b"\x1b[?1049l");
+        assert!(!p.use_alt_screen);
+        assert_eq!(p.grid.cell(0, 0).c, 'H');
+    }
+
+    #[test]
+    fn test_cursor_hide_show() {
+        let mut p = Performer::new(80, 24);
+        assert!(p.cursor_visible);
+        feed(&mut p, b"\x1b[?25l");
+        assert!(!p.cursor_visible);
+        feed(&mut p, b"\x1b[?25h");
+        assert!(p.cursor_visible);
+    }
+
+    #[test]
+    fn test_dec_save_restore_cursor() {
+        let mut p = Performer::new(80, 24);
+        p.grid.cursor_col = 10;
+        p.grid.cursor_row = 5;
+        feed(&mut p, b"\x1b7"); // save
+        p.grid.cursor_col = 0;
+        p.grid.cursor_row = 0;
+        feed(&mut p, b"\x1b8"); // restore
+        assert_eq!(p.grid.cursor_col, 10);
+        assert_eq!(p.grid.cursor_row, 5);
     }
 }

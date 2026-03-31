@@ -150,7 +150,7 @@ impl MainState {
         let (cols, rows) = self.renderer.grid_size();
         for tab in &mut self.tabs {
             let _ = tab.pty.resize(cols as u16, rows as u16);
-            tab.performer.lock().unwrap().grid.resize(cols, rows);
+            tab.performer.lock().unwrap().resize(cols, rows);
         }
         self.window.request_redraw();
     }
@@ -202,12 +202,17 @@ fn config_path() -> Option<PathBuf> {
 fn open_config_in_editor() {
     let Some(path) = config_path() else { return };
 
-    // Write sample config if it doesn't exist yet
     if !path.exists() {
+        // First run: write the fully-documented sample config
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(&path, sample_config_toml());
+    } else if let Ok(existing) = std::fs::read_to_string(&path) {
+        // Old config (created before documentation was added) — replace it
+        if !existing.contains("# Volt Terminal") {
+            let _ = std::fs::write(&path, sample_config_toml());
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -295,7 +300,7 @@ impl ApplicationHandler<VoltEvent> for App {
                 let (cols, rows) = state.renderer.grid_size();
                 for tab in &mut state.tabs {
                     let _ = tab.pty.resize(cols as u16, rows as u16);
-                    tab.performer.lock().unwrap().grid.resize(cols, rows);
+                    tab.performer.lock().unwrap().resize(cols, rows);
                 }
             }
 
@@ -304,7 +309,7 @@ impl ApplicationHandler<VoltEvent> for App {
                 let (cols, rows) = state.renderer.grid_size();
                 for tab in &mut state.tabs {
                     let _ = tab.pty.resize(cols as u16, rows as u16);
-                    tab.performer.lock().unwrap().grid.resize(cols, rows);
+                    tab.performer.lock().unwrap().resize(cols, rows);
                 }
             }
 
@@ -431,7 +436,12 @@ impl ApplicationHandler<VoltEvent> for App {
                     .collect();
 
                 let performer = state.tabs[state.active_tab].performer.lock().unwrap();
-                state.renderer.render_frame(&performer.grid, &state.theme, &tab_entries);
+                state.renderer.render_frame(
+                    &performer.grid,
+                    &state.theme,
+                    &tab_entries,
+                    performer.cursor_visible,
+                );
             }
 
             _ => {}

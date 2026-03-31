@@ -419,6 +419,7 @@ impl Renderer {
         grid: &Grid,
         theme: &Theme,
         tabs: &[TabEntry],
+        cursor_visible: bool,
     ) {
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(o) | wgpu::CurrentSurfaceTexture::Suboptimal(o) => o,
@@ -442,11 +443,20 @@ impl Renderer {
         let mut bg_verts: Vec<BgVertex> = Vec::new();
         let mut glyph_verts: Vec<GlyphVertex> = Vec::new();
 
+        let cursor_col = grid.cursor_col;
+        let cursor_row = grid.cursor_row;
+
         // ── terminal background quads ────────────────────────────────────────
         for row in 0..grid.rows {
             for col in 0..grid.cols {
                 let cell = grid.cell(col, row);
-                let color = cell.bg.resolve_bg(theme).to_f32();
+                let is_cursor = cursor_visible && col == cursor_col && row == cursor_row;
+                // At cursor: invert fg/bg to show a block cursor
+                let color = if is_cursor {
+                    cell.fg.resolve_fg(theme).to_f32()
+                } else {
+                    cell.bg.resolve_bg(theme).to_f32()
+                };
                 let px = phys_pad + col as f32 * cw;
                 let py = tby + phys_pad + row as f32 * ch;
                 self.draw_rect(&mut bg_verts, px, py, cw, ch, color);
@@ -465,12 +475,18 @@ impl Renderer {
                     &mut self.font_system,
                     &cell.c.to_string(),
                     Attrs::new().family(resolve_family(&fam_name)),
-                    Shaping::Basic,
+                    Shaping::Advanced,
                 );
                 buf.shape_until_scroll(&mut self.font_system, false);
 
                 let cell_top = tby + phys_pad + row as f32 * ch;
-                let color = cell.fg.resolve_fg(theme).to_f32();
+                let is_cursor = cursor_visible && col == cursor_col && row == cursor_row;
+                // At cursor: draw glyph in background color (inverted)
+                let color = if is_cursor {
+                    cell.bg.resolve_bg(theme).to_f32()
+                } else {
+                    cell.fg.resolve_fg(theme).to_f32()
+                };
 
                 for run in buf.layout_runs() {
                     for glyph in run.glyphs.iter() {
