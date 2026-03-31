@@ -1,0 +1,13 @@
+[package]
+name = "volt"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "volt"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+volt-ui = { path = "../volt-ui" }
+volt-config = { path = "../volt-config" }

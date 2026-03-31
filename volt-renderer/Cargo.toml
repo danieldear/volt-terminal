@@ -1,0 +1,14 @@
+[package]
+name = "volt-renderer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "0.19"
+winit = "0.29"
+cosmic-text = "0.11"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"
+tokio = { workspace = true }
+volt-core = { path = "../volt-core" }
+volt-config = { path = "../volt-config" }
