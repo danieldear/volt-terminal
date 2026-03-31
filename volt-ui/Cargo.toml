@@ -1,12 +1,12 @@
 [package]
 name = "volt-ui"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-winit = "0.29"
+winit = "0.30"
 pollster = "0.3"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
 volt-core = { path = "../volt-core" }
 volt-renderer = { path = "../volt-renderer" }
 volt-config = { path = "../volt-config" }
