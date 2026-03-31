@@ -8,6 +8,11 @@ pub struct Grid {
     pub cursor_row: usize,
     pub scroll_top: usize,
     pub scroll_bottom: usize,
+    /// Pending-wrap (xenl): set when the last char was printed in the rightmost
+    /// column. The actual line-wrap is deferred until the next `print()` call.
+    /// This matches xterm / ghostty behaviour and prevents zsh PROMPT_SP from
+    /// leaving a visible `%` on its own line.
+    pub pending_wrap: bool,
 }
 
 impl Grid {
@@ -20,6 +25,7 @@ impl Grid {
             cursor_row: 0,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
+            pending_wrap: false,
         }
     }
 
@@ -96,10 +102,11 @@ impl Grid {
     }
 
     pub fn advance_cursor(&mut self) {
-        self.cursor_col += 1;
-        if self.cursor_col >= self.cols {
-            self.cursor_col = 0;
-            self.newline();
+        if self.cursor_col + 1 >= self.cols {
+            // Stay at the last column; the wrap fires on the next print() call.
+            self.pending_wrap = true;
+        } else {
+            self.cursor_col += 1;
         }
     }
 
@@ -153,13 +160,15 @@ mod tests {
     }
 
     #[test]
-    fn test_advance_cursor_wraps() {
+    fn test_advance_cursor_sets_pending_wrap_at_last_col() {
+        // xenl (pending wrap): advance at last col sets the flag but doesn't move yet.
         let mut g = Grid::new(4, 4);
         g.cursor_col = 3;
         g.cursor_row = 0;
         g.advance_cursor();
-        assert_eq!(g.cursor_col, 0);
-        assert_eq!(g.cursor_row, 1);
+        assert!(g.pending_wrap);
+        assert_eq!(g.cursor_col, 3); // stays at last column
+        assert_eq!(g.cursor_row, 0); // row unchanged until next print
     }
 
     #[test]

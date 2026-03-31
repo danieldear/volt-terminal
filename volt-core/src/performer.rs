@@ -94,6 +94,12 @@ impl Performer {
 
 impl Perform for Performer {
     fn print(&mut self, c: char) {
+        // Deferred wrap: fire the pending wrap before placing the new character.
+        if self.grid.pending_wrap {
+            self.grid.pending_wrap = false;
+            self.grid.cursor_col = 0;
+            self.grid.newline();
+        }
         let col = self.grid.cursor_col;
         let row = self.grid.cursor_row;
         if col < self.grid.cols && row < self.grid.rows {
@@ -103,6 +109,8 @@ impl Perform for Performer {
     }
 
     fn execute(&mut self, byte: u8) {
+        // Any C0 control character clears the pending-wrap state.
+        self.grid.pending_wrap = false;
         match byte {
             0x08 => {
                 // BS
@@ -129,6 +137,12 @@ impl Perform for Performer {
         action: char,
     ) {
         let private = intermediates.contains(&b'?');
+        // Cursor-moving sequences clear pending wrap (same as xterm behaviour).
+        match action {
+            'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'f'
+            | 'J' | 'K' | 'r' | 's' | 'u' => self.grid.pending_wrap = false,
+            _ => {}
+        }
         match action {
             'A' => {
                 // cursor up
@@ -409,6 +423,7 @@ impl Perform for Performer {
             }
             b'8' => {
                 // DEC restore cursor
+                self.grid.pending_wrap = false;
                 self.grid.cursor_col = self.saved_cursor_col.min(self.grid.cols.saturating_sub(1));
                 self.grid.cursor_row = self.saved_cursor_row.min(self.grid.rows.saturating_sub(1));
             }

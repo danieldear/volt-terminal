@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, SwashCache};
 use wgpu::util::DeviceExt;
 
 use crate::atlas::CpuAtlas;
@@ -9,6 +10,17 @@ use volt_config::Theme;
 use volt_core::grid::Grid;
 
 const ATLAS_SIZE: u32 = 2048;
+
+/// Positioned glyph from a shaped Buffer run — everything needed to place it
+/// in the atlas and emit vertices, WITHOUT the colour (which varies per cell).
+#[derive(Clone)]
+struct CachedGlyph {
+    cache_key: CacheKey,
+    /// Horizontal advance from the Buffer layout run (physical pixels).
+    glyph_x: f32,
+    /// Baseline y within the cell (physical pixels).
+    line_y: f32,
+}
 
 fn resolve_family(name: &str) -> Family<'_> {
     let n = name.trim();
@@ -48,6 +60,9 @@ pub struct Renderer {
     /// Logical padding (from config), physical = padding * scale_factor
     pub padding: f32,
     pub line_height: f32,
+    /// Per-character shape cache: avoids re-shaping the same glyph every frame.
+    /// Keyed by char; cleared when font family/size/scale changes.
+    shape_cache: HashMap<char, Vec<CachedGlyph>>,
 }
 
 impl Renderer {
@@ -196,6 +211,7 @@ impl Renderer {
             font_family: font_family.to_string(),
             padding,
             line_height,
+            shape_cache: HashMap::new(),
         }
     }
 
@@ -225,6 +241,7 @@ impl Renderer {
         self.cell_height = self.font_size_phys * self.line_height;
         self.tab_bar_height = (38.0 * scale_factor).round();
         self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
+        self.shape_cache.clear();
     }
 
     /// Terminal area in columns / rows (excludes tab bar and padding)
@@ -259,6 +276,41 @@ impl Renderer {
             }
         }
         seen.into_iter().collect()
+    }
+
+    // ── shape cache helpers ──────────────────────────────────────────────────
+
+    /// Shape a single character and return its glyph layout info.
+    /// Called at most once per unique character per font configuration.
+    fn shape_char(
+        font_system: &mut FontSystem,
+        c: char,
+        metrics: Metrics,
+        cell_w: f32,
+        cell_h: f32,
+        fam_name: &str,
+    ) -> Vec<CachedGlyph> {
+        let mut buf = Buffer::new(font_system, metrics);
+        buf.set_size(font_system, cell_w * 2.0, cell_h + 4.0);
+        buf.set_text(
+            font_system,
+            &c.to_string(),
+            Attrs::new().family(resolve_family(fam_name)),
+            Shaping::Basic,
+        );
+        buf.shape_until_scroll(font_system, false);
+        let mut out = Vec::new();
+        for run in buf.layout_runs() {
+            for g in run.glyphs.iter() {
+                let physical = g.physical((0.0, 0.0), 1.0);
+                out.push(CachedGlyph {
+                    cache_key: physical.cache_key,
+                    glyph_x: g.x,
+                    line_y: run.line_y,
+                });
+            }
+        }
+        out
     }
 
     // ── drawing helpers ──────────────────────────────────────────────────────
@@ -464,59 +516,74 @@ impl Renderer {
         }
 
         // ── terminal glyph quads ─────────────────────────────────────────────
+        // Phase 1: populate the shape cache for any characters not yet seen.
+        // We do this in a separate pass so we don't hold a borrow on shape_cache
+        // while also mutating font_system / atlas below.
+        {
+            let mut unseen: Vec<char> = Vec::new();
+            for row in 0..grid.rows {
+                for col in 0..grid.cols {
+                    let c = grid.cell(col, row).c;
+                    if c != ' ' && !self.shape_cache.contains_key(&c) {
+                        unseen.push(c);
+                    }
+                }
+            }
+            unseen.dedup();
+            for c in unseen {
+                let glyphs = Self::shape_char(
+                    &mut self.font_system, c, metrics, cw, ch, &fam_name,
+                );
+                self.shape_cache.insert(c, glyphs);
+            }
+        }
+
+        // Phase 2: emit vertices using the cache — zero Buffer allocations.
         for row in 0..grid.rows {
             for col in 0..grid.cols {
                 let cell = grid.cell(col, row);
                 if cell.c == ' ' { continue; }
 
-                let mut buf = Buffer::new(&mut self.font_system, metrics);
-                buf.set_size(&mut self.font_system, cw + 10.0, ch + 10.0);
-                buf.set_text(
-                    &mut self.font_system,
-                    &cell.c.to_string(),
-                    Attrs::new().family(resolve_family(&fam_name)),
-                    Shaping::Advanced,
-                );
-                buf.shape_until_scroll(&mut self.font_system, false);
-
                 let cell_top = tby + phys_pad + row as f32 * ch;
                 let is_cursor = cursor_visible && col == cursor_col && row == cursor_row;
-                // At cursor: draw glyph in background color (inverted)
                 let color = if is_cursor {
                     cell.bg.resolve_bg(theme).to_f32()
                 } else {
                     cell.fg.resolve_fg(theme).to_f32()
                 };
 
-                for run in buf.layout_runs() {
-                    for glyph in run.glyphs.iter() {
-                        let physical = glyph.physical((0.0, 0.0), 1.0);
-                        let Some(region) = self.atlas.get_or_rasterize(
-                            physical.cache_key,
-                            &mut self.font_system,
-                            &mut self.swash_cache,
-                        ) else { continue };
+                // Clone is cheap: typically a Vec of 1 element (~48 bytes).
+                let glyph_infos = match self.shape_cache.get(&cell.c) {
+                    Some(v) => v.clone(),
+                    None => continue,
+                };
 
-                        let gx = phys_pad + col as f32 * cw + glyph.x + region.offset_x as f32;
-                        let gy = cell_top + run.line_y - region.offset_y as f32;
-                        let gw = region.width as f32;
-                        let gh = region.height as f32;
+                for gi in &glyph_infos {
+                    let Some(region) = self.atlas.get_or_rasterize(
+                        gi.cache_key,
+                        &mut self.font_system,
+                        &mut self.swash_cache,
+                    ) else { continue };
 
-                        let x0 = (gx / sw) * 2.0 - 1.0;
-                        let x1 = ((gx + gw) / sw) * 2.0 - 1.0;
-                        let y0 = 1.0 - (gy / sh) * 2.0;
-                        let y1 = 1.0 - ((gy + gh) / sh) * 2.0;
-                        let [u0, v0, u1, v1] = [region.u0, region.v0, region.u1, region.v1];
+                    let gx = phys_pad + col as f32 * cw + gi.glyph_x + region.offset_x as f32;
+                    let gy = cell_top + gi.line_y - region.offset_y as f32;
+                    let gw = region.width as f32;
+                    let gh = region.height as f32;
 
-                        glyph_verts.extend_from_slice(&[
-                            GlyphVertex { pos: [x0, y0], uv: [u0, v0], color },
-                            GlyphVertex { pos: [x1, y0], uv: [u1, v0], color },
-                            GlyphVertex { pos: [x0, y1], uv: [u0, v1], color },
-                            GlyphVertex { pos: [x1, y0], uv: [u1, v0], color },
-                            GlyphVertex { pos: [x1, y1], uv: [u1, v1], color },
-                            GlyphVertex { pos: [x0, y1], uv: [u0, v1], color },
-                        ]);
-                    }
+                    let x0 = (gx / sw) * 2.0 - 1.0;
+                    let x1 = ((gx + gw) / sw) * 2.0 - 1.0;
+                    let y0 = 1.0 - (gy / sh) * 2.0;
+                    let y1 = 1.0 - ((gy + gh) / sh) * 2.0;
+                    let [u0, v0, u1, v1] = [region.u0, region.v0, region.u1, region.v1];
+
+                    glyph_verts.extend_from_slice(&[
+                        GlyphVertex { pos: [x0, y0], uv: [u0, v0], color },
+                        GlyphVertex { pos: [x1, y0], uv: [u1, v0], color },
+                        GlyphVertex { pos: [x0, y1], uv: [u0, v1], color },
+                        GlyphVertex { pos: [x1, y0], uv: [u1, v0], color },
+                        GlyphVertex { pos: [x1, y1], uv: [u1, v1], color },
+                        GlyphVertex { pos: [x0, y1], uv: [u0, v1], color },
+                    ]);
                 }
             }
         }
