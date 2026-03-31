@@ -91,6 +91,10 @@ impl Grid {
         self.cursor_row = 0;
     }
 
+    pub fn erase_all(&mut self) {
+        for cell in &mut self.cells { *cell = Cell::default(); }
+    }
+
     pub fn advance_cursor(&mut self) {
         self.cursor_col += 1;
         if self.cursor_col >= self.cols {

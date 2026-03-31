@@ -152,7 +152,7 @@ impl Perform for Performer {
                     }
                     self.grid.clear_line(row, 0, col);
                 }
-                2 | 3 => self.grid.clear_screen(),
+                2 | 3 => self.grid.erase_all(),
                 _ => {}
             },
             'K' => match Self::param(params, 0) {
@@ -217,17 +217,11 @@ impl Perform for Performer {
             }
             'm' => {
                 // SGR
-                let params_vec: Vec<u16> = params
-                    .iter()
-                    .filter_map(|s| s.first().copied())
-                    .collect();
-                if params_vec.is_empty() {
-                    self.reset_attrs();
-                    return;
-                }
-                let mut i = 0;
-                while i < params_vec.len() {
-                    match params_vec[i] {
+                let mut iter = params.iter().peekable();
+                if iter.peek().is_none() { self.reset_attrs(); return; }
+                while let Some(subparams) = iter.next() {
+                    let p = subparams.first().copied().unwrap_or(0);
+                    match p {
                         0 => self.reset_attrs(),
                         1 => self.current_bold = true,
                         3 => self.current_italic = true,
@@ -235,47 +229,47 @@ impl Perform for Performer {
                         22 => self.current_bold = false,
                         23 => self.current_italic = false,
                         24 => self.current_underline = false,
-                        30..=37 => {
-                            self.current_fg = CellColor::Indexed(params_vec[i] as u8 - 30)
-                        }
+                        30..=37 => self.current_fg = CellColor::Indexed(p as u8 - 30),
                         39 => self.current_fg = CellColor::Default,
-                        40..=47 => {
-                            self.current_bg = CellColor::Indexed(params_vec[i] as u8 - 40)
-                        }
+                        40..=47 => self.current_bg = CellColor::Indexed(p as u8 - 40),
                         49 => self.current_bg = CellColor::Default,
-                        90..=97 => {
-                            self.current_fg = CellColor::Indexed(params_vec[i] as u8 - 90 + 8)
-                        }
-                        100..=107 => {
-                            self.current_bg = CellColor::Indexed(params_vec[i] as u8 - 100 + 8)
-                        }
+                        90..=97  => self.current_fg = CellColor::Indexed(p as u8 - 90 + 8),
+                        100..=107 => self.current_bg = CellColor::Indexed(p as u8 - 100 + 8),
                         38 | 48 => {
-                            let is_fg = params_vec[i] == 38;
-                            if i + 2 < params_vec.len() && params_vec[i + 1] == 5 {
-                                let idx = params_vec[i + 2] as u8;
-                                if is_fg {
-                                    self.current_fg = CellColor::Indexed(idx);
-                                } else {
-                                    self.current_bg = CellColor::Indexed(idx);
+                            let is_fg = p == 38;
+                            // Colon form: 38:5:n or 38:2:r:g:b (sub-params in same entry)
+                            if subparams.len() >= 3 && subparams[1] == 5 {
+                                let idx = subparams[2] as u8;
+                                if is_fg { self.current_fg = CellColor::Indexed(idx); }
+                                else      { self.current_bg = CellColor::Indexed(idx); }
+                            } else if subparams.len() >= 5 && subparams[1] == 2 {
+                                let c = Color::rgb(subparams[2] as u8, subparams[3] as u8, subparams[4] as u8);
+                                if is_fg { self.current_fg = CellColor::Rgb(c); }
+                                else      { self.current_bg = CellColor::Rgb(c); }
+                            // Semicolon form: 38;5;n or 38;2;r;g;b (separate params, consume from iterator)
+                            } else if let Some(next) = iter.next() {
+                                match next.first().copied().unwrap_or(0) {
+                                    5 => {
+                                        if let Some(idx_param) = iter.next() {
+                                            let idx = idx_param.first().copied().unwrap_or(0) as u8;
+                                            if is_fg { self.current_fg = CellColor::Indexed(idx); }
+                                            else      { self.current_bg = CellColor::Indexed(idx); }
+                                        }
+                                    }
+                                    2 => {
+                                        let r = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                                        let g = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                                        let b = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                                        let c = Color::rgb(r, g, b);
+                                        if is_fg { self.current_fg = CellColor::Rgb(c); }
+                                        else      { self.current_bg = CellColor::Rgb(c); }
+                                    }
+                                    _ => {}
                                 }
-                                i += 2;
-                            } else if i + 4 < params_vec.len() && params_vec[i + 1] == 2 {
-                                let c = Color::rgb(
-                                    params_vec[i + 2] as u8,
-                                    params_vec[i + 3] as u8,
-                                    params_vec[i + 4] as u8,
-                                );
-                                if is_fg {
-                                    self.current_fg = CellColor::Rgb(c);
-                                } else {
-                                    self.current_bg = CellColor::Rgb(c);
-                                }
-                                i += 4;
                             }
                         }
                         _ => {}
                     }
-                    i += 1;
                 }
             }
             _ => {}
@@ -391,5 +385,20 @@ mod tests {
         let mut p = Performer::new(80, 24);
         feed(&mut p, b"AB\x08");
         assert_eq!(p.grid.cursor_col, 1);
+    }
+
+    #[test]
+    fn test_sgr_colon_form_rgb() {
+        let mut p = Performer::new(80, 24);
+        // 38:2:255:0:128 — colon-separated RGB fg
+        feed(&mut p, b"\x1b[38:2:255:0:128mA");
+        match p.grid.cell(0, 0).fg {
+            crate::cell::CellColor::Rgb(c) => {
+                assert_eq!(c.r, 255);
+                assert_eq!(c.g, 0);
+                assert_eq!(c.b, 128);
+            }
+            other => panic!("expected Rgb, got {:?}", other),
+        }
     }
 }
