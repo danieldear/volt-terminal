@@ -11,6 +11,7 @@ pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn std::io::Write + Send>,
     pub event_tx: mpsc::UnboundedSender<CoreEvent>,
+    _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
 impl Pty {
@@ -36,7 +37,7 @@ impl Pty {
         for arg in args {
             cmd.arg(arg);
         }
-        let _child = pair.slave.spawn_command(cmd)?;
+        let child = pair.slave.spawn_command(cmd)?;
 
         let writer = pair.master.take_writer()?;
         let performer = Arc::new(Mutex::new(Performer::new(cols as usize, rows as usize)));
@@ -68,6 +69,7 @@ impl Pty {
                 master: pair.master,
                 writer,
                 event_tx,
+                _child: child,
             },
             performer,
             event_rx,
