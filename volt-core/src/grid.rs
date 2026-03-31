@@ -48,6 +48,20 @@ impl Grid {
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
     }
 
+    pub fn scroll_down(&mut self, top: usize, bottom: usize, count: usize) {
+        for _ in 0..count {
+            for row in (top..bottom).rev() {
+                for col in 0..self.cols {
+                    self.cells[(row + 1) * self.cols + col] = self.cells[row * self.cols + col];
+                    self.cells[(row + 1) * self.cols + col].dirty = true;
+                }
+            }
+            for col in 0..self.cols {
+                self.cells[top * self.cols + col] = Cell::default();
+            }
+        }
+    }
+
     pub fn scroll_up(&mut self, top: usize, bottom: usize, count: usize) {
         for _ in 0..count {
             for row in top..bottom {
@@ -152,6 +166,15 @@ mod tests {
         g.newline();
         assert_eq!(g.cell(0, 0).c, ' ');
         assert_eq!(g.cursor_row, 3); // stays at bottom
+    }
+
+    #[test]
+    fn test_scroll_down_moves_content() {
+        let mut g = Grid::new(80, 24);
+        g.cell_mut(0, 0).c = 'A';
+        g.scroll_down(0, 23, 1);
+        assert_eq!(g.cell(0, 1).c, 'A');
+        assert_eq!(g.cell(0, 0).c, ' ');
     }
 
     #[test]
