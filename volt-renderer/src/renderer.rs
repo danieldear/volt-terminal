@@ -130,8 +130,25 @@ impl Renderer {
         let bg_pl = bg_pipeline(&device, surface_format);
         let glyph_pl = glyph_pipeline(&device, surface_format, &bgl);
 
-        let font_system = FontSystem::new();
-        let cell_width = font_size * 0.6;
+        let mut font_system = FontSystem::new();
+
+        // Bug 2 fix: measure actual advance width of '0' with monospace font
+        let metrics = Metrics::new(font_size, font_size * 1.4);
+        let mut measure_buf = Buffer::new(&mut font_system, metrics);
+        measure_buf.set_size(&mut font_system, 1000.0, font_size * 2.0);
+        measure_buf.set_text(
+            &mut font_system,
+            "0",
+            Attrs::new().family(cosmic_text::Family::Monospace),
+            Shaping::Basic,
+        );
+        measure_buf.shape_until_scroll(&mut font_system, false);
+
+        let cell_width = measure_buf.layout_runs()
+            .next()
+            .and_then(|r| r.glyphs.first())
+            .map(|g| g.w)
+            .unwrap_or(font_size * 0.6);
         let cell_height = font_size * 1.4;
 
         Self {
@@ -236,11 +253,11 @@ impl Renderer {
                 }
 
                 let mut buf = Buffer::new(&mut self.font_system, metrics);
-                buf.set_size(&mut self.font_system, cw * 2.0, ch * 2.0);
+                buf.set_size(&mut self.font_system, cw + 10.0, ch + 10.0);
                 buf.set_text(
                     &mut self.font_system,
                     &cell.c.to_string(),
-                    Attrs::new(),
+                    Attrs::new().family(cosmic_text::Family::Monospace),
                     Shaping::Basic,
                 );
                 buf.shape_until_scroll(&mut self.font_system, false);
@@ -260,7 +277,7 @@ impl Renderer {
 
                         let gx = col as f32 * cw + glyph.x + region.offset_x as f32;
                         let gy =
-                            row as f32 * ch + layout_run.line_y - glyph.y + region.offset_y as f32;
+                            row as f32 * ch + layout_run.line_y - glyph.y - region.offset_y as f32;
                         let gw = region.width as f32;
                         let gh = region.height as f32;
 
