@@ -1,6 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FontConfig {
     #[serde(default = "default_font_family")]
     pub family: String,
@@ -13,7 +13,7 @@ impl Default for FontConfig {
     fn default() -> Self { Self { family: default_font_family(), size: default_font_size() } }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellConfig {
     #[serde(default = "default_shell")]
     pub program: String,
@@ -27,7 +27,7 @@ impl Default for ShellConfig {
     fn default() -> Self { Self { program: default_shell(), args: vec![] } }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub font: FontConfig,
@@ -36,7 +36,7 @@ pub struct Config {
     #[serde(default = "default_theme")]
     pub theme: String,
 }
-fn default_theme() -> String { "dark".to_string() }
+fn default_theme() -> String { "catppuccin".to_string() }
 
 impl Config {
     pub fn load() -> Self {
@@ -50,6 +50,15 @@ impl Config {
             }
         }
         Self::default()
+    }
+
+    pub fn save(&self) {
+        let Some(dir) = dirs::config_dir().map(|d| d.join("volt")) else { return };
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        if let Ok(s) = toml::to_string_pretty(self) {
+            let _ = std::fs::write(path, s);
+        }
     }
 }
 
@@ -77,5 +86,16 @@ mod tests {
         assert_eq!(c.font.family, "JetBrains Mono");
         assert_eq!(c.font.size, 16.0);
         assert_eq!(c.shell.program, "/bin/bash");
+    }
+
+    #[test]
+    fn test_config_roundtrip() {
+        let mut c = Config::default();
+        c.theme = "tokyo-night".to_string();
+        c.font.size = 18.0;
+        let s = toml::to_string_pretty(&c).unwrap();
+        let c2: Config = toml::from_str(&s).unwrap();
+        assert_eq!(c2.theme, "tokyo-night");
+        assert_eq!(c2.font.size, 18.0);
     }
 }

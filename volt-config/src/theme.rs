@@ -21,34 +21,155 @@ pub struct Theme {
     pub background: Color,
     pub foreground: Color,
     pub cursor:     Color,
-    pub ansi: [Color; 16],  // indices 0-7 normal, 8-15 bright
+    pub ansi: [Color; 16],
 }
 
 impl Theme {
+    pub fn names() -> &'static [&'static str] {
+        &["catppuccin", "tokyo-night", "gruvbox", "nord", "dracula"]
+    }
+
+    pub fn by_name(name: &str) -> Self {
+        match name {
+            "tokyo-night" => Self::tokyo_night(),
+            "gruvbox"     => Self::gruvbox(),
+            "nord"        => Self::nord(),
+            "dracula"     => Self::dracula(),
+            _             => Self::dark(), // "catppuccin" or default
+        }
+    }
+
+    /// Catppuccin Mocha
     pub fn dark() -> Self {
         Self {
             background: Color::rgb(24,  24,  37),
             foreground: Color::rgb(202, 211, 245),
             cursor:     Color::rgb(202, 211, 245),
             ansi: [
-                // normal
-                Color::rgb(30,  30,  46),   // black
-                Color::rgb(243, 139, 168),  // red
-                Color::rgb(166, 227, 161),  // green
-                Color::rgb(249, 226, 175),  // yellow
-                Color::rgb(137, 180, 250),  // blue
-                Color::rgb(203, 166, 247),  // magenta
-                Color::rgb(137, 220, 235),  // cyan
-                Color::rgb(166, 173, 200),  // white
-                // bright
-                Color::rgb(88,  91,  112),  // bright black
-                Color::rgb(243, 139, 168),  // bright red
-                Color::rgb(166, 227, 161),  // bright green
-                Color::rgb(249, 226, 175),  // bright yellow
-                Color::rgb(137, 180, 250),  // bright blue
-                Color::rgb(203, 166, 247),  // bright magenta
-                Color::rgb(137, 220, 235),  // bright cyan
-                Color::rgb(186, 194, 222),  // bright white
+                Color::rgb(30,  30,  46),
+                Color::rgb(243, 139, 168),
+                Color::rgb(166, 227, 161),
+                Color::rgb(249, 226, 175),
+                Color::rgb(137, 180, 250),
+                Color::rgb(203, 166, 247),
+                Color::rgb(137, 220, 235),
+                Color::rgb(166, 173, 200),
+                Color::rgb(88,  91,  112),
+                Color::rgb(243, 139, 168),
+                Color::rgb(166, 227, 161),
+                Color::rgb(249, 226, 175),
+                Color::rgb(137, 180, 250),
+                Color::rgb(203, 166, 247),
+                Color::rgb(137, 220, 235),
+                Color::rgb(186, 194, 222),
+            ],
+        }
+    }
+
+    /// Tokyo Night Storm
+    pub fn tokyo_night() -> Self {
+        Self {
+            background: Color::rgb(36,  40,  59),
+            foreground: Color::rgb(192, 202, 245),
+            cursor:     Color::rgb(187, 154, 247),
+            ansi: [
+                Color::rgb(32,  32,  44),
+                Color::rgb(247, 118, 142),
+                Color::rgb(158, 206, 106),
+                Color::rgb(224, 175, 104),
+                Color::rgb(122, 162, 247),
+                Color::rgb(187, 154, 247),
+                Color::rgb(115, 218, 202),
+                Color::rgb(169, 177, 214),
+                Color::rgb(65,  72,  104),
+                Color::rgb(255, 117, 127),
+                Color::rgb(158, 206, 106),
+                Color::rgb(255, 199,  119),
+                Color::rgb(125, 175, 255),
+                Color::rgb(187, 154, 247),
+                Color::rgb(115, 218, 202),
+                Color::rgb(192, 202, 245),
+            ],
+        }
+    }
+
+    /// Gruvbox Dark Hard
+    pub fn gruvbox() -> Self {
+        Self {
+            background: Color::rgb(29,  32,  33),
+            foreground: Color::rgb(235, 219, 178),
+            cursor:     Color::rgb(235, 219, 178),
+            ansi: [
+                Color::rgb(40,  40,  40),
+                Color::rgb(204,  36,  29),
+                Color::rgb(152, 151,  26),
+                Color::rgb(215, 153,  33),
+                Color::rgb(69, 133, 136),
+                Color::rgb(177,  98, 134),
+                Color::rgb(104, 157, 106),
+                Color::rgb(168, 153, 132),
+                Color::rgb(146, 131, 116),
+                Color::rgb(251,  73,  52),
+                Color::rgb(184, 187,  38),
+                Color::rgb(250, 189,  47),
+                Color::rgb(131, 165, 152),
+                Color::rgb(211, 134, 155),
+                Color::rgb(142, 192, 124),
+                Color::rgb(235, 219, 178),
+            ],
+        }
+    }
+
+    /// Nord
+    pub fn nord() -> Self {
+        Self {
+            background: Color::rgb(46,  52,  64),
+            foreground: Color::rgb(216, 222, 233),
+            cursor:     Color::rgb(216, 222, 233),
+            ansi: [
+                Color::rgb(59,  66,  82),
+                Color::rgb(191,  97, 106),
+                Color::rgb(163, 190, 140),
+                Color::rgb(235, 203, 139),
+                Color::rgb(129, 161, 193),
+                Color::rgb(180, 142, 173),
+                Color::rgb(136, 192, 208),
+                Color::rgb(229, 233, 240),
+                Color::rgb(76,  86, 106),
+                Color::rgb(191,  97, 106),
+                Color::rgb(163, 190, 140),
+                Color::rgb(235, 203, 139),
+                Color::rgb(129, 161, 193),
+                Color::rgb(180, 142, 173),
+                Color::rgb(143, 188, 187),
+                Color::rgb(236, 239, 244),
+            ],
+        }
+    }
+
+    /// Dracula
+    pub fn dracula() -> Self {
+        Self {
+            background: Color::rgb(40,  42,  54),
+            foreground: Color::rgb(248, 248, 242),
+            cursor:     Color::rgb(248, 248, 242),
+            ansi: [
+                Color::rgb(33,  34,  44),
+                Color::rgb(255,  85,  85),
+                Color::rgb( 80, 250, 123),
+                Color::rgb(241, 250, 140),
+                Color::rgb(189, 147, 249),
+                Color::rgb(255, 121, 198),
+                Color::rgb(139, 233, 253),
+                Color::rgb(191, 191, 191),
+                Color::rgb( 85,  85,  85),
+                Color::rgb(255, 110, 110),
+                Color::rgb( 90, 255, 148),
+                Color::rgb(255, 255, 153),
+                Color::rgb(202, 169, 255),
+                Color::rgb(255, 153, 215),
+                Color::rgb(154, 237, 254),
+                Color::rgb(255, 255, 255),
             ],
         }
     }

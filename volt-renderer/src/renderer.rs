@@ -1,12 +1,30 @@
 use std::sync::Arc;
 
-use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache};
 use wgpu::util::DeviceExt;
 
 use crate::atlas::CpuAtlas;
 use crate::pipeline::{bg_pipeline, glyph_pipeline, BgVertex, GlyphVertex};
 use volt_config::Theme;
 use volt_core::grid::Grid;
+
+const ATLAS_SIZE: u32 = 2048;
+
+/// One entry for the tab bar
+pub struct TabEntry<'a> {
+    pub title: &'a str,
+    pub active: bool,
+    pub index: usize, // 1-based
+}
+
+/// Data for the settings overlay
+pub struct SettingsOverlay<'a> {
+    pub font_size: f32,
+    pub font_family: &'a str,
+    pub theme_names: &'a [&'static str],
+    pub theme_idx: usize,
+    pub focused_field: u8, // 0=theme 1=font_family 2=font_size
+}
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -22,11 +40,13 @@ pub struct Renderer {
     swash_cache: SwashCache,
     pub cell_width: f32,
     pub cell_height: f32,
-    font_size: f32,
+    pub tab_bar_height: f32,
+    pub scale_factor: f32,
+    font_size_phys: f32, // font_size * scale_factor
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<winit::window::Window>, font_size: f32) -> Self {
+    pub async fn new(window: Arc<winit::window::Window>, font_size: f32, scale_factor: f32) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -69,8 +89,6 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        // Atlas texture (R8 single channel, 1024x1024)
-        const ATLAS_SIZE: u32 = 1024;
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph_atlas"),
             size: wgpu::Extent3d {
@@ -132,24 +150,27 @@ impl Renderer {
 
         let mut font_system = FontSystem::new();
 
-        // Bug 2 fix: measure actual advance width of '0' with monospace font
-        let metrics = Metrics::new(font_size, font_size * 1.4);
+        // Measure cell dimensions at physical pixel size
+        let font_size_phys = font_size * scale_factor;
+        let metrics = Metrics::new(font_size_phys, font_size_phys * 1.4);
         let mut measure_buf = Buffer::new(&mut font_system, metrics);
-        measure_buf.set_size(&mut font_system, 1000.0, font_size * 2.0);
+        measure_buf.set_size(&mut font_system, 1000.0, font_size_phys * 2.0);
         measure_buf.set_text(
             &mut font_system,
             "0",
-            Attrs::new().family(cosmic_text::Family::Monospace),
+            Attrs::new().family(Family::Monospace),
             Shaping::Basic,
         );
         measure_buf.shape_until_scroll(&mut font_system, false);
 
-        let cell_width = measure_buf.layout_runs()
+        let cell_width = measure_buf
+            .layout_runs()
             .next()
             .and_then(|r| r.glyphs.first())
             .map(|g| g.w)
-            .unwrap_or(font_size * 0.6);
-        let cell_height = font_size * 1.4;
+            .unwrap_or(font_size_phys * 0.6);
+        let cell_height = font_size_phys * 1.4;
+        let tab_bar_height = (38.0 * scale_factor).round();
 
         Self {
             surface,
@@ -165,7 +186,9 @@ impl Renderer {
             swash_cache: SwashCache::new(),
             cell_width,
             cell_height,
-            font_size,
+            tab_bar_height,
+            scale_factor,
+            font_size_phys,
         }
     }
 
@@ -178,14 +201,225 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Returns (cols, rows) based on current surface size and cell dimensions
+    pub fn update_scale(&mut self, scale_factor: f32, font_size: f32) {
+        self.scale_factor = scale_factor;
+        self.font_size_phys = font_size * scale_factor;
+        let metrics = Metrics::new(self.font_size_phys, self.font_size_phys * 1.4);
+        let mut measure_buf = Buffer::new(&mut self.font_system, metrics);
+        measure_buf.set_size(&mut self.font_system, 1000.0, self.font_size_phys * 2.0);
+        measure_buf.set_text(
+            &mut self.font_system,
+            "0",
+            Attrs::new().family(Family::Monospace),
+            Shaping::Basic,
+        );
+        measure_buf.shape_until_scroll(&mut self.font_system, false);
+        self.cell_width = measure_buf
+            .layout_runs()
+            .next()
+            .and_then(|r| r.glyphs.first())
+            .map(|g| g.w)
+            .unwrap_or(self.font_size_phys * 0.6);
+        self.cell_height = self.font_size_phys * 1.4;
+        self.tab_bar_height = (38.0 * scale_factor).round();
+        // Invalidate glyph atlas since font size changed
+        self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
+    }
+
+    /// Terminal area size in columns and rows (excludes tab bar)
     pub fn grid_size(&self) -> (usize, usize) {
+        let term_h = self.config.height as f32 - self.tab_bar_height;
         let cols = (self.config.width as f32 / self.cell_width).floor() as usize;
-        let rows = (self.config.height as f32 / self.cell_height).floor() as usize;
+        let rows = (term_h / self.cell_height).floor() as usize;
         (cols.max(1), rows.max(1))
     }
 
-    pub fn render(&mut self, grid: &Grid, theme: &Theme) {
+    // ── drawing helpers ──────────────────────────────────────────────────────
+
+    /// Push a filled rect (physical pixels) into bg_verts.
+    fn draw_rect(
+        &self,
+        bg: &mut Vec<BgVertex>,
+        px: f32, py: f32, pw: f32, ph: f32,
+        color: [f32; 4],
+    ) {
+        let sw = self.config.width as f32;
+        let sh = self.config.height as f32;
+        let x0 = (px / sw) * 2.0 - 1.0;
+        let x1 = ((px + pw) / sw) * 2.0 - 1.0;
+        let y0 = 1.0 - (py / sh) * 2.0;
+        let y1 = 1.0 - ((py + ph) / sh) * 2.0;
+        bg.extend_from_slice(&[
+            BgVertex { pos: [x0, y0], color },
+            BgVertex { pos: [x1, y0], color },
+            BgVertex { pos: [x0, y1], color },
+            BgVertex { pos: [x1, y0], color },
+            BgVertex { pos: [x1, y1], color },
+            BgVertex { pos: [x0, y1], color },
+        ]);
+    }
+
+    /// Render a text string starting at physical pixel (px, py) = top-left of text.
+    fn draw_text(
+        &mut self,
+        glyphs: &mut Vec<GlyphVertex>,
+        text: &str,
+        px: f32, py: f32,
+        font_size_phys: f32,
+        color: [f32; 4],
+    ) {
+        let sw = self.config.width as f32;
+        let sh = self.config.height as f32;
+        let metrics = Metrics::new(font_size_phys, font_size_phys * 1.4);
+        let mut buf = Buffer::new(&mut self.font_system, metrics);
+        buf.set_size(&mut self.font_system, sw, font_size_phys * 2.0);
+        buf.set_text(&mut self.font_system, text, Attrs::new().family(Family::Monospace), Shaping::Basic);
+        buf.shape_until_scroll(&mut self.font_system, false);
+
+        for run in buf.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                let physical = glyph.physical((0.0, 0.0), 1.0);
+                let Some(region) = self.atlas.get_or_rasterize(
+                    physical.cache_key,
+                    &mut self.font_system,
+                    &mut self.swash_cache,
+                ) else {
+                    continue;
+                };
+                let gx = px + glyph.x + region.offset_x as f32;
+                // line_y is baseline from buffer top; offset_y = placement.top (pixels above baseline)
+                let gy = py + run.line_y - region.offset_y as f32;
+                let gw = region.width as f32;
+                let gh = region.height as f32;
+
+                let x0 = (gx / sw) * 2.0 - 1.0;
+                let x1 = ((gx + gw) / sw) * 2.0 - 1.0;
+                let y0 = 1.0 - (gy / sh) * 2.0;
+                let y1 = 1.0 - ((gy + gh) / sh) * 2.0;
+                let [u0, v0, u1, v1] = [region.u0, region.v0, region.u1, region.v1];
+                glyphs.extend_from_slice(&[
+                    GlyphVertex { pos: [x0, y0], uv: [u0, v0], color },
+                    GlyphVertex { pos: [x1, y0], uv: [u1, v0], color },
+                    GlyphVertex { pos: [x0, y1], uv: [u0, v1], color },
+                    GlyphVertex { pos: [x1, y0], uv: [u1, v0], color },
+                    GlyphVertex { pos: [x1, y1], uv: [u1, v1], color },
+                    GlyphVertex { pos: [x0, y1], uv: [u0, v1], color },
+                ]);
+            }
+        }
+    }
+
+    // ── settings overlay ─────────────────────────────────────────────────────
+
+    fn render_settings(
+        &mut self,
+        bg: &mut Vec<BgVertex>,
+        glyphs: &mut Vec<GlyphVertex>,
+        s: &SettingsOverlay,
+    ) {
+        let sw = self.config.width as f32;
+        let sh = self.config.height as f32;
+        let sc = self.scale_factor;
+
+        // Dim overlay
+        self.draw_rect(bg, 0.0, 0.0, sw, sh, [0.0, 0.0, 0.0, 0.65]);
+
+        // Panel dimensions
+        let pw = (480.0 * sc).min(sw - 40.0 * sc);
+        let ph = (360.0 * sc).min(sh - 40.0 * sc);
+        let px = ((sw - pw) / 2.0).round();
+        let py = ((sh - ph) / 2.0).round();
+
+        // Panel background
+        self.draw_rect(bg, px, py, pw, ph, [0.12, 0.12, 0.16, 1.0]);
+        // Panel border
+        self.draw_rect(bg, px, py, pw, 1.0, [0.30, 0.30, 0.40, 1.0]);
+        self.draw_rect(bg, px, py + ph - 1.0, pw, 1.0, [0.30, 0.30, 0.40, 1.0]);
+        self.draw_rect(bg, px, py, 1.0, ph, [0.30, 0.30, 0.40, 1.0]);
+        self.draw_rect(bg, px + pw - 1.0, py, 1.0, ph, [0.30, 0.30, 0.40, 1.0]);
+
+        let hdr_font = (16.0 * sc).round();
+        let lbl_font = (13.0 * sc).round();
+        let val_font = (13.0 * sc).round();
+        let pad = 20.0 * sc;
+        let row_h = 34.0 * sc;
+        let hdr_color = [0.85_f32, 0.85, 0.90, 1.0];
+        let lbl_color = [0.60_f32, 0.60, 0.65, 1.0];
+        let val_color = [0.90_f32, 0.90, 0.95, 1.0];
+        let focus_color = [0.38_f32, 0.57, 0.96, 1.0];
+
+        // Title
+        self.draw_text(glyphs, "Settings", px + pad, py + pad, hdr_font, hdr_color);
+
+        // ── APPEARANCE section ───────────────────────────────────────────────
+        let sec_y = py + pad + hdr_font * 1.6 + 8.0 * sc;
+        self.draw_text(glyphs, "APPEARANCE", px + pad, sec_y, (10.0 * sc).round(), [0.45, 0.45, 0.55, 1.0]);
+
+        // Theme row
+        let row1_y = sec_y + (10.0 * sc) * 1.4 + 6.0 * sc;
+        self.draw_text(glyphs, "Theme", px + pad, row1_y, lbl_font, lbl_color);
+
+        let field_x = px + pad + 90.0 * sc;
+        let field_w = pw - pad - 90.0 * sc - pad;
+        let field_h = row_h * 0.8;
+        let f0_focused = s.focused_field == 0;
+        let f0_border = if f0_focused { focus_color } else { [0.25, 0.25, 0.32, 1.0] };
+        self.draw_rect(bg, field_x, row1_y - 2.0 * sc, field_w, field_h, [0.17, 0.17, 0.22, 1.0]);
+        self.draw_rect(bg, field_x, row1_y - 2.0 * sc, field_w, 1.0, f0_border);
+        self.draw_rect(bg, field_x, row1_y - 2.0 * sc + field_h - 1.0, field_w, 1.0, f0_border);
+        let theme_name = s.theme_names.get(s.theme_idx).copied().unwrap_or("dark");
+        self.draw_text(glyphs, theme_name, field_x + 6.0 * sc, row1_y, val_font, val_color);
+
+        // ── FONT section ─────────────────────────────────────────────────────
+        let sec2_y = row1_y + row_h + 16.0 * sc;
+        self.draw_text(glyphs, "FONT", px + pad, sec2_y, (10.0 * sc).round(), [0.45, 0.45, 0.55, 1.0]);
+
+        // Font family
+        let row2_y = sec2_y + (10.0 * sc) * 1.4 + 6.0 * sc;
+        self.draw_text(glyphs, "Family", px + pad, row2_y, lbl_font, lbl_color);
+        let f1_focused = s.focused_field == 1;
+        let f1_border = if f1_focused { focus_color } else { [0.25, 0.25, 0.32, 1.0] };
+        self.draw_rect(bg, field_x, row2_y - 2.0 * sc, field_w, field_h, [0.17, 0.17, 0.22, 1.0]);
+        self.draw_rect(bg, field_x, row2_y - 2.0 * sc, field_w, 1.0, f1_border);
+        self.draw_rect(bg, field_x, row2_y - 2.0 * sc + field_h - 1.0, field_w, 1.0, f1_border);
+        let family_display = if f1_focused {
+            format!("{}|", s.font_family)
+        } else {
+            s.font_family.to_string()
+        };
+        self.draw_text(glyphs, &family_display, field_x + 6.0 * sc, row2_y, val_font, val_color);
+
+        // Font size
+        let row3_y = row2_y + row_h;
+        self.draw_text(glyphs, "Size", px + pad, row3_y, lbl_font, lbl_color);
+        let f2_focused = s.focused_field == 2;
+        let f2_border = if f2_focused { focus_color } else { [0.25, 0.25, 0.32, 1.0] };
+        let size_field_w = 80.0 * sc;
+        self.draw_rect(bg, field_x, row3_y - 2.0 * sc, size_field_w, field_h, [0.17, 0.17, 0.22, 1.0]);
+        self.draw_rect(bg, field_x, row3_y - 2.0 * sc, size_field_w, 1.0, f2_border);
+        self.draw_rect(bg, field_x, row3_y - 2.0 * sc + field_h - 1.0, size_field_w, 1.0, f2_border);
+        self.draw_text(glyphs, &format!("{}", s.font_size as u32), field_x + 6.0 * sc, row3_y, val_font, val_color);
+        // +/- buttons
+        let btn_x = field_x + size_field_w + 8.0 * sc;
+        self.draw_rect(bg, btn_x, row3_y - 2.0 * sc, 26.0 * sc, field_h, [0.20, 0.20, 0.27, 1.0]);
+        self.draw_text(glyphs, "-", btn_x + 8.0 * sc, row3_y, val_font, val_color);
+        self.draw_rect(bg, btn_x + 30.0 * sc, row3_y - 2.0 * sc, 26.0 * sc, field_h, [0.20, 0.20, 0.27, 1.0]);
+        self.draw_text(glyphs, "+", btn_x + 30.0 * sc + 8.0 * sc, row3_y, val_font, val_color);
+
+        // Hint at bottom
+        let hint_y = py + ph - pad - lbl_font * 1.4;
+        self.draw_text(glyphs, "Tab/Shift+Tab: cycle fields   Up/Down: change value   Esc: close", px + pad, hint_y, (10.0 * sc).round(), [0.40, 0.40, 0.50, 1.0]);
+    }
+
+    // ── main render entry point ───────────────────────────────────────────────
+
+    pub fn render_frame(
+        &mut self,
+        grid: &Grid,
+        theme: &Theme,
+        tabs: &[TabEntry],
+        settings: Option<&SettingsOverlay>,
+    ) {
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(o) | wgpu::CurrentSurfaceTexture::Suboptimal(o) => o,
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
@@ -196,55 +430,28 @@ impl Renderer {
         };
         let view = output.texture.create_view(&Default::default());
 
-        let w = self.config.width as f32;
-        let h = self.config.height as f32;
+        let sw = self.config.width as f32;
+        let sh = self.config.height as f32;
         let cw = self.cell_width;
         let ch = self.cell_height;
+        let tby = self.tab_bar_height;
+        let metrics = Metrics::new(self.font_size_phys, ch);
 
-        // --- Background quads ---
-        let mut bg_verts: Vec<BgVertex> = Vec::with_capacity(grid.cols * grid.rows * 6);
+        let mut bg_verts: Vec<BgVertex> = Vec::new();
+        let mut glyph_verts: Vec<GlyphVertex> = Vec::new();
+
+        // ── terminal background quads ────────────────────────────────────────
         for row in 0..grid.rows {
             for col in 0..grid.cols {
                 let cell = grid.cell(col, row);
                 let color = cell.bg.resolve_bg(theme).to_f32();
-                let x0 = (col as f32 * cw / w) * 2.0 - 1.0;
-                let x1 = ((col as f32 + 1.0) * cw / w) * 2.0 - 1.0;
-                let y0 = 1.0 - (row as f32 * ch / h) * 2.0;
-                let y1 = 1.0 - ((row as f32 + 1.0) * ch / h) * 2.0;
-                // Two triangles per quad
-                bg_verts.extend_from_slice(&[
-                    BgVertex {
-                        pos: [x0, y0],
-                        color,
-                    },
-                    BgVertex {
-                        pos: [x1, y0],
-                        color,
-                    },
-                    BgVertex {
-                        pos: [x0, y1],
-                        color,
-                    },
-                    BgVertex {
-                        pos: [x1, y0],
-                        color,
-                    },
-                    BgVertex {
-                        pos: [x1, y1],
-                        color,
-                    },
-                    BgVertex {
-                        pos: [x0, y1],
-                        color,
-                    },
-                ]);
+                let px = col as f32 * cw;
+                let py = tby + row as f32 * ch;
+                self.draw_rect(&mut bg_verts, px, py, cw, ch, color);
             }
         }
 
-        // --- Glyph quads ---
-        let mut glyph_verts: Vec<GlyphVertex> = Vec::new();
-        let metrics = Metrics::new(self.font_size, ch);
-
+        // ── terminal glyph quads ─────────────────────────────────────────────
         for row in 0..grid.rows {
             for col in 0..grid.cols {
                 let cell = grid.cell(col, row);
@@ -257,18 +464,19 @@ impl Renderer {
                 buf.set_text(
                     &mut self.font_system,
                     &cell.c.to_string(),
-                    Attrs::new().family(cosmic_text::Family::Monospace),
+                    Attrs::new().family(Family::Monospace),
                     Shaping::Basic,
                 );
                 buf.shape_until_scroll(&mut self.font_system, false);
 
-                for layout_run in buf.layout_runs() {
-                    for glyph in layout_run.glyphs.iter() {
-                        let physical = glyph.physical((0.0, 0.0), 1.0);
-                        let cache_key = physical.cache_key;
+                let cell_top = tby + row as f32 * ch;
+                let color = cell.fg.resolve_fg(theme).to_f32();
 
+                for run in buf.layout_runs() {
+                    for glyph in run.glyphs.iter() {
+                        let physical = glyph.physical((0.0, 0.0), 1.0);
                         let Some(region) = self.atlas.get_or_rasterize(
-                            cache_key,
+                            physical.cache_key,
                             &mut self.font_system,
                             &mut self.swash_cache,
                         ) else {
@@ -276,57 +484,90 @@ impl Renderer {
                         };
 
                         let gx = col as f32 * cw + glyph.x + region.offset_x as f32;
-                        let gy =
-                            row as f32 * ch + layout_run.line_y - glyph.y - region.offset_y as f32;
+                        // Correct: baseline from cell top + line_y, minus placement.top
+                        let gy = cell_top + run.line_y - region.offset_y as f32;
                         let gw = region.width as f32;
                         let gh = region.height as f32;
 
-                        let x0 = (gx / w) * 2.0 - 1.0;
-                        let x1 = ((gx + gw) / w) * 2.0 - 1.0;
-                        let y0 = 1.0 - (gy / h) * 2.0;
-                        let y1 = 1.0 - ((gy + gh) / h) * 2.0;
-
-                        let color = cell.fg.resolve_fg(theme).to_f32();
+                        let x0 = (gx / sw) * 2.0 - 1.0;
+                        let x1 = ((gx + gw) / sw) * 2.0 - 1.0;
+                        let y0 = 1.0 - (gy / sh) * 2.0;
+                        let y1 = 1.0 - ((gy + gh) / sh) * 2.0;
                         let [u0, v0, u1, v1] = [region.u0, region.v0, region.u1, region.v1];
 
                         glyph_verts.extend_from_slice(&[
-                            GlyphVertex {
-                                pos: [x0, y0],
-                                uv: [u0, v0],
-                                color,
-                            },
-                            GlyphVertex {
-                                pos: [x1, y0],
-                                uv: [u1, v0],
-                                color,
-                            },
-                            GlyphVertex {
-                                pos: [x0, y1],
-                                uv: [u0, v1],
-                                color,
-                            },
-                            GlyphVertex {
-                                pos: [x1, y0],
-                                uv: [u1, v0],
-                                color,
-                            },
-                            GlyphVertex {
-                                pos: [x1, y1],
-                                uv: [u1, v1],
-                                color,
-                            },
-                            GlyphVertex {
-                                pos: [x0, y1],
-                                uv: [u0, v1],
-                                color,
-                            },
+                            GlyphVertex { pos: [x0, y0], uv: [u0, v0], color },
+                            GlyphVertex { pos: [x1, y0], uv: [u1, v0], color },
+                            GlyphVertex { pos: [x0, y1], uv: [u0, v1], color },
+                            GlyphVertex { pos: [x1, y0], uv: [u1, v0], color },
+                            GlyphVertex { pos: [x1, y1], uv: [u1, v1], color },
+                            GlyphVertex { pos: [x0, y1], uv: [u0, v1], color },
                         ]);
                     }
                 }
             }
         }
 
-        // Upload atlas if dirty
+        // ── tab bar ──────────────────────────────────────────────────────────
+        // Collect tab data to avoid borrow issues
+        let tab_data: Vec<(String, bool, usize)> = tabs
+            .iter()
+            .map(|t| (t.title.to_string(), t.active, t.index))
+            .collect();
+
+        // Draw tab bar background
+        self.draw_rect(&mut bg_verts, 0.0, 0.0, sw, tby, [0.11, 0.11, 0.14, 1.0]);
+
+        let sc = self.scale_factor;
+        let left_pad = (78.0 * sc).round();
+        let tab_w = if !tab_data.is_empty() {
+            ((sw - left_pad - 40.0 * sc) / tab_data.len() as f32).min(240.0 * sc)
+        } else {
+            0.0
+        };
+        let tab_font = (12.0 * sc).round();
+        let pad_v = (tby - tab_font * 1.4) / 2.0;
+
+        for (i, (title, active, _idx)) in tab_data.iter().enumerate() {
+            let tx = left_pad + i as f32 * tab_w;
+            if *active {
+                self.draw_rect(&mut bg_verts, tx, 0.0, tab_w, tby, [0.20, 0.20, 0.25, 1.0]);
+                self.draw_rect(&mut bg_verts, tx, tby - 2.0, tab_w, 2.0, [0.38, 0.57, 0.96, 1.0]);
+            }
+            if i > 0 {
+                self.draw_rect(&mut bg_verts, tx, 6.0 * sc, 1.0, tby - 12.0 * sc, [0.25, 0.25, 0.30, 1.0]);
+            }
+            let color = if *active {
+                [0.90_f32, 0.90, 0.95, 1.0]
+            } else {
+                [0.65_f32, 0.65, 0.70, 1.0]
+            };
+            self.draw_text(&mut glyph_verts, title, tx + 8.0 * sc, pad_v, tab_font, color);
+        }
+        if !tab_data.is_empty() {
+            let plus_x = left_pad + tab_data.len() as f32 * tab_w + 8.0 * sc;
+            self.draw_text(&mut glyph_verts, "+", plus_x, pad_v, tab_font, [0.45, 0.45, 0.50, 1.0]);
+        }
+
+        // ── settings overlay ─────────────────────────────────────────────────
+        if let Some(s) = settings {
+            // Collect data to avoid multiple borrows
+            let font_size = s.font_size;
+            let font_family = s.font_family.to_string();
+            let theme_names: Vec<&'static str> = s.theme_names.to_vec();
+            let theme_idx = s.theme_idx;
+            let focused_field = s.focused_field;
+            let overlay = SettingsOverlay {
+                font_size,
+                font_family: &font_family,
+                theme_names: &theme_names,
+                theme_idx,
+                focused_field,
+            };
+            self.render_settings(&mut bg_verts, &mut glyph_verts, &overlay);
+        }
+
+        // ── upload atlas if dirty ─────────────────────────────────────────────
         if self.atlas.dirty {
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -350,40 +591,29 @@ impl Renderer {
             self.atlas.dirty = false;
         }
 
-        // Create GPU buffers
-        let bg_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("bg_verts"),
-                contents: bytemuck::cast_slice(&bg_verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+        // ── GPU buffers ───────────────────────────────────────────────────────
+        let bg_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bg_verts"),
+            contents: bytemuck::cast_slice(&bg_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
 
-        // glyph_buf needs at least 1 vertex to avoid empty buffer
         let glyph_buf = if glyph_verts.is_empty() {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("glyph_verts_empty"),
-                    contents: bytemuck::cast_slice(&[GlyphVertex {
-                        pos: [0.0; 2],
-                        uv: [0.0; 2],
-                        color: [0.0; 4],
-                    }]),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("glyph_empty"),
+                contents: bytemuck::cast_slice(&[GlyphVertex { pos: [0.0; 2], uv: [0.0; 2], color: [0.0; 4] }]),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
         } else {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("glyph_verts"),
-                    contents: bytemuck::cast_slice(&glyph_verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("glyph_verts"),
+                contents: bytemuck::cast_slice(&glyph_verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
         };
 
         let bg_color = theme.background.to_f32();
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -407,12 +637,10 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            // Draw backgrounds
             pass.set_pipeline(&self.bg_pipeline);
             pass.set_vertex_buffer(0, bg_buf.slice(..));
             pass.draw(0..bg_verts.len() as u32, 0..1);
 
-            // Draw glyphs
             if !glyph_verts.is_empty() {
                 pass.set_pipeline(&self.glyph_pipeline);
                 pass.set_bind_group(0, &self.atlas_bind_group, &[]);

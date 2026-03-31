@@ -3,4 +3,4 @@ pub mod pipeline;
 pub mod renderer;
 
 pub use atlas::{AtlasRegion, CpuAtlas};
-pub use renderer::Renderer;
+pub use renderer::{Renderer, SettingsOverlay, TabEntry};

@@ -10,3 +10,5 @@ tokio = { workspace = true, features = ["rt", "sync"] }
 volt-core = { path = "../volt-core" }
 volt-renderer = { path = "../volt-renderer" }
 volt-config = { path = "../volt-config" }
+dirs = "5"
+anyhow = { workspace = true }
