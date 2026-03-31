@@ -1,5 +1,7 @@
-AGENTS.md 
+AGENTS.md
 .zed
 .claude
 .agent007
 .cursor
+target/
+Cargo.lock
