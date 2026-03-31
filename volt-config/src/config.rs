@@ -23,8 +23,9 @@ pub struct ShellConfig {
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
+fn default_shell_args() -> Vec<String> { vec!["-l".to_string()] }
 impl Default for ShellConfig {
-    fn default() -> Self { Self { program: default_shell(), args: vec![] } }
+    fn default() -> Self { Self { program: default_shell(), args: default_shell_args() } }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

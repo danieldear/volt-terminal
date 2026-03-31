@@ -263,6 +263,7 @@ impl WindowState {
         self.config.font.size = self.settings.font_size;
         self.config.font.family = self.settings.font_family.clone();
         self.config.save();
+        self.renderer.font_family = self.settings.font_family.clone();
         self.renderer.update_scale(self.renderer.scale_factor, self.settings.font_size);
         let (cols, rows) = self.renderer.grid_size();
         for tab in &mut self.tabs {
@@ -356,7 +357,7 @@ impl ApplicationHandler for App {
 
         let window = Arc::new(event_loop.create_window(window_attrs).unwrap());
         let scale_factor = window.scale_factor() as f32;
-        let renderer = self.rt.block_on(Renderer::new(window.clone(), self.config.font.size, scale_factor));
+        let renderer = self.rt.block_on(Renderer::new(window.clone(), self.config.font.size, scale_factor, &self.config.font.family));
         let (cols, rows) = renderer.grid_size();
 
         let first_tab = TerminalTab::spawn(&self.config, cols as u16, rows as u16)

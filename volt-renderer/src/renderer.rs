@@ -10,6 +10,17 @@ use volt_core::grid::Grid;
 
 const ATLAS_SIZE: u32 = 2048;
 
+/// Resolve a font family name to a cosmic-text `Family`.
+/// Falls back to Monospace if the name is empty or "monospace".
+fn resolve_family(name: &str) -> Family<'_> {
+    let n = name.trim();
+    if n.is_empty() || n.eq_ignore_ascii_case("monospace") {
+        Family::Monospace
+    } else {
+        Family::Name(n)
+    }
+}
+
 /// One entry for the tab bar
 pub struct TabEntry<'a> {
     pub title: &'a str,
@@ -43,10 +54,11 @@ pub struct Renderer {
     pub tab_bar_height: f32,
     pub scale_factor: f32,
     font_size_phys: f32, // font_size * scale_factor
+    pub font_family: String,
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<winit::window::Window>, font_size: f32, scale_factor: f32) -> Self {
+    pub async fn new(window: Arc<winit::window::Window>, font_size: f32, scale_factor: f32, font_family: &str) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -161,13 +173,14 @@ impl Renderer {
 
         // Measure cell dimensions at physical pixel size
         let font_size_phys = font_size * scale_factor;
+        let resolved_family = resolve_family(font_family);
         let metrics = Metrics::new(font_size_phys, font_size_phys * 1.4);
         let mut measure_buf = Buffer::new(&mut font_system, metrics);
         measure_buf.set_size(&mut font_system, 1000.0, font_size_phys * 2.0);
         measure_buf.set_text(
             &mut font_system,
             "0",
-            Attrs::new().family(Family::Monospace),
+            Attrs::new().family(resolved_family),
             Shaping::Basic,
         );
         measure_buf.shape_until_scroll(&mut font_system, false);
@@ -198,6 +211,7 @@ impl Renderer {
             tab_bar_height,
             scale_factor,
             font_size_phys,
+            font_family: font_family.to_string(),
         }
     }
 
@@ -213,13 +227,15 @@ impl Renderer {
     pub fn update_scale(&mut self, scale_factor: f32, font_size: f32) {
         self.scale_factor = scale_factor;
         self.font_size_phys = font_size * scale_factor;
+        let fam_name = self.font_family.clone();
+        let fam = resolve_family(&fam_name);
         let metrics = Metrics::new(self.font_size_phys, self.font_size_phys * 1.4);
         let mut measure_buf = Buffer::new(&mut self.font_system, metrics);
         measure_buf.set_size(&mut self.font_system, 1000.0, self.font_size_phys * 2.0);
         measure_buf.set_text(
             &mut self.font_system,
             "0",
-            Attrs::new().family(Family::Monospace),
+            Attrs::new().family(fam),
             Shaping::Basic,
         );
         measure_buf.shape_until_scroll(&mut self.font_system, false);
@@ -279,10 +295,12 @@ impl Renderer {
     ) {
         let sw = self.config.width as f32;
         let sh = self.config.height as f32;
+        let fam_name = self.font_family.clone();
+        let fam = resolve_family(&fam_name);
         let metrics = Metrics::new(font_size_phys, font_size_phys * 1.4);
         let mut buf = Buffer::new(&mut self.font_system, metrics);
         buf.set_size(&mut self.font_system, sw, font_size_phys * 2.0);
-        buf.set_text(&mut self.font_system, text, Attrs::new().family(Family::Monospace), Shaping::Basic);
+        buf.set_text(&mut self.font_system, text, Attrs::new().family(fam), Shaping::Basic);
         buf.shape_until_scroll(&mut self.font_system, false);
 
         for run in buf.layout_runs() {
@@ -445,6 +463,8 @@ impl Renderer {
         let ch = self.cell_height;
         let tby = self.tab_bar_height;
         let metrics = Metrics::new(self.font_size_phys, ch);
+        // Resolve font family once to avoid borrow conflicts inside loops
+        let fam_name = self.font_family.clone();
 
         let mut bg_verts: Vec<BgVertex> = Vec::new();
         let mut glyph_verts: Vec<GlyphVertex> = Vec::new();
@@ -473,7 +493,7 @@ impl Renderer {
                 buf.set_text(
                     &mut self.font_system,
                     &cell.c.to_string(),
-                    Attrs::new().family(Family::Monospace),
+                    Attrs::new().family(resolve_family(&fam_name)),
                     Shaping::Basic,
                 );
                 buf.shape_until_scroll(&mut self.font_system, false);

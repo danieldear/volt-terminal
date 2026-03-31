@@ -37,6 +37,14 @@ impl Pty {
         for arg in args {
             cmd.arg(arg);
         }
+        // Set terminal environment so the shell and programs like starship use
+        // full color and correct capabilities regardless of how Volt was launched.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        // Ensure UTF-8 locale for Nerd Font / Unicode rendering
+        if std::env::var("LANG").is_err() {
+            cmd.env("LANG", "en_US.UTF-8");
+        }
         let child = pair.slave.spawn_command(cmd)?;
 
         let writer = pair.master.take_writer()?;
