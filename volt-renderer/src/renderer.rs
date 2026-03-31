@@ -70,12 +70,21 @@ impl Renderer {
             .unwrap();
 
         let caps = surface.get_capabilities(&adapter);
+        // Prefer non-sRGB format: our Color values are already sRGB (raw 0-255 / 255.0).
+        // An sRGB surface would apply gamma on top, making everything look washed out.
         let surface_format = caps
             .formats
             .iter()
-            .find(|f| f.is_srgb())
+            .find(|f| {
+                matches!(
+                    **f,
+                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+                )
+            })
             .copied()
-            .unwrap_or(caps.formats[0]);
+            .unwrap_or_else(|| {
+                caps.formats.iter().find(|f| !f.is_srgb()).copied().unwrap_or(caps.formats[0])
+            });
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -509,44 +518,89 @@ impl Renderer {
         }
 
         // ── tab bar ──────────────────────────────────────────────────────────
-        // Collect tab data to avoid borrow issues
         let tab_data: Vec<(String, bool, usize)> = tabs
             .iter()
             .map(|t| (t.title.to_string(), t.active, t.index))
             .collect();
 
-        // Draw tab bar background
-        self.draw_rect(&mut bg_verts, 0.0, 0.0, sw, tby, [0.11, 0.11, 0.14, 1.0]);
-
         let sc = self.scale_factor;
-        let left_pad = (78.0 * sc).round();
-        let tab_w = if !tab_data.is_empty() {
-            ((sw - left_pad - 40.0 * sc) / tab_data.len() as f32).min(240.0 * sc)
-        } else {
-            0.0
-        };
-        let tab_font = (12.0 * sc).round();
-        let pad_v = (tby - tab_font * 1.4) / 2.0;
 
-        for (i, (title, active, _idx)) in tab_data.iter().enumerate() {
+        // Tab bar background — same tone as terminal bg, just a hair lighter
+        self.draw_rect(&mut bg_verts, 0.0, 0.0, sw, tby,
+            [theme.background.r as f32 / 255.0 + 0.04,
+             theme.background.g as f32 / 255.0 + 0.04,
+             theme.background.b as f32 / 255.0 + 0.05, 1.0]);
+        // Single thin bottom border separating tab bar from terminal
+        self.draw_rect(&mut bg_verts, 0.0, tby - 1.0, sw, 1.0, [0.22, 0.22, 0.28, 1.0]);
+
+        // Traffic light zone: 78 logical px (~78*scale physical). Max tab width 220 logical px.
+        let left_pad = (78.0 * sc).round();
+        let n = tab_data.len().max(1);
+        let tab_w = ((sw - left_pad - 32.0 * sc) / n as f32).min(220.0 * sc).max(80.0 * sc);
+        let tab_font = (11.5 * sc).round().max(1.0);
+        let close_font = (10.0 * sc).round().max(1.0);
+        let text_top = (tby - tab_font * 1.2) / 2.0;
+
+        for (i, (title, active, _)) in tab_data.iter().enumerate() {
             let tx = left_pad + i as f32 * tab_w;
+
             if *active {
-                self.draw_rect(&mut bg_verts, tx, 0.0, tab_w, tby, [0.20, 0.20, 0.25, 1.0]);
-                self.draw_rect(&mut bg_verts, tx, tby - 2.0, tab_w, 2.0, [0.38, 0.57, 0.96, 1.0]);
+                // Active tab: subtle lighter fill
+                self.draw_rect(&mut bg_verts, tx, 0.0, tab_w, tby,
+                    [theme.background.r as f32 / 255.0 + 0.10,
+                     theme.background.g as f32 / 255.0 + 0.10,
+                     theme.background.b as f32 / 255.0 + 0.12, 1.0]);
+                // Top accent line (system blue-ish)
+                self.draw_rect(&mut bg_verts, tx, 0.0, tab_w, (2.0 * sc).max(2.0),
+                    [0.35, 0.53, 0.94, 1.0]);
             }
-            if i > 0 {
-                self.draw_rect(&mut bg_verts, tx, 6.0 * sc, 1.0, tby - 12.0 * sc, [0.25, 0.25, 0.30, 1.0]);
+
+            // Title — truncate to leave room for × (16px logical right margin)
+            let close_w = 16.0 * sc;
+            let max_text_w = tab_w - 8.0 * sc - close_w - 6.0 * sc;
+            // Clip title text by capping buffer width
+            let title_color = if *active { [0.92_f32, 0.92, 0.95, 1.0] } else { [0.52_f32, 0.52, 0.58, 1.0] };
+            {
+                // Inline text draw with max width
+                let metrics = Metrics::new(tab_font, tab_font * 1.4);
+                let mut buf = Buffer::new(&mut self.font_system, metrics);
+                buf.set_size(&mut self.font_system, max_text_w, tab_font * 2.0);
+                buf.set_text(&mut self.font_system, title, Attrs::new().family(Family::Monospace), Shaping::Basic);
+                buf.shape_until_scroll(&mut self.font_system, false);
+                let bx = tx + 8.0 * sc;
+                let by = text_top;
+                for run in buf.layout_runs() {
+                    for glyph in run.glyphs.iter() {
+                        let physical = glyph.physical((0.0, 0.0), 1.0);
+                        let Some(region) = self.atlas.get_or_rasterize(physical.cache_key, &mut self.font_system, &mut self.swash_cache) else { continue };
+                        let gx = bx + glyph.x + region.offset_x as f32;
+                        let gy = by + run.line_y - region.offset_y as f32;
+                        let gw = region.width as f32; let gh = region.height as f32;
+                        let x0=(gx/sw)*2.0-1.0; let x1=((gx+gw)/sw)*2.0-1.0;
+                        let y0=1.0-(gy/sh)*2.0; let y1=1.0-((gy+gh)/sh)*2.0;
+                        let [u0,v0,u1,v1]=[region.u0,region.v0,region.u1,region.v1];
+                        glyph_verts.extend_from_slice(&[
+                            GlyphVertex{pos:[x0,y0],uv:[u0,v0],color:title_color},
+                            GlyphVertex{pos:[x1,y0],uv:[u1,v0],color:title_color},
+                            GlyphVertex{pos:[x0,y1],uv:[u0,v1],color:title_color},
+                            GlyphVertex{pos:[x1,y0],uv:[u1,v0],color:title_color},
+                            GlyphVertex{pos:[x1,y1],uv:[u1,v1],color:title_color},
+                            GlyphVertex{pos:[x0,y1],uv:[u0,v1],color:title_color},
+                        ]);
+                    }
+                }
             }
-            let color = if *active {
-                [0.90_f32, 0.90, 0.95, 1.0]
-            } else {
-                [0.65_f32, 0.65, 0.70, 1.0]
-            };
-            self.draw_text(&mut glyph_verts, title, tx + 8.0 * sc, pad_v, tab_font, color);
+
+            // Close × button — right-aligned in tab
+            let cx = tx + tab_w - close_w - 2.0 * sc;
+            let close_color = if *active { [0.60_f32, 0.60, 0.65, 1.0] } else { [0.35_f32, 0.35, 0.40, 1.0] };
+            self.draw_text(&mut glyph_verts, "\u{00d7}", cx, text_top, close_font, close_color);
         }
+
+        // New tab (+) button
         if !tab_data.is_empty() {
-            let plus_x = left_pad + tab_data.len() as f32 * tab_w + 8.0 * sc;
-            self.draw_text(&mut glyph_verts, "+", plus_x, pad_v, tab_font, [0.45, 0.45, 0.50, 1.0]);
+            let plus_x = left_pad + tab_data.len() as f32 * tab_w + 6.0 * sc;
+            self.draw_text(&mut glyph_verts, "+", plus_x, text_top, tab_font, [0.40, 0.40, 0.46, 1.0]);
         }
 
         // ── settings overlay ─────────────────────────────────────────────────
