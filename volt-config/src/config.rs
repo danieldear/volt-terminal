@@ -54,6 +54,50 @@ pub struct Config {
 }
 fn default_theme() -> String { "catppuccin".to_string() }
 
+/// Returns a fully-commented sample config for first-time setup.
+pub fn sample_config_toml() -> String {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    format!(r#"# Volt Terminal — Configuration
+# Edit this file, save, then press Cmd+Shift+R in Volt to reload.
+# All values shown are the defaults.
+
+# ── Theme ──────────────────────────────────────────────────────────────────────
+# Options: catppuccin  tokyo-night  gruvbox  nord  dracula
+theme = "catppuccin"
+
+# ── Font ───────────────────────────────────────────────────────────────────────
+[font]
+# Font family name exactly as shown in Font Book (macOS) or fc-list (Linux).
+# For Starship / powerline icons set a Nerd Font variant, e.g.:
+#   "JetBrainsMono Nerd Font Mono"
+#   "SFMono Nerd Font"
+#   "FiraCode Nerd Font Mono"
+#   "Hack Nerd Font Mono"
+family = "monospace"
+
+# Font size in logical points (Retina / HiDPI scaling is automatic).
+size = 14.0
+
+# ── Shell ──────────────────────────────────────────────────────────────────────
+[shell]
+# Path to the shell binary.
+program = "{shell}"
+
+# Shell startup arguments.
+# "-l" starts a login shell — needed for $PATH, Starship, nvm, homebrew, etc.
+args = ["-l"]
+
+# ── Appearance ─────────────────────────────────────────────────────────────────
+[appearance]
+# Inner padding around the terminal grid, in logical pixels.
+padding = 8
+
+# Line height multiplier.
+# 1.0 = tight  |  1.2 = snug  |  1.4 = comfortable  |  1.6 = airy
+line_height = 1.4
+"#, shell = shell)
+}
+
 impl Config {
     pub fn load() -> Self {
         let path = dirs::config_dir()

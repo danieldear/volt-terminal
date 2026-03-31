@@ -24,6 +24,7 @@ impl Pty {
         args: &[String],
         cols: u16,
         rows: u16,
+        on_data: impl Fn() + Send + 'static,
     ) -> anyhow::Result<(Self, Arc<Mutex<Performer>>, mpsc::UnboundedReceiver<CoreEvent>)> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -67,6 +68,7 @@ impl Pty {
                             parser.advance(&mut *p, b);
                         }
                         let _ = event_tx_clone.send(CoreEvent::GridUpdated);
+                        on_data(); // wake the winit event loop immediately
                     }
                 }
             }
@@ -110,7 +112,7 @@ mod tests {
     fn test_pty_spawn_and_write() {
         // Spawn a shell, write "exit\n", verify no panic and channel gets an event
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let (mut pty, _performer, mut rx) = Pty::spawn(&shell, &[], 80, 24).unwrap();
+        let (mut pty, _performer, mut rx) = Pty::spawn(&shell, &[], 80, 24, || {}).unwrap();
         pty.write(b"exit\n").unwrap();
         // Give the reader thread a moment to process output
         std::thread::sleep(std::time::Duration::from_millis(200));
