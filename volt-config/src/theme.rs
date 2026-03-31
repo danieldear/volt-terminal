@@ -7,9 +7,13 @@ pub struct Color {
 
 impl Color {
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self { Self { r, g, b } }
-    pub fn to_linear_f32(self) -> [f32; 4] {
+    pub fn to_f32(self) -> [f32; 4] {
         [self.r as f32 / 255.0, self.g as f32 / 255.0, self.b as f32 / 255.0, 1.0]
     }
+}
+
+impl Default for Color {
+    fn default() -> Self { Self::rgb(0, 0, 0) }
 }
 
 #[derive(Debug, Clone)]
@@ -54,9 +58,10 @@ impl Theme {
             0..=15 => self.ansi[index as usize],
             16..=231 => {
                 let i = index - 16;
-                let b = (i % 6) * 51;
-                let g = ((i / 6) % 6) * 51;
-                let r = (i / 36) * 51;
+                let level = |v: u8| if v == 0 { 0u8 } else { 55 + v * 40 };
+                let b = level(i % 6);
+                let g = level((i / 6) % 6);
+                let r = level(i / 36);
                 Color::rgb(r, g, b)
             }
             232..=255 => {
