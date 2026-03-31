@@ -1,3 +1,7 @@
+use volt_config::Config;
+use volt_ui::App;
+
 fn main() {
-    println!("volt starting");
+    let config = Config::load();
+    App::new(config).run();
 }
