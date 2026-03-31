@@ -28,6 +28,19 @@ impl Default for ShellConfig {
     fn default() -> Self { Self { program: default_shell(), args: default_shell_args() } }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppearanceConfig {
+    #[serde(default = "default_padding")]
+    pub padding: u16,
+    #[serde(default = "default_line_height")]
+    pub line_height: f32,
+}
+fn default_padding() -> u16 { 8 }
+fn default_line_height() -> f32 { 1.4 }
+impl Default for AppearanceConfig {
+    fn default() -> Self { Self { padding: default_padding(), line_height: default_line_height() } }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -36,6 +49,8 @@ pub struct Config {
     pub shell: ShellConfig,
     #[serde(default = "default_theme")]
     pub theme: String,
+    #[serde(default)]
+    pub appearance: AppearanceConfig,
 }
 fn default_theme() -> String { "catppuccin".to_string() }
 
