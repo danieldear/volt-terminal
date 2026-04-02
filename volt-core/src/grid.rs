@@ -1,9 +1,11 @@
 use crate::cell::Cell;
 
+#[derive(Clone)]
 pub struct Grid {
     pub cols: usize,
     pub rows: usize,
     cells: Vec<Cell>,
+    row_map: Vec<usize>,
     pub cursor_col: usize,
     pub cursor_row: usize,
     pub scroll_top: usize,
@@ -21,6 +23,7 @@ impl Grid {
             cols,
             rows,
             cells: vec![Cell::default(); cols * rows],
+            row_map: (0..rows).collect(),
             cursor_col: 0,
             cursor_row: 0,
             scroll_top: 0,
@@ -30,12 +33,12 @@ impl Grid {
     }
 
     pub fn cell(&self, col: usize, row: usize) -> &Cell {
-        &self.cells[row * self.cols + col]
+        let idx = self.row_map[row] * self.cols + col;
+        &self.cells[idx]
     }
 
     pub fn cell_mut(&mut self, col: usize, row: usize) -> &mut Cell {
-        let idx = row * self.cols + col;
-        self.cells[idx].dirty = true;
+        let idx = self.row_map[row] * self.cols + col;
         &mut self.cells[idx]
     }
 
@@ -43,62 +46,87 @@ impl Grid {
         let mut new_cells = vec![Cell::default(); cols * rows];
         for row in 0..rows.min(self.rows) {
             for col in 0..cols.min(self.cols) {
-                new_cells[row * cols + col] = self.cells[row * self.cols + col];
+                new_cells[row * cols + col] = *self.cell(col, row);
             }
         }
         self.cols = cols;
         self.rows = rows;
         self.scroll_bottom = rows.saturating_sub(1);
         self.cells = new_cells;
+        self.row_map = (0..rows).collect();
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
     }
 
     pub fn scroll_down(&mut self, top: usize, bottom: usize, count: usize) {
-        for _ in 0..count {
-            for row in (top..bottom).rev() {
-                for col in 0..self.cols {
-                    self.cells[(row + 1) * self.cols + col] = self.cells[row * self.cols + col];
-                    self.cells[(row + 1) * self.cols + col].dirty = true;
-                }
-            }
-            for col in 0..self.cols {
-                self.cells[top * self.cols + col] = Cell::default();
-            }
+        if self.cols == 0
+            || self.rows == 0
+            || top >= self.rows
+            || bottom >= self.rows
+            || top > bottom
+        {
+            return;
+        }
+        let region_rows = bottom - top + 1;
+        let count = count.min(region_rows);
+        if count == 0 {
+            return;
+        }
+
+        self.row_map[top..=bottom].rotate_right(count);
+        for row in top..(top + count) {
+            let start = self.row_map[row] * self.cols;
+            let end = start + self.cols;
+            self.cells[start..end].fill(Cell::default());
         }
     }
 
     pub fn scroll_up(&mut self, top: usize, bottom: usize, count: usize) {
-        for _ in 0..count {
-            for row in top..bottom {
-                for col in 0..self.cols {
-                    self.cells[row * self.cols + col] = self.cells[(row + 1) * self.cols + col];
-                    self.cells[row * self.cols + col].dirty = true;
-                }
-            }
-            for col in 0..self.cols {
-                self.cells[bottom * self.cols + col] = Cell::default();
-            }
+        if self.cols == 0
+            || self.rows == 0
+            || top >= self.rows
+            || bottom >= self.rows
+            || top > bottom
+        {
+            return;
+        }
+        let region_rows = bottom - top + 1;
+        let count = count.min(region_rows);
+        if count == 0 {
+            return;
+        }
+
+        self.row_map[top..=bottom].rotate_left(count);
+        let clear_start_row = bottom + 1 - count;
+        for row in clear_start_row..=bottom {
+            let start = self.row_map[row] * self.cols;
+            let end = start + self.cols;
+            self.cells[start..end].fill(Cell::default());
         }
     }
 
     pub fn clear_line(&mut self, row: usize, from_col: usize, to_col: usize) {
+        if row >= self.rows || self.cols == 0 {
+            return;
+        }
         let end = to_col.min(self.cols.saturating_sub(1));
+        if from_col > end {
+            return;
+        }
+        let row_start = self.row_map[row] * self.cols;
         for col in from_col..=end {
-            self.cells[row * self.cols + col] = Cell::default();
+            self.cells[row_start + col] = Cell::default();
         }
     }
 
     pub fn clear_screen(&mut self) {
-        for cell in &mut self.cells {
-            *cell = Cell::default();
-        }
+        self.cells.fill(Cell::default());
         self.cursor_col = 0;
         self.cursor_row = 0;
     }
 
     pub fn erase_all(&mut self) {
-        for cell in &mut self.cells { *cell = Cell::default(); }
+        self.cells.fill(Cell::default());
     }
 
     pub fn advance_cursor(&mut self) {

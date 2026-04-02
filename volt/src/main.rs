@@ -1,7 +1,8 @@
 use volt_config::Config;
 use volt_ui::App;
 
-fn main() {
-    let config = Config::load();
-    App::new(config).run();
+fn main() -> anyhow::Result<()> {
+    let (config, config_load_error) = Config::load_with_diagnostics();
+    App::new(config, config_load_error)?.run()?;
+    Ok(())
 }

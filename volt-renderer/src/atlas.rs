@@ -80,8 +80,7 @@ impl CpuAtlas {
                 for row in 0..h {
                     for col in 0..w {
                         let src = image.data[(row * w + col) as usize];
-                        let dst =
-                            ((self.shelf_y + row) * self.width + self.shelf_x + col) as usize;
+                        let dst = ((self.shelf_y + row) * self.width + self.shelf_x + col) as usize;
                         self.data[dst] = src;
                     }
                 }
@@ -91,24 +90,22 @@ impl CpuAtlas {
                 for row in 0..h {
                     for col in 0..w {
                         let src = image.data[((row * w + col) * 4 + 3) as usize];
-                        let dst =
-                            ((self.shelf_y + row) * self.width + self.shelf_x + col) as usize;
+                        let dst = ((self.shelf_y + row) * self.width + self.shelf_x + col) as usize;
                         self.data[dst] = src;
                     }
                 }
             }
             SwashContent::SubpixelMask => {
-                // Take average of R+G+B sub-channels
+                // Use the strongest sub-channel coverage to avoid thinning
+                // edges when collapsing LCD subpixel masks to grayscale alpha.
                 for row in 0..h {
                     for col in 0..w {
                         let base = ((row * w + col) * 3) as usize;
-                        let avg = ((image.data[base] as u16
-                            + image.data[base + 1] as u16
-                            + image.data[base + 2] as u16)
-                            / 3) as u8;
-                        let dst =
-                            ((self.shelf_y + row) * self.width + self.shelf_x + col) as usize;
-                        self.data[dst] = avg;
+                        let coverage = image.data[base]
+                            .max(image.data[base + 1])
+                            .max(image.data[base + 2]);
+                        let dst = ((self.shelf_y + row) * self.width + self.shelf_x + col) as usize;
+                        self.data[dst] = coverage;
                     }
                 }
             }
@@ -155,11 +152,8 @@ mod tests {
         for run in buf.layout_runs() {
             for glyph in run.glyphs.iter() {
                 let physical = glyph.physical((0.0, 0.0), 1.0);
-                let result = atlas.get_or_rasterize(
-                    physical.cache_key,
-                    &mut font_system,
-                    &mut swash_cache,
-                );
+                let result =
+                    atlas.get_or_rasterize(physical.cache_key, &mut font_system, &mut swash_cache);
                 // Just assert it doesn't panic — result may be None if no font available
                 let _ = result;
             }
@@ -180,17 +174,11 @@ mod tests {
         for run in buf.layout_runs() {
             for glyph in run.glyphs.iter() {
                 let physical = glyph.physical((0.0, 0.0), 1.0);
-                let first = atlas.get_or_rasterize(
-                    physical.cache_key,
-                    &mut font_system,
-                    &mut swash_cache,
-                );
+                let first =
+                    atlas.get_or_rasterize(physical.cache_key, &mut font_system, &mut swash_cache);
                 atlas.dirty = false; // reset dirty flag
-                let second = atlas.get_or_rasterize(
-                    physical.cache_key,
-                    &mut font_system,
-                    &mut swash_cache,
-                );
+                let second =
+                    atlas.get_or_rasterize(physical.cache_key, &mut font_system, &mut swash_cache);
                 // Second call should hit cache, not mark dirty again
                 assert!(!atlas.dirty);
                 // Both calls return the same result

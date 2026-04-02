@@ -12,3 +12,6 @@ volt-renderer = { path = "../volt-renderer" }
 volt-config = { path = "../volt-config" }
 dirs = "5"
 anyhow = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"

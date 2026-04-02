@@ -1,11 +1,19 @@
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::Read;
 use std::sync::{Arc, Mutex};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tokio::sync::mpsc;
 use vte::Parser;
 
 use crate::events::CoreEvent;
 use crate::performer::Performer;
+
+fn send_event(tx: &mpsc::UnboundedSender<CoreEvent>, event: CoreEvent) {
+    if let Err(err) = tx.send(event) {
+        eprintln!("volt-core: failed to send core event: {err}");
+    }
+}
+
+const PARSE_LOCK_CHUNK_BYTES: usize = 4096;
 
 pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -25,7 +33,11 @@ impl Pty {
         cols: u16,
         rows: u16,
         on_data: impl Fn() + Send + 'static,
-    ) -> anyhow::Result<(Self, Arc<Mutex<Performer>>, mpsc::UnboundedReceiver<CoreEvent>)> {
+    ) -> anyhow::Result<(
+        Self,
+        Arc<Mutex<Performer>>,
+        mpsc::UnboundedReceiver<CoreEvent>,
+    )> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -59,36 +71,90 @@ impl Pty {
         let event_tx_clone = event_tx.clone();
         std::thread::spawn(move || {
             let mut parser = Parser::new();
-            let mut buf = [0u8; 4096];
-            loop {
+            let mut buf = [0u8; 64 * 1024];
+            'reader_loop: loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        // Process byte-by-byte so responses (e.g. CPR) are flushed immediately
-                        for &b in &buf[..n] {
-                            let pending = {
-                                let mut p = performer_clone.lock().unwrap();
-                                parser.advance(&mut *p, b);
-                                if p.pending_writes.is_empty() {
+                        let mut read_events: Vec<CoreEvent> = Vec::new();
+                        let mut read_writes: Vec<Vec<u8>> = Vec::new();
+                        let mut read_dirty = false;
+
+                        for chunk in buf[..n].chunks(PARSE_LOCK_CHUNK_BYTES) {
+                            let (pending_events, pending_writes, chunk_dirty) = {
+                                let mut p = match performer_clone.lock() {
+                                    Ok(performer) => performer,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "volt-core: failed to lock performer in PTY reader: {err}"
+                                        );
+                                        break 'reader_loop;
+                                    }
+                                };
+                                for &b in chunk {
+                                    parser.advance(&mut *p, b);
+                                }
+                                let pending_events = if p.pending_events.is_empty() {
+                                    None
+                                } else {
+                                    Some(std::mem::take(&mut p.pending_events))
+                                };
+                                let pending_writes = if p.pending_writes.is_empty() {
                                     None
                                 } else {
                                     Some(std::mem::take(&mut p.pending_writes))
-                                }
+                                };
+                                let dirty = p.display_dirty;
+                                let _ = p.take_damage_rows();
+                                p.display_dirty = false;
+                                (pending_events, pending_writes, dirty)
                             };
-                            if let Some(pending) = pending {
-                                use std::io::Write;
-                                let mut w = writer_clone.lock().unwrap();
-                                for bytes in pending {
-                                    let _ = w.write_all(&bytes);
-                                }
-                                let _ = w.flush();
+
+                            if let Some(events) = pending_events {
+                                read_events.extend(events);
+                            }
+                            if let Some(writes) = pending_writes {
+                                read_writes.extend(writes);
+                            }
+                            if chunk_dirty {
+                                read_dirty = true;
                             }
                         }
-                        let _ = event_tx_clone.send(CoreEvent::GridUpdated);
-                        on_data();
+
+                        for event in read_events {
+                            send_event(&event_tx_clone, event);
+                        }
+
+                        if !read_writes.is_empty() {
+                            use std::io::Write;
+                            let mut w = match writer_clone.lock() {
+                                Ok(writer) => writer,
+                                Err(err) => {
+                                    eprintln!("volt-core: failed to lock PTY writer for response bytes: {err}");
+                                    break 'reader_loop;
+                                }
+                            };
+                            for bytes in read_writes {
+                                if let Err(err) = w.write_all(&bytes) {
+                                    eprintln!(
+                                        "volt-core: failed to write PTY response bytes: {err}"
+                                    );
+                                    break 'reader_loop;
+                                }
+                            }
+                            if let Err(err) = w.flush() {
+                                eprintln!("volt-core: failed to flush PTY response bytes: {err}");
+                            }
+                        }
+
+                        if read_dirty {
+                            on_data();
+                        }
                     }
                 }
             }
+            send_event(&event_tx_clone, CoreEvent::PtyClosed);
+            on_data();
         });
 
         Ok((
@@ -127,13 +193,19 @@ mod tests {
 
     #[test]
     fn test_pty_spawn_and_write() {
-        // Spawn a shell, write "exit\n", verify no panic and channel gets an event
+        // Spawn a shell, write "exit\n", verify no panic and channel gets an event.
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let (mut pty, _performer, mut rx) = Pty::spawn(&shell, &[], 80, 24, || {}).unwrap();
         pty.write(b"exit\n").unwrap();
-        // Give the reader thread a moment to process output
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        // At least one GridUpdated event should have arrived
-        assert!(rx.try_recv().is_ok());
+        let start = std::time::Instant::now();
+        let mut got_event = false;
+        while start.elapsed() < std::time::Duration::from_secs(3) {
+            if rx.try_recv().is_ok() {
+                got_event = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(got_event);
     }
 }

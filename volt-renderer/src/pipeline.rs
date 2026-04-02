@@ -15,10 +15,7 @@ pub struct GlyphVertex {
     pub color: [f32; 4],
 }
 
-pub fn bg_pipeline(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-) -> wgpu::RenderPipeline {
+pub fn bg_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("bg_shader"),
         source: wgpu::ShaderSource::Wgsl(include_str!("shaders/bg.wgsl").into()),

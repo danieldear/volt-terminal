@@ -9,3 +9,4 @@ portable-pty = "0.8"
 tokio = { workspace = true, features = ["rt", "sync", "io-util"] }
 anyhow = { workspace = true }
 volt-config = { path = "../volt-config" }
+unicode-width = "0.2"

@@ -1,5 +1,7 @@
 pub mod config;
 pub mod theme;
 
-pub use config::{Config, AppearanceConfig, sample_config_toml};
+pub use config::{
+    config_dir, config_path, sample_config_toml, AppearanceConfig, Config, CursorStyle,
+};
 pub use theme::{Color, Theme};
