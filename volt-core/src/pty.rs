@@ -13,6 +13,9 @@ fn send_event(tx: &mpsc::UnboundedSender<CoreEvent>, event: CoreEvent) {
     }
 }
 
+/// How many bytes to parse per Mutex<Performer> acquisition.
+/// Smaller = lower latency / less contention with UI reads.
+/// Larger = fewer lock round-trips under heavy throughput.
 const PARSE_LOCK_CHUNK_BYTES: usize = 4096;
 
 pub struct Pty {
@@ -84,11 +87,18 @@ impl Pty {
                             let (pending_events, pending_writes, chunk_dirty) = {
                                 let mut p = match performer_clone.lock() {
                                     Ok(performer) => performer,
-                                    Err(err) => {
-                                        eprintln!(
-                                            "volt-core: failed to lock performer in PTY reader: {err}"
+                                    Err(poisoned) => {
+                                        // Another thread panicked; recover the guard
+                                        // and report via the event channel instead of
+                                        // panicking or going fully silent.
+                                        let msg = format!(
+                                            "performer mutex poisoned: {poisoned}"
                                         );
-                                        break 'reader_loop;
+                                        send_event(
+                                            &event_tx_clone,
+                                            CoreEvent::PtyError(msg),
+                                        );
+                                        poisoned.into_inner()
                                     }
                                 };
                                 for &b in chunk {
@@ -129,21 +139,34 @@ impl Pty {
                             use std::io::Write;
                             let mut w = match writer_clone.lock() {
                                 Ok(writer) => writer,
-                                Err(err) => {
-                                    eprintln!("volt-core: failed to lock PTY writer for response bytes: {err}");
-                                    break 'reader_loop;
+                                Err(poisoned) => {
+                                    send_event(
+                                        &event_tx_clone,
+                                        CoreEvent::PtyError(format!(
+                                            "PTY writer mutex poisoned: {poisoned}"
+                                        )),
+                                    );
+                                    poisoned.into_inner()
                                 }
                             };
                             for bytes in read_writes {
                                 if let Err(err) = w.write_all(&bytes) {
-                                    eprintln!(
-                                        "volt-core: failed to write PTY response bytes: {err}"
+                                    send_event(
+                                        &event_tx_clone,
+                                        CoreEvent::PtyError(format!(
+                                            "failed to write PTY response bytes: {err}"
+                                        )),
                                     );
                                     break 'reader_loop;
                                 }
                             }
                             if let Err(err) = w.flush() {
-                                eprintln!("volt-core: failed to flush PTY response bytes: {err}");
+                                send_event(
+                                    &event_tx_clone,
+                                    CoreEvent::PtyError(format!(
+                                        "failed to flush PTY response bytes: {err}"
+                                    )),
+                                );
                             }
                         }
 
@@ -172,7 +195,13 @@ impl Pty {
     /// Write bytes to the PTY (keyboard input)
     pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
-        self.writer.lock().unwrap().write_all(bytes)
+        // Recover from a poisoned mutex rather than panicking — the writer
+        // state is still valid even if another thread panicked holding it.
+        let mut w = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        w.write_all(bytes)
     }
 
     /// Resize the PTY

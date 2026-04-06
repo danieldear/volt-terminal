@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cosmic_text::{Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight};
 
 use crate::atlas::CpuAtlas;
 use crate::pipeline::{bg_pipeline, glyph_pipeline, BgVertex, GlyphVertex};
@@ -77,6 +77,24 @@ fn is_symbol_fallback_char(c: char) -> bool {
     )
 }
 
+/// Ordered list of Nerd Font / symbol families to try as a fallback when the
+/// primary font lacks private-use or symbol glyphs.  Checked by both
+/// `detect_symbol_font_family` and `default_symbol_font_family` so the
+/// preference list is maintained in exactly one place.
+const PREFERRED_SYMBOL_FONTS: &[&str] = &[
+    "JetBrainsMono Nerd Font Mono",
+    "JetBrainsMono NL Nerd Font Mono",
+    "ZedMono Nerd Font Mono",
+    "CaskaydiaMono Nerd Font Mono",
+    "FiraMono Nerd Font Mono",
+    "Hack Nerd Font Mono",
+    "SFMono Nerd Font",
+    "FiraCode Nerd Font Mono",
+    "Symbols Nerd Font Mono",
+    "Symbols Nerd Font",
+    "Apple Symbols",
+];
+
 fn detect_symbol_font_family(
     font_system: &mut FontSystem,
     _swash_cache: &mut SwashCache,
@@ -96,20 +114,7 @@ fn detect_symbol_font_family(
         }
     }
 
-    let preferred = [
-        "JetBrainsMono Nerd Font Mono",
-        "JetBrainsMono NL Nerd Font Mono",
-        "ZedMono Nerd Font Mono",
-        "CaskaydiaMono Nerd Font Mono",
-        "FiraMono Nerd Font Mono",
-        "Hack Nerd Font Mono",
-        "SFMono Nerd Font",
-        "Symbols Nerd Font Mono",
-        "Symbols Nerd Font",
-        "Apple Symbols",
-    ];
-
-    for wanted in preferred {
+    for &wanted in PREFERRED_SYMBOL_FONTS {
         if let Some(found) = families
             .iter()
             .find(|name| name.eq_ignore_ascii_case(wanted) && !name.eq_ignore_ascii_case(primary))
@@ -130,19 +135,7 @@ fn default_symbol_font_family(font_system: &FontSystem, primary_family: &str) ->
         }
     }
 
-    let preferred = [
-        "JetBrainsMono Nerd Font Mono",
-        "JetBrainsMono NL Nerd Font Mono",
-        "CaskaydiaMono Nerd Font Mono",
-        "FiraMono Nerd Font Mono",
-        "Hack Nerd Font Mono",
-        "ZedMono Nerd Font Mono",
-        "Symbols Nerd Font Mono",
-        "Symbols Nerd Font",
-        "FiraCode Nerd Font Mono",
-    ];
-
-    for wanted in preferred {
+    for &wanted in PREFERRED_SYMBOL_FONTS {
         if let Some(found) = families
             .iter()
             .find(|name| name.eq_ignore_ascii_case(wanted) && !name.eq_ignore_ascii_case(primary))
@@ -202,8 +195,9 @@ pub struct Renderer {
     pub padding: f32,
     pub line_height: f32,
     /// Per-character shape cache: avoids re-shaping the same glyph every frame.
-    /// Keyed by char; cleared when font family/size/scale changes.
-    shape_cache: HashMap<char, Vec<CachedGlyph>>,
+    /// Per-character shape cache: avoids re-shaping the same glyph every frame.
+    /// Keyed by (char, bold, italic); cleared when font family/size/scale changes.
+    shape_cache: HashMap<(char, bool, bool), Vec<CachedGlyph>>,
     symbol_font_family: Option<String>,
     top_alert: Option<String>,
     bg_vertex_buffer: wgpu::Buffer,
@@ -651,7 +645,7 @@ impl Renderer {
     // ── shape cache helpers ──────────────────────────────────────────────────
 
     /// Shape a single character and return its glyph layout info.
-    /// Called at most once per unique character per font configuration.
+    /// Called at most once per unique (char, bold, italic) triple per font configuration.
     #[allow(clippy::too_many_arguments)]
     fn shape_char(
         font_system: &mut FontSystem,
@@ -662,6 +656,8 @@ impl Renderer {
         fam_name: &str,
         symbol_fallback_family: Option<&str>,
         swash_cache: &mut SwashCache,
+        bold: bool,
+        italic: bool,
     ) -> Vec<CachedGlyph> {
         fn shape_for_family(
             font_system: &mut FontSystem,
@@ -670,15 +666,16 @@ impl Renderer {
             cell_w: f32,
             cell_h: f32,
             family: Family<'_>,
+            bold: bool,
+            italic: bool,
         ) -> Vec<CachedGlyph> {
+            let attrs = Attrs::new()
+                .family(family)
+                .weight(if bold { Weight::BOLD } else { Weight::NORMAL })
+                .style(if italic { Style::Italic } else { Style::Normal });
             let mut buf = Buffer::new(font_system, metrics);
             buf.set_size(font_system, cell_w * 2.0, cell_h * 2.0);
-            buf.set_text(
-                font_system,
-                &c.to_string(),
-                Attrs::new().family(family),
-                Shaping::Advanced,
-            );
+            buf.set_text(font_system, &c.to_string(), attrs, Shaping::Advanced);
             buf.shape_until_scroll(font_system, false);
             let mut out = Vec::new();
             for run in buf.layout_runs() {
@@ -705,6 +702,8 @@ impl Renderer {
                     cell_w,
                     cell_h,
                     resolve_family(fallback_family),
+                    bold,
+                    italic,
                 );
                 let fallback_visible = fallback.iter().any(|glyph| {
                     swash_cache
@@ -725,6 +724,8 @@ impl Renderer {
             cell_w,
             cell_h,
             resolve_family(fam_name),
+            bold,
+            italic,
         );
         let primary_visible = primary.iter().any(|glyph| {
             swash_cache
@@ -745,6 +746,8 @@ impl Renderer {
                     cell_w,
                     cell_h,
                     resolve_family(fallback_family),
+                    bold,
+                    italic,
                 );
             }
         }
@@ -1117,7 +1120,8 @@ impl Renderer {
                 if cell.c == ' ' {
                     continue;
                 }
-                if !self.shape_cache.contains_key(&cell.c) {
+                let cache_key = (cell.c, cell.bold, cell.italic);
+                if !self.shape_cache.contains_key(&cache_key) {
                     let char_metrics =
                         if is_private_use_char(cell.c) || is_symbol_fallback_char(cell.c) {
                             symbol_metrics
@@ -1133,8 +1137,10 @@ impl Renderer {
                         &fam_name,
                         self.symbol_font_family.as_deref(),
                         &mut self.swash_cache,
+                        cell.bold,
+                        cell.italic,
                     );
-                    self.shape_cache.insert(cell.c, glyphs);
+                    self.shape_cache.insert(cache_key, glyphs);
                 }
 
                 let cell_top = content_top + phys_pad + row as f32 * ch;
@@ -1153,7 +1159,7 @@ impl Renderer {
                     resolved_fg
                 };
 
-                let glyph_infos = match self.shape_cache.get(&cell.c) {
+                let glyph_infos = match self.shape_cache.get(&cache_key) {
                     Some(v) => v,
                     None => continue,
                 };

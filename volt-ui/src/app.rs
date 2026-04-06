@@ -1,10 +1,7 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-#[cfg(target_os = "macos")]
-use std::{ffi::c_void, ptr::null_mut};
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -17,9 +14,14 @@ use winit::window::{Window, WindowId};
 use volt_config::{config_path, sample_config_toml, Config, Theme};
 use volt_core::events::CoreEvent;
 use volt_core::grid::Grid;
-use volt_core::performer::{MouseTrackingMode, Performer};
-use volt_core::pty::Pty;
+use volt_core::performer::MouseTrackingMode;
+
 use volt_renderer::{Renderer, TabEntry};
+
+#[cfg(target_os = "macos")]
+use crate::display_link::DisplayLinkScheduler;
+use crate::tab::{PaneSplitDirection, PaneSlot, Selection, TerminalPane, TerminalTab};
+use crate::tab_layout::TabLayout;
 
 // ── user events (used to wake the event loop from background threads) ────────
 
@@ -33,450 +35,6 @@ pub enum VoltEvent {
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
-
-#[cfg(target_os = "macos")]
-type CVDisplayLinkRef = *mut c_void;
-#[cfg(target_os = "macos")]
-type CVOptionFlags = u64;
-#[cfg(target_os = "macos")]
-type CVReturn = i32;
-#[cfg(target_os = "macos")]
-type CVTimeStamp = c_void;
-#[cfg(target_os = "macos")]
-type CVDisplayLinkOutputCallback = Option<
-    extern "C" fn(
-        CVDisplayLinkRef,
-        *const CVTimeStamp,
-        *const CVTimeStamp,
-        CVOptionFlags,
-        *mut CVOptionFlags,
-        *mut c_void,
-    ) -> CVReturn,
->;
-
-#[cfg(target_os = "macos")]
-#[link(name = "CoreVideo", kind = "framework")]
-unsafe extern "C" {
-    fn CVDisplayLinkCreateWithActiveCGDisplays(displayLinkOut: *mut CVDisplayLinkRef) -> CVReturn;
-    fn CVDisplayLinkSetOutputCallback(
-        displayLink: CVDisplayLinkRef,
-        callback: CVDisplayLinkOutputCallback,
-        userInfo: *mut c_void,
-    ) -> CVReturn;
-    fn CVDisplayLinkStart(displayLink: CVDisplayLinkRef) -> CVReturn;
-    fn CVDisplayLinkStop(displayLink: CVDisplayLinkRef) -> CVReturn;
-    fn CVDisplayLinkRelease(displayLink: CVDisplayLinkRef);
-}
-
-#[cfg(target_os = "macos")]
-struct DisplayLinkContext {
-    pending: Arc<AtomicBool>,
-    proxy: EventLoopProxy<VoltEvent>,
-}
-
-#[cfg(target_os = "macos")]
-struct DisplayLinkScheduler {
-    display_link: CVDisplayLinkRef,
-    pending: Arc<AtomicBool>,
-    context: *mut DisplayLinkContext,
-}
-
-#[cfg(target_os = "macos")]
-extern "C" fn display_link_output_callback(
-    _display_link: CVDisplayLinkRef,
-    _in_now: *const CVTimeStamp,
-    _in_output_time: *const CVTimeStamp,
-    _flags_in: CVOptionFlags,
-    _flags_out: *mut CVOptionFlags,
-    user_info: *mut c_void,
-) -> CVReturn {
-    if user_info.is_null() {
-        return 0;
-    }
-    let ctx = unsafe { &*(user_info as *mut DisplayLinkContext) };
-    if ctx.pending.swap(false, Ordering::AcqRel) {
-        if let Err(err) = ctx.proxy.send_event(VoltEvent::DisplayLinkTick) {
-            eprintln!("volt-ui: failed to send DisplayLinkTick event: {err}");
-        }
-    }
-    0
-}
-
-#[cfg(target_os = "macos")]
-impl DisplayLinkScheduler {
-    fn new(proxy: EventLoopProxy<VoltEvent>) -> anyhow::Result<Self> {
-        let mut display_link: CVDisplayLinkRef = null_mut();
-        let create_result = unsafe { CVDisplayLinkCreateWithActiveCGDisplays(&mut display_link) };
-        if create_result != 0 || display_link.is_null() {
-            return Err(anyhow::anyhow!(
-                "CVDisplayLinkCreateWithActiveCGDisplays failed with code {create_result}"
-            ));
-        }
-
-        let pending = Arc::new(AtomicBool::new(false));
-        let context = Box::new(DisplayLinkContext {
-            pending: Arc::clone(&pending),
-            proxy,
-        });
-        let context_ptr = Box::into_raw(context);
-
-        let callback_result = unsafe {
-            CVDisplayLinkSetOutputCallback(
-                display_link,
-                Some(display_link_output_callback),
-                context_ptr as *mut c_void,
-            )
-        };
-        if callback_result != 0 {
-            unsafe {
-                CVDisplayLinkRelease(display_link);
-                drop(Box::from_raw(context_ptr));
-            }
-            return Err(anyhow::anyhow!(
-                "CVDisplayLinkSetOutputCallback failed with code {callback_result}"
-            ));
-        }
-
-        let start_result = unsafe { CVDisplayLinkStart(display_link) };
-        if start_result != 0 {
-            unsafe {
-                CVDisplayLinkRelease(display_link);
-                drop(Box::from_raw(context_ptr));
-            }
-            return Err(anyhow::anyhow!(
-                "CVDisplayLinkStart failed with code {start_result}"
-            ));
-        }
-
-        Ok(Self {
-            display_link,
-            pending,
-            context: context_ptr,
-        })
-    }
-
-    fn request_redraw(&self) {
-        self.pending.store(true, Ordering::Release);
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for DisplayLinkScheduler {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.display_link.is_null() {
-                let _ = CVDisplayLinkStop(self.display_link);
-                CVDisplayLinkRelease(self.display_link);
-            }
-            if !self.context.is_null() {
-                drop(Box::from_raw(self.context));
-            }
-        }
-    }
-}
-
-// ── per-tab state ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PaneSlot {
-    Primary,
-    Secondary,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PaneSplitDirection {
-    Vertical,
-    Horizontal,
-}
-
-struct TerminalPane {
-    pty: Pty,
-    performer: Arc<Mutex<Performer>>,
-    event_rx: tokio::sync::mpsc::UnboundedReceiver<CoreEvent>,
-    title: String,
-    cwd: Option<PathBuf>,
-    running: bool,
-}
-
-struct TerminalTab {
-    primary: TerminalPane,
-    secondary: Option<TerminalPane>,
-    split_direction: Option<PaneSplitDirection>,
-    active_pane: PaneSlot,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Selection {
-    pane: PaneSlot,
-    start_col: usize,
-    start_row: usize,
-    end_col: usize,
-    end_row: usize,
-}
-
-impl Selection {
-    fn normalized(self) -> Self {
-        if (self.start_row, self.start_col) <= (self.end_row, self.end_col) {
-            self
-        } else {
-            Self {
-                pane: self.pane,
-                start_col: self.end_col,
-                start_row: self.end_row,
-                end_col: self.start_col,
-                end_row: self.start_row,
-            }
-        }
-    }
-}
-
-impl TerminalPane {
-    fn spawn(
-        config: &Config,
-        cols: u16,
-        rows: u16,
-        proxy: EventLoopProxy<VoltEvent>,
-        wake_pending: Arc<AtomicBool>,
-    ) -> anyhow::Result<Self> {
-        let (pty, performer, event_rx) = Pty::spawn(
-            &config.shell.program,
-            &config.shell.args,
-            cols,
-            rows,
-            move || {
-                if !wake_pending.swap(true, Ordering::AcqRel) {
-                    if let Err(err) = proxy.send_event(VoltEvent::PtyData) {
-                        eprintln!("volt-ui: failed to send PtyData event: {err}");
-                    }
-                }
-            },
-        )?;
-        Ok(Self {
-            pty,
-            performer,
-            event_rx,
-            title: "~".to_string(),
-            cwd: None,
-            running: false,
-        })
-    }
-
-    fn display_title(&self) -> String {
-        let title = self.title.trim();
-        let raw = if !title.is_empty() && title != "~" {
-            title.to_string()
-        } else {
-            self.cwd
-                .as_deref()
-                .map(|p| {
-                    if let Some(home) = dirs::home_dir() {
-                        if p == home {
-                            return "~".to_string();
-                        }
-                        if let Ok(rel) = p.strip_prefix(&home) {
-                            if let Some(name) = rel.file_name() {
-                                return format!("~/{}", name.to_string_lossy());
-                            }
-                            return "~".to_string();
-                        }
-                    }
-                    p.file_name()
-                        .map(|name| name.to_string_lossy().to_string())
-                        .unwrap_or_else(|| p.to_string_lossy().to_string())
-                })
-                .unwrap_or_else(|| "~".to_string())
-        };
-        if raw.trim().is_empty() {
-            return "~".to_string();
-        }
-        if raw.len() > 20 {
-            format!("...{}", &raw[raw.len() - 20..])
-        } else {
-            raw
-        }
-    }
-}
-
-impl TerminalTab {
-    fn spawn(
-        config: &Config,
-        cols: u16,
-        rows: u16,
-        proxy: EventLoopProxy<VoltEvent>,
-        wake_pending: Arc<AtomicBool>,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
-            primary: TerminalPane::spawn(config, cols, rows, proxy, wake_pending)?,
-            secondary: None,
-            split_direction: None,
-            active_pane: PaneSlot::Primary,
-        })
-    }
-
-    fn pane_count(&self) -> usize {
-        if self.secondary.is_some() {
-            2
-        } else {
-            1
-        }
-    }
-
-    fn is_busy(&self) -> bool {
-        self.primary.running || self.secondary.as_ref().is_some_and(|pane| pane.running)
-    }
-
-    fn active_pane(&self) -> &TerminalPane {
-        if self.active_pane == PaneSlot::Secondary {
-            if let Some(secondary) = self.secondary.as_ref() {
-                return secondary;
-            }
-        }
-        &self.primary
-    }
-
-    fn active_pane_mut(&mut self) -> &mut TerminalPane {
-        if self.active_pane == PaneSlot::Secondary {
-            if let Some(secondary) = self.secondary.as_mut() {
-                return secondary;
-            }
-        }
-        &mut self.primary
-    }
-
-    fn set_active_pane(&mut self, slot: PaneSlot) {
-        if slot == PaneSlot::Secondary && self.secondary.is_none() {
-            self.active_pane = PaneSlot::Primary;
-            return;
-        }
-        self.active_pane = slot;
-    }
-
-    fn split(
-        &mut self,
-        direction: PaneSplitDirection,
-        config: &Config,
-        cols: u16,
-        rows: u16,
-        proxy: EventLoopProxy<VoltEvent>,
-        wake_pending: Arc<AtomicBool>,
-    ) -> bool {
-        if self.secondary.is_none() {
-            let Ok(pane) = TerminalPane::spawn(config, cols, rows, proxy, wake_pending) else {
-                return false;
-            };
-            self.secondary = Some(pane);
-        }
-        let changed_direction = self.split_direction != Some(direction);
-        self.split_direction = Some(direction);
-        self.active_pane = PaneSlot::Secondary;
-        changed_direction || self.secondary.is_some()
-    }
-
-    fn close_secondary(&mut self) {
-        self.secondary = None;
-        self.split_direction = None;
-        if self.active_pane == PaneSlot::Secondary {
-            self.active_pane = PaneSlot::Primary;
-        }
-    }
-
-    fn promote_secondary_to_primary(&mut self) {
-        if let Some(secondary) = self.secondary.take() {
-            self.primary = secondary;
-            self.split_direction = None;
-            self.active_pane = PaneSlot::Primary;
-        }
-    }
-
-    fn display_title(&self, index: usize) -> String {
-        let _ = index;
-        self.active_pane().display_title()
-    }
-}
-
-// ── tab bar hit testing ──────────────────────────────────────────────────────
-
-struct TabLayout {
-    sc: f32,
-    left_pad: f32,
-    tab_w: f32,
-    tab_gap: f32,
-    tab_y: f32,
-    tab_h: f32,
-    close_w: f32,
-    plus_x: f32,
-    plus_w: f32,
-}
-
-impl TabLayout {
-    fn compute(sw: f32, tab_bar_h: f32, n_tabs: usize, sc: f32) -> Self {
-        let left_pad = (78.0 * sc).round();
-        let tab_gap = (4.0 * sc).round().max(2.0);
-        let plus_w = (24.0 * sc).round().max(20.0);
-        let right_pad = (10.0 * sc).round();
-        let plus_x = (sw - right_pad - plus_w).max(left_pad + plus_w);
-        let tab_area_w = (plus_x - left_pad - 10.0 * sc).max(80.0 * sc);
-        let n = n_tabs.max(1);
-        let tab_w = ((tab_area_w - tab_gap * (n.saturating_sub(1)) as f32) / n as f32)
-            .min(220.0 * sc)
-            .max(100.0 * sc);
-        let tab_h = (tab_bar_h - 8.0 * sc).max(24.0 * sc);
-        let tab_y = ((tab_bar_h - tab_h) * 0.5).round().max(2.0 * sc);
-        TabLayout {
-            sc,
-            left_pad,
-            tab_w,
-            tab_gap,
-            tab_y,
-            tab_h,
-            close_w: 16.0 * sc,
-            plus_x,
-            plus_w,
-        }
-    }
-
-    fn tab_x(&self, i: usize) -> f32 {
-        self.left_pad + i as f32 * (self.tab_w + self.tab_gap)
-    }
-
-    fn close_rect(&self, i: usize) -> (f32, f32, f32, f32) {
-        let close_box_w = self.close_w + 6.0 * self.sc;
-        let close_box_x = self.tab_x(i) + self.tab_w - close_box_w - 5.0 * self.sc;
-        let close_box_y = self.tab_y + (1.0 * self.sc).max(1.0);
-        let close_box_h = (self.tab_h - 2.0 * self.sc).max(18.0 * self.sc);
-        (close_box_x, close_box_y, close_box_w, close_box_h)
-    }
-
-    fn plus_rect(&self) -> (f32, f32, f32, f32) {
-        let plus_box_x = self.plus_x - 2.0 * self.sc;
-        let plus_box_y = self.tab_y + (1.0 * self.sc).max(1.0);
-        let plus_box_w = self.plus_w + 4.0 * self.sc;
-        let plus_box_h = (self.tab_h - 2.0 * self.sc).max(18.0 * self.sc);
-        (plus_box_x, plus_box_y, plus_box_w, plus_box_h)
-    }
-
-    fn hit_tab(&self, mx: f32, my: f32, n: usize) -> Option<usize> {
-        if my < self.tab_y || my >= self.tab_y + self.tab_h {
-            return None;
-        }
-        for i in 0..n {
-            let tx = self.tab_x(i);
-            if mx >= tx && mx < tx + self.tab_w {
-                return Some(i);
-            }
-        }
-        None
-    }
-    fn hit_close(&self, mx: f32, my: f32, i: usize) -> bool {
-        let (x, y, w, h) = self.close_rect(i);
-        mx >= x && mx < x + w && my >= y && my < y + h
-    }
-
-    fn hit_plus(&self, mx: f32, my: f32) -> bool {
-        let (x, y, w, h) = self.plus_rect();
-        mx >= x && mx < x + w && my >= y && my < y + h
-    }
-}
 
 // ── main window state ────────────────────────────────────────────────────────
 
@@ -1735,6 +1293,7 @@ impl ApplicationHandler<VoltEvent> for App {
                 event:
                     KeyEvent {
                         physical_key,
+                        logical_key,
                         state: key_state,
                         text,
                         ..
@@ -1771,6 +1330,7 @@ impl ApplicationHandler<VoltEvent> for App {
                 let ctrl = state.ctrl_down();
                 let super_key = state.super_down();
                 let shift = state.shift_down();
+                let alt = state.modifiers.alt_key();
 
                 let reload_modifier = {
                     #[cfg(target_os = "macos")]
@@ -1915,52 +1475,25 @@ impl ApplicationHandler<VoltEvent> for App {
                 }
 
                 // ── terminal input ────────────────────────────────────────────
-                let special: Option<&[u8]> = match physical_key {
-                    PhysicalKey::Code(KeyCode::Enter) => Some(b"\r"),
-                    PhysicalKey::Code(KeyCode::Backspace) => Some(b"\x7f"),
-                    PhysicalKey::Code(KeyCode::Tab) => Some(b"\t"),
-                    PhysicalKey::Code(KeyCode::Escape) => Some(b"\x1b"),
-                    PhysicalKey::Code(KeyCode::ArrowUp) => {
-                        if state.active_application_cursor_keys_mode() {
-                            Some(b"\x1bOA")
-                        } else {
-                            Some(b"\x1b[A")
-                        }
-                    }
-                    PhysicalKey::Code(KeyCode::ArrowDown) => {
-                        if state.active_application_cursor_keys_mode() {
-                            Some(b"\x1bOB")
-                        } else {
-                            Some(b"\x1b[B")
-                        }
-                    }
-                    PhysicalKey::Code(KeyCode::ArrowRight) => {
-                        if state.active_application_cursor_keys_mode() {
-                            Some(b"\x1bOC")
-                        } else {
-                            Some(b"\x1b[C")
-                        }
-                    }
-                    PhysicalKey::Code(KeyCode::ArrowLeft) => {
-                        if state.active_application_cursor_keys_mode() {
-                            Some(b"\x1bOD")
-                        } else {
-                            Some(b"\x1b[D")
-                        }
-                    }
-                    PhysicalKey::Code(KeyCode::Home) => Some(b"\x1b[H"),
-                    PhysicalKey::Code(KeyCode::End) => Some(b"\x1b[F"),
-                    PhysicalKey::Code(KeyCode::PageUp) => Some(b"\x1b[5~"),
-                    PhysicalKey::Code(KeyCode::PageDown) => Some(b"\x1b[6~"),
-                    PhysicalKey::Code(KeyCode::Delete) => Some(b"\x1b[3~"),
+                let special = match physical_key {
+                    PhysicalKey::Code(code) => terminal_special_sequence(
+                        code,
+                        shift,
+                        alt,
+                        ctrl,
+                        state.active_application_cursor_keys_mode(),
+                    ),
                     _ => None,
                 };
 
                 if let Some(bytes) = special {
-                    if matches!(physical_key, PhysicalKey::Code(KeyCode::Enter)) {
+                    if matches!(
+                        physical_key,
+                        PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter)
+                    ) {
                         state.active_pane_mut().running = true;
                     }
-                    if let Err(err) = state.active_pane_mut().pty.write(bytes) {
+                    if let Err(err) = state.active_pane_mut().pty.write(&bytes) {
                         eprintln!("volt-ui: failed to write PTY input: {err}");
                     }
                     return;
@@ -1969,7 +1502,12 @@ impl ApplicationHandler<VoltEvent> for App {
                 if ctrl {
                     if let PhysicalKey::Code(code) = physical_key {
                         if let Some(b) = ctrl_code(code) {
-                            if let Err(err) = state.active_pane_mut().pty.write(&[b]) {
+                            let mut bytes = Vec::with_capacity(2);
+                            if alt {
+                                bytes.push(0x1b);
+                            }
+                            bytes.push(b);
+                            if let Err(err) = state.active_pane_mut().pty.write(&bytes) {
                                 eprintln!("volt-ui: failed to write PTY control input: {err}");
                             }
                             return;
@@ -1980,6 +1518,13 @@ impl ApplicationHandler<VoltEvent> for App {
                 if let Some(text) = text {
                     if let Err(err) = state.active_pane_mut().pty.write(text.as_str().as_bytes()) {
                         eprintln!("volt-ui: failed to write PTY text input: {err}");
+                    }
+                    return;
+                }
+
+                if let Some(fallback_text) = logical_key.to_text() {
+                    if let Err(err) = state.active_pane_mut().pty.write(fallback_text.as_bytes()) {
+                        eprintln!("volt-ui: failed to write PTY fallback input: {err}");
                     }
                 }
             }
@@ -2018,6 +1563,12 @@ impl ApplicationHandler<VoltEvent> for App {
                             CoreEvent::CommandFinished { .. } => {
                                 tab.primary.running = false;
                             }
+                            CoreEvent::PtyError(msg) => {
+                                if i == active {
+                                    state.renderer.set_top_alert(Some(msg));
+                                    needs_full_redraw = true;
+                                }
+                            }
                             CoreEvent::PtyClosed => closed_primary.push(i),
                         }
                     }
@@ -2047,6 +1598,12 @@ impl ApplicationHandler<VoltEvent> for App {
                                 }
                                 CoreEvent::CommandFinished { .. } => {
                                     secondary.running = false;
+                                }
+                                CoreEvent::PtyError(msg) => {
+                                    if i == active {
+                                        state.renderer.set_top_alert(Some(msg));
+                                        needs_full_redraw = true;
+                                    }
                                 }
                                 CoreEvent::PtyClosed => closed_secondary.push(i),
                             }
@@ -2224,6 +1781,13 @@ impl ApplicationHandler<VoltEvent> for App {
                             CoreEvent::CommandFinished { .. } => {
                                 tab.primary.running = false;
                             }
+                            CoreEvent::PtyError(msg) => {
+                                if i == active {
+                                    state.renderer.set_top_alert(Some(msg));
+                                    needs_redraw = true;
+                                    needs_full_redraw = true;
+                                }
+                            }
                             CoreEvent::PtyClosed => closed_primary.push(i),
                         }
                     }
@@ -2262,6 +1826,13 @@ impl ApplicationHandler<VoltEvent> for App {
                                 }
                                 CoreEvent::CommandFinished { .. } => {
                                     secondary.running = false;
+                                }
+                                CoreEvent::PtyError(msg) => {
+                                    if i == active {
+                                        state.renderer.set_top_alert(Some(msg));
+                                        needs_redraw = true;
+                                        needs_full_redraw = true;
+                                    }
                                 }
                                 CoreEvent::PtyClosed => closed_secondary.push(i),
                             }
@@ -2361,6 +1932,156 @@ impl ApplicationHandler<VoltEvent> for App {
     }
 }
 
+fn xterm_modifier_param(shift: bool, alt: bool, ctrl: bool) -> Option<u8> {
+    let mut value = 1u8;
+    if shift {
+        value = value.saturating_add(1);
+    }
+    if alt {
+        value = value.saturating_add(2);
+    }
+    if ctrl {
+        value = value.saturating_add(4);
+    }
+    (value > 1).then_some(value)
+}
+
+fn ss3_function_sequence(letter: char, modifier: Option<u8>) -> Vec<u8> {
+    match modifier {
+        Some(m) => format!("\x1b[1;{}{}", m, letter).into_bytes(),
+        None => format!("\x1bO{}", letter).into_bytes(),
+    }
+}
+
+fn csi_tilde_sequence(code: u16, modifier: Option<u8>) -> Vec<u8> {
+    match modifier {
+        Some(m) => format!("\x1b[{};{}~", code, m).into_bytes(),
+        None => format!("\x1b[{}~", code).into_bytes(),
+    }
+}
+
+fn terminal_special_sequence(
+    code: KeyCode,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    application_cursor_keys_mode: bool,
+) -> Option<Vec<u8>> {
+    let modifier = xterm_modifier_param(shift, alt, ctrl);
+
+    match code {
+        KeyCode::Enter | KeyCode::NumpadEnter => {
+            let mut bytes = Vec::with_capacity(2);
+            if alt {
+                bytes.push(0x1b);
+            }
+            bytes.push(b'\r');
+            Some(bytes)
+        }
+        KeyCode::Backspace | KeyCode::NumpadBackspace => {
+            let mut bytes = Vec::with_capacity(2);
+            if alt {
+                bytes.push(0x1b);
+            }
+            bytes.push(0x7f);
+            Some(bytes)
+        }
+        KeyCode::Tab => match modifier {
+            Some(2) => Some(b"\x1b[Z".to_vec()),
+            Some(m) => Some(format!("\x1b[1;{}Z", m).into_bytes()),
+            None => Some(b"\t".to_vec()),
+        },
+        KeyCode::Escape => {
+            let mut bytes = Vec::with_capacity(2);
+            bytes.push(0x1b);
+            if alt {
+                bytes.push(0x1b);
+            }
+            Some(bytes)
+        }
+        KeyCode::ArrowUp => {
+            if let Some(m) = modifier {
+                Some(format!("\x1b[1;{}A", m).into_bytes())
+            } else if application_cursor_keys_mode {
+                Some(b"\x1bOA".to_vec())
+            } else {
+                Some(b"\x1b[A".to_vec())
+            }
+        }
+        KeyCode::ArrowDown => {
+            if let Some(m) = modifier {
+                Some(format!("\x1b[1;{}B", m).into_bytes())
+            } else if application_cursor_keys_mode {
+                Some(b"\x1bOB".to_vec())
+            } else {
+                Some(b"\x1b[B".to_vec())
+            }
+        }
+        KeyCode::ArrowRight => {
+            if let Some(m) = modifier {
+                Some(format!("\x1b[1;{}C", m).into_bytes())
+            } else if application_cursor_keys_mode {
+                Some(b"\x1bOC".to_vec())
+            } else {
+                Some(b"\x1b[C".to_vec())
+            }
+        }
+        KeyCode::ArrowLeft => {
+            if let Some(m) = modifier {
+                Some(format!("\x1b[1;{}D", m).into_bytes())
+            } else if application_cursor_keys_mode {
+                Some(b"\x1bOD".to_vec())
+            } else {
+                Some(b"\x1b[D".to_vec())
+            }
+        }
+        KeyCode::Home => {
+            if let Some(m) = modifier {
+                Some(format!("\x1b[1;{}H", m).into_bytes())
+            } else {
+                Some(b"\x1b[H".to_vec())
+            }
+        }
+        KeyCode::End => {
+            if let Some(m) = modifier {
+                Some(format!("\x1b[1;{}F", m).into_bytes())
+            } else {
+                Some(b"\x1b[F".to_vec())
+            }
+        }
+        KeyCode::Insert => Some(csi_tilde_sequence(2, modifier)),
+        KeyCode::Delete => Some(csi_tilde_sequence(3, modifier)),
+        KeyCode::PageUp => Some(csi_tilde_sequence(5, modifier)),
+        KeyCode::PageDown => Some(csi_tilde_sequence(6, modifier)),
+
+        KeyCode::F1 => Some(ss3_function_sequence('P', modifier)),
+        KeyCode::F2 => Some(ss3_function_sequence('Q', modifier)),
+        KeyCode::F3 => Some(ss3_function_sequence('R', modifier)),
+        KeyCode::F4 => Some(ss3_function_sequence('S', modifier)),
+        KeyCode::F5 => Some(csi_tilde_sequence(15, modifier)),
+        KeyCode::F6 => Some(csi_tilde_sequence(17, modifier)),
+        KeyCode::F7 => Some(csi_tilde_sequence(18, modifier)),
+        KeyCode::F8 => Some(csi_tilde_sequence(19, modifier)),
+        KeyCode::F9 => Some(csi_tilde_sequence(20, modifier)),
+        KeyCode::F10 => Some(csi_tilde_sequence(21, modifier)),
+        KeyCode::F11 => Some(csi_tilde_sequence(23, modifier)),
+        KeyCode::F12 => Some(csi_tilde_sequence(24, modifier)),
+        KeyCode::F13 => Some(csi_tilde_sequence(25, modifier)),
+        KeyCode::F14 => Some(csi_tilde_sequence(26, modifier)),
+        KeyCode::F15 => Some(csi_tilde_sequence(28, modifier)),
+        KeyCode::F16 => Some(csi_tilde_sequence(29, modifier)),
+        KeyCode::F17 => Some(csi_tilde_sequence(31, modifier)),
+        KeyCode::F18 => Some(csi_tilde_sequence(32, modifier)),
+        KeyCode::F19 => Some(csi_tilde_sequence(33, modifier)),
+        KeyCode::F20 => Some(csi_tilde_sequence(34, modifier)),
+        KeyCode::F21 => Some(csi_tilde_sequence(42, modifier)),
+        KeyCode::F22 => Some(csi_tilde_sequence(43, modifier)),
+        KeyCode::F23 => Some(csi_tilde_sequence(44, modifier)),
+        KeyCode::F24 => Some(csi_tilde_sequence(45, modifier)),
+        _ => None,
+    }
+}
+
 fn ctrl_code(code: KeyCode) -> Option<u8> {
     let letter = match code {
         KeyCode::KeyA => b'A',
@@ -2389,6 +2110,13 @@ fn ctrl_code(code: KeyCode) -> Option<u8> {
         KeyCode::KeyX => b'X',
         KeyCode::KeyY => b'Y',
         KeyCode::KeyZ => b'Z',
+        KeyCode::Space | KeyCode::Digit2 => return Some(0x00),
+        KeyCode::Digit3 | KeyCode::BracketLeft => return Some(0x1b),
+        KeyCode::Digit4 | KeyCode::Backslash => return Some(0x1c),
+        KeyCode::Digit5 | KeyCode::BracketRight => return Some(0x1d),
+        KeyCode::Digit6 => return Some(0x1e),
+        KeyCode::Digit7 | KeyCode::Slash | KeyCode::Minus => return Some(0x1f),
+        KeyCode::Digit8 => return Some(0x7f),
         _ => return None,
     };
     Some(letter - b'@')
