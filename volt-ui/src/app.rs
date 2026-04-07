@@ -1071,6 +1071,9 @@ impl ApplicationHandler<VoltEvent> for App {
             return;
         }
 
+        #[cfg(target_os = "macos")]
+        set_app_icon();
+
         if let Err(err) = self.create_main_window(event_loop, Some("volt".to_string())) {
             eprintln!("volt-ui: failed to create initial window: {err}");
             event_loop.exit();
@@ -2120,4 +2123,32 @@ fn ctrl_code(code: KeyCode) -> Option<u8> {
         _ => return None,
     };
     Some(letter - b'@')
+}
+
+// ── macOS app icon ────────────────────────────────────────────────────────────
+
+/// Sets the Dock / app-switcher icon at runtime by loading the embedded
+/// 512×512 PNG through Cocoa's NSImage API.
+#[cfg(target_os = "macos")]
+fn set_app_icon() {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    const ICON_PNG: &[u8] = include_bytes!("../../assets/icon-512.png");
+
+    unsafe {
+        let data: *mut Object = msg_send![
+            class!(NSData),
+            dataWithBytes: ICON_PNG.as_ptr() as *const std::ffi::c_void
+            length: ICON_PNG.len()
+        ];
+        let image: *mut Object = msg_send![class!(NSImage), alloc];
+        let image: *mut Object = msg_send![image, initWithData: data];
+        if !image.is_null() {
+            let app: *mut Object =
+                msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![app, setApplicationIconImage: image];
+            let _: () = msg_send![image, release];
+        }
+    }
 }
