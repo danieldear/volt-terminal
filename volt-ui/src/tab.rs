@@ -38,6 +38,7 @@ pub struct TerminalTab {
     pub secondary: Option<TerminalPane>,
     pub split_direction: Option<PaneSplitDirection>,
     pub active_pane: PaneSlot,
+    pub split_ratio: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -145,7 +146,12 @@ impl TerminalTab {
             secondary: None,
             split_direction: None,
             active_pane: PaneSlot::Primary,
+            split_ratio: 0.5,
         })
+    }
+
+    pub fn set_split_ratio(&mut self, r: f32) {
+        self.split_ratio = r.clamp(0.1, 0.9);
     }
 
     pub fn pane_count(&self) -> usize {

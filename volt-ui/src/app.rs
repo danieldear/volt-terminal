@@ -36,6 +36,12 @@ pub enum VoltEvent {
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
+#[derive(Debug, Clone, Copy)]
+struct DividerDrag {
+    start_ratio: f32,
+    start_px: f32,
+}
+
 // ── main window state ────────────────────────────────────────────────────────
 
 struct MainState {
@@ -69,6 +75,7 @@ struct MainState {
     last_known_native_tab_count: usize,
     proxy: EventLoopProxy<VoltEvent>,
     pty_wake_pending: Arc<AtomicBool>,
+    divider_drag: Option<DividerDrag>,
 }
 
 impl MainState {
@@ -105,8 +112,10 @@ impl MainState {
         match tab.split_direction.unwrap_or(PaneSplitDirection::Vertical) {
             PaneSplitDirection::Vertical => {
                 let usable_cols = total_cols.saturating_sub(divider).max(2);
-                let left_cols = (usable_cols / 2).max(1);
-                let right_cols = (usable_cols - left_cols).max(1);
+                let left_cols = ((usable_cols as f32 * tab.split_ratio).round() as usize)
+                    .max(1)
+                    .min(usable_cols - 1);
+                let right_cols = usable_cols - left_cols;
                 (
                     (left_cols, total_rows.max(1)),
                     Some((right_cols, total_rows.max(1))),
@@ -114,8 +123,10 @@ impl MainState {
             }
             PaneSplitDirection::Horizontal => {
                 let usable_rows = total_rows.saturating_sub(divider).max(2);
-                let top_rows = (usable_rows / 2).max(1);
-                let bottom_rows = (usable_rows - top_rows).max(1);
+                let top_rows = ((usable_rows as f32 * tab.split_ratio).round() as usize)
+                    .max(1)
+                    .min(usable_rows - 1);
+                let bottom_rows = usable_rows - top_rows;
                 (
                     (total_cols.max(1), top_rows),
                     Some((total_cols.max(1), bottom_rows)),
@@ -156,6 +167,60 @@ impl MainState {
 
     fn active_pane_mut(&mut self) -> &mut TerminalPane {
         self.active_tab_mut().active_pane_mut()
+    }
+
+    /// Returns the physical-pixel coordinate of the divider and its direction,
+    /// or None if the active tab has no secondary pane.
+    fn divider_px_coord(&self) -> Option<(f32, PaneSplitDirection)> {
+        let tab = &self.tabs[self.active_tab];
+        if tab.secondary.is_none() {
+            return None;
+        }
+        let direction = tab.split_direction.unwrap_or(PaneSplitDirection::Vertical);
+        let (total_cols, total_rows) = self.current_grid_size();
+        let ((primary_cols, primary_rows), _) =
+            Self::pane_grid_sizes_for_tab(tab, total_cols, total_rows);
+        let phys_pad = self.renderer.padding * self.renderer.scale_factor;
+        let content_top = self.current_content_top_offset();
+        let divider_px = match direction {
+            PaneSplitDirection::Vertical => phys_pad + primary_cols as f32 * self.renderer.cell_width,
+            PaneSplitDirection::Horizontal => {
+                content_top + phys_pad + primary_rows as f32 * self.renderer.cell_height
+            }
+        };
+        Some((divider_px, direction))
+    }
+
+    fn resize_panes_for_active_tab(&mut self) {
+        let (total_cols, total_rows) = self.current_grid_size();
+        let active = self.active_tab;
+        let ((primary_cols, primary_rows), secondary_size) = {
+            let tab = &self.tabs[active];
+            Self::pane_grid_sizes_for_tab(tab, total_cols, total_rows)
+        };
+        let tab = &mut self.tabs[active];
+        if let Err(err) = tab.primary.pty.resize(primary_cols as u16, primary_rows as u16) {
+            eprintln!("volt-ui: failed to resize primary PTY after divider drag: {err}");
+        }
+        match tab.primary.performer.lock() {
+            Ok(mut performer) => performer.resize(primary_cols, primary_rows),
+            Err(err) => {
+                eprintln!("volt-ui: failed to lock primary performer after divider drag: {err}")
+            }
+        }
+        if let (Some(secondary), Some((secondary_cols, secondary_rows))) =
+            (tab.secondary.as_mut(), secondary_size)
+        {
+            if let Err(err) = secondary.pty.resize(secondary_cols as u16, secondary_rows as u16) {
+                eprintln!("volt-ui: failed to resize secondary PTY after divider drag: {err}");
+            }
+            match secondary.performer.lock() {
+                Ok(mut performer) => performer.resize(secondary_cols, secondary_rows),
+                Err(err) => eprintln!(
+                    "volt-ui: failed to lock secondary performer after divider drag: {err}"
+                ),
+            }
+        }
     }
 
     fn switch_tab(&mut self, idx: usize) {
@@ -1002,6 +1067,7 @@ impl App {
             last_known_native_tab_count: native_tab_count,
             proxy,
             pty_wake_pending: Arc::clone(&self.pty_wake_pending),
+            divider_drag: None,
         };
         state
             .window
@@ -1165,21 +1231,71 @@ impl ApplicationHandler<VoltEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_pos = (position.x as f32, position.y as f32);
-                let cell = state.pane_cell_from_mouse(state.mouse_pos.0, state.mouse_pos.1);
-                if let Some((pane, col, row)) = cell {
-                    if pane == state.active_tab().active_pane {
-                        if state.last_reported_mouse_cell != Some((col, row)) {
-                            let _ = state.report_mouse_motion(col, row);
-                            state.last_reported_mouse_cell = Some((col, row));
+
+                if let Some(drag) = state.divider_drag {
+                    // Update divider position during drag
+                    let active = state.active_tab;
+                    if state.tabs[active].secondary.is_some() {
+                        let direction = state.tabs[active]
+                            .split_direction
+                            .unwrap_or(PaneSplitDirection::Vertical);
+                        let (total_cols, total_rows) = state.current_grid_size();
+                        let cell_w = state.renderer.cell_width;
+                        let cell_h = state.renderer.cell_height;
+                        let delta = match direction {
+                            PaneSplitDirection::Vertical => position.x as f32 - drag.start_px,
+                            PaneSplitDirection::Horizontal => position.y as f32 - drag.start_px,
+                        };
+                        let dim = match direction {
+                            PaneSplitDirection::Vertical => total_cols as f32 * cell_w,
+                            PaneSplitDirection::Horizontal => total_rows as f32 * cell_h,
+                        };
+                        if dim > 0.0 {
+                            let new_ratio = drag.start_ratio + delta / dim;
+                            state.tabs[active].set_split_ratio(new_ratio);
+                            state.begin_redraw();
+                        }
+                    }
+                } else {
+                    // Update cursor icon when hovering near the divider
+                    if let Some((divider_px, direction)) = state.divider_px_coord() {
+                        let mouse_coord = match direction {
+                            PaneSplitDirection::Vertical => position.x as f32,
+                            PaneSplitDirection::Horizontal => position.y as f32,
+                        };
+                        if (mouse_coord - divider_px).abs() < 6.0 {
+                            let icon = match direction {
+                                PaneSplitDirection::Vertical => {
+                                    winit::window::CursorIcon::ColResize
+                                }
+                                PaneSplitDirection::Horizontal => {
+                                    winit::window::CursorIcon::RowResize
+                                }
+                            };
+                            state.window.set_cursor(icon);
+                        } else {
+                            state.window.set_cursor(winit::window::CursorIcon::Default);
+                        }
+                    } else {
+                        state.window.set_cursor(winit::window::CursorIcon::Default);
+                    }
+
+                    let cell = state.pane_cell_from_mouse(state.mouse_pos.0, state.mouse_pos.1);
+                    if let Some((pane, col, row)) = cell {
+                        if pane == state.active_tab().active_pane {
+                            if state.last_reported_mouse_cell != Some((col, row)) {
+                                let _ = state.report_mouse_motion(col, row);
+                                state.last_reported_mouse_cell = Some((col, row));
+                            }
+                        } else {
+                            state.last_reported_mouse_cell = None;
                         }
                     } else {
                         state.last_reported_mouse_cell = None;
                     }
-                } else {
-                    state.last_reported_mouse_cell = None;
-                }
-                if state.is_drag_selecting {
-                    state.update_selection_end(state.mouse_pos.0, state.mouse_pos.1);
+                    if state.is_drag_selecting {
+                        state.update_selection_end(state.mouse_pos.0, state.mouse_pos.1);
+                    }
                 }
             }
 
@@ -1199,6 +1315,38 @@ impl ApplicationHandler<VoltEvent> for App {
                         state.begin_redraw();
                     }
                     return;
+                }
+
+                // Divider drag: release
+                if btn_state == ElementState::Released {
+                    if state.divider_drag.take().is_some() {
+                        state.resize_panes_for_active_tab();
+                        state.window.set_cursor(winit::window::CursorIcon::Default);
+                        state.begin_redraw();
+                        return;
+                    }
+                }
+
+                // Divider drag: press
+                if button == MouseButton::Left && btn_state == ElementState::Pressed {
+                    if let Some((divider_px, direction)) = state.divider_px_coord() {
+                        let mouse_coord = match direction {
+                            PaneSplitDirection::Vertical => mx,
+                            PaneSplitDirection::Horizontal => my,
+                        };
+                        if (mouse_coord - divider_px).abs() < 6.0 {
+                            let start_px = match direction {
+                                PaneSplitDirection::Vertical => mx,
+                                PaneSplitDirection::Horizontal => my,
+                            };
+                            let start_ratio = state.tabs[state.active_tab].split_ratio;
+                            state.divider_drag = Some(DividerDrag {
+                                start_ratio,
+                                start_px,
+                            });
+                            return;
+                        }
+                    }
                 }
 
                 if let Some((pane, col, row)) = state.pane_cell_from_mouse(mx, my) {
