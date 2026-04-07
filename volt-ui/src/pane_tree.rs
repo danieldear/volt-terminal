@@ -126,9 +126,16 @@ impl PaneTree {
         out
     }
 
-    pub fn adjust_ratio(
+    pub fn get_ratio(&self, divider_id: usize) -> Option<f32> {
+        self.root.as_ref().and_then(|r| get_ratio_node(r, divider_id))
+    }
+
+    /// Apply an **absolute** ratio from `start_ratio + total_delta_px / local_span_px`.
+    /// Uses local (sub-tree) dimensions, so nested splits are handled correctly.
+    pub fn set_ratio_from_drag(
         &mut self,
         divider_id: usize,
+        start_ratio: f32,
         delta_px: f32,
         cell_w: f32,
         cell_h: f32,
@@ -136,7 +143,14 @@ impl PaneTree {
         total_rows: usize,
     ) {
         if let Some(root) = &mut self.root {
-            adjust_ratio_node(root, divider_id, delta_px, cell_w, cell_h, total_cols, total_rows);
+            set_ratio_from_drag_node(root, divider_id, start_ratio, delta_px, cell_w, cell_h, total_cols, total_rows);
+        }
+    }
+
+    /// Zero-allocation, borrow-safe leaf iteration with mutation.
+    pub fn for_each_leaf_mut(&mut self, f: &mut impl FnMut(usize, &mut TerminalPane)) {
+        if let Some(root) = &mut self.root {
+            for_each_leaf_mut_node(root, f);
         }
     }
 
@@ -355,9 +369,23 @@ fn remove_node_bv(node: PaneNode, target_id: usize, active_id: &mut usize) -> (P
     }
 }
 
-fn adjust_ratio_node(
+fn get_ratio_node(node: &PaneNode, target: usize) -> Option<f32> {
+    match node {
+        PaneNode::Leaf { .. } => None,
+        PaneNode::Split { divider_id, ratio, children, .. } => {
+            if *divider_id == target { return Some(*ratio); }
+            get_ratio_node(&children[0], target)
+                .or_else(|| get_ratio_node(&children[1], target))
+        }
+    }
+}
+
+/// Set ratio absolutely: `new_ratio = (start_ratio + delta_px / local_span_px).clamp(0.1, 0.9)`.
+/// Recurses with local sub-rect dimensions so nested splits are handled correctly.
+fn set_ratio_from_drag_node(
     node: &mut PaneNode,
     target_divider_id: usize,
+    start_ratio: f32,
     delta_px: f32,
     cell_w: f32,
     cell_h: f32,
@@ -368,38 +396,40 @@ fn adjust_ratio_node(
         PaneNode::Leaf { .. } => false,
         PaneNode::Split { divider_id, direction, ratio, children } => {
             if *divider_id == target_divider_id {
-                match direction {
-                    PaneSplitDirection::Vertical => {
-                        let total_px = cols.saturating_sub(1) as f32 * cell_w;
-                        if total_px > 0.0 {
-                            *ratio = (*ratio + delta_px / total_px).clamp(0.1, 0.9);
-                        }
-                    }
-                    PaneSplitDirection::Horizontal => {
-                        let total_px = rows.saturating_sub(1) as f32 * cell_h;
-                        if total_px > 0.0 {
-                            *ratio = (*ratio + delta_px / total_px).clamp(0.1, 0.9);
-                        }
-                    }
+                let total_px = match direction {
+                    PaneSplitDirection::Vertical  => cols.saturating_sub(1) as f32 * cell_w,
+                    PaneSplitDirection::Horizontal => rows.saturating_sub(1) as f32 * cell_h,
+                };
+                if total_px > 0.0 {
+                    *ratio = (start_ratio + delta_px / total_px).clamp(0.1, 0.9);
+                    if ratio.is_nan() { *ratio = 0.5; }
                 }
-                if ratio.is_nan() { *ratio = 0.5; }
                 return true;
             }
             let (lc, lr, rc, rr) = match direction {
                 PaneSplitDirection::Vertical => {
                     let lc = left_cols_from_ratio(*ratio, cols);
-                    let rc = cols.saturating_sub(lc + 1).max(1);
-                    (lc, rows, rc, rows)
+                    (lc, rows, cols.saturating_sub(lc + 1).max(1), rows)
                 }
                 PaneSplitDirection::Horizontal => {
                     let tr = top_rows_from_ratio(*ratio, rows);
-                    let br = rows.saturating_sub(tr + 1).max(1);
-                    (cols, tr, cols, br)
+                    (cols, tr, cols, rows.saturating_sub(tr + 1).max(1))
                 }
             };
             let [left, right] = children.as_mut();
-            adjust_ratio_node(left, target_divider_id, delta_px, cell_w, cell_h, lc, lr)
-                || adjust_ratio_node(right, target_divider_id, delta_px, cell_w, cell_h, rc, rr)
+            set_ratio_from_drag_node(left,  target_divider_id, start_ratio, delta_px, cell_w, cell_h, lc, lr)
+                || set_ratio_from_drag_node(right, target_divider_id, start_ratio, delta_px, cell_w, cell_h, rc, rr)
+        }
+    }
+}
+
+fn for_each_leaf_mut_node(node: &mut PaneNode, f: &mut impl FnMut(usize, &mut TerminalPane)) {
+    match node {
+        PaneNode::Leaf { id, pane } => f(*id, pane),
+        PaneNode::Split { children, .. } => {
+            let [left, right] = children.as_mut();
+            for_each_leaf_mut_node(left, f);
+            for_each_leaf_mut_node(right, f);
         }
     }
 }
@@ -417,3 +447,5 @@ fn top_rows_from_ratio(ratio: f32, rows: usize) -> usize {
     let tr = (usable as f32 * ratio.clamp(0.1, 0.9)).round() as usize;
     tr.max(1).min(usable.saturating_sub(1).max(1))
 }
+
+

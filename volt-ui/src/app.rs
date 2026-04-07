@@ -41,7 +41,10 @@ const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 #[derive(Debug, Clone, Copy)]
 struct DividerDrag {
     divider_id: usize,
+    /// Physical pixel position where the drag began (x for vertical, y for horizontal).
     start_px: f32,
+    /// Ratio of the divider at drag-start; new ratio is computed as `start_ratio + delta/span`.
+    start_ratio: f32,
     is_vertical: bool,
 }
 
@@ -1024,23 +1027,21 @@ impl ApplicationHandler<VoltEvent> for App {
                 state.mouse_pos = (position.x as f32, position.y as f32);
 
                 if let Some(drag) = state.divider_drag {
-                    let delta = if drag.is_vertical {
-                        position.x as f32 - drag.start_px
-                    } else {
-                        position.y as f32 - drag.start_px
-                    };
+                    // Absolute ratio: start_ratio + total_delta / local_span.
+                    // delta_px is the total movement since drag began — no per-frame reset needed.
+                    let current_px = if drag.is_vertical { position.x as f32 } else { position.y as f32 };
+                    let delta_px = current_px - drag.start_px;
                     let (total_cols, total_rows) = state.current_grid_size();
                     let active = state.active_tab;
-                    state.tabs[active].tree.adjust_ratio(
-                        drag.divider_id, delta,
-                        state.renderer.cell_width, state.renderer.cell_height,
-                        total_cols, total_rows,
+                    state.tabs[active].tree.set_ratio_from_drag(
+                        drag.divider_id,
+                        drag.start_ratio,
+                        delta_px,
+                        state.renderer.cell_width,
+                        state.renderer.cell_height,
+                        total_cols,
+                        total_rows,
                     );
-                    // reset start_px so delta is incremental on next move
-                    state.divider_drag = Some(DividerDrag {
-                        start_px: if drag.is_vertical { position.x as f32 } else { position.y as f32 },
-                        ..drag
-                    });
                     state.begin_redraw();
                 } else {
                     // Update cursor icon and hover state near any divider.
@@ -1142,9 +1143,12 @@ impl ApplicationHandler<VoltEvent> for App {
                             && span_coord >= span_start - 4.0
                             && span_coord <= span_end + 4.0
                         {
+                            let start_ratio = state.active_tab().tree
+                                .get_ratio(div.id).unwrap_or(0.5);
                             state.divider_drag = Some(DividerDrag {
                                 divider_id: div.id,
                                 start_px: axis_coord,
+                                start_ratio,
                                 is_vertical,
                             });
                             started_drag = true;
@@ -1506,11 +1510,10 @@ impl ApplicationHandler<VoltEvent> for App {
                 let mut closed_panes: Vec<(usize, usize)> = Vec::new();
 
                 for (i, tab) in state.tabs.iter_mut().enumerate() {
-                    let leaf_ids = tab.tree.leaf_ids();
-                    for pane_id in leaf_ids {
+                    let mut pty_errors: Vec<String> = Vec::new();
+                    tab.tree.for_each_leaf_mut(&mut |pane_id, pane| {
                         loop {
-                            let Some(ev) = tab.tree.find_leaf_mut(pane_id)
-                                .and_then(|p| p.event_rx.try_recv().ok()) else { break; };
+                            let Some(ev) = pane.event_rx.try_recv().ok() else { break; };
                             match ev {
                                 CoreEvent::GridUpdated { damaged_rows } => {
                                     if i == active {
@@ -1527,30 +1530,20 @@ impl ApplicationHandler<VoltEvent> for App {
                                         }
                                     }
                                 }
-                                CoreEvent::CwdChanged(path) => {
-                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
-                                        p.cwd = Some(path);
-                                    }
-                                }
-                                CoreEvent::TitleChanged(t) => {
-                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
-                                        p.title = t;
-                                    }
-                                }
-                                CoreEvent::CommandFinished { .. } => {
-                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
-                                        p.running = false;
-                                    }
-                                }
+                                CoreEvent::CwdChanged(path) => { pane.cwd = Some(path); }
+                                CoreEvent::TitleChanged(t)   => { pane.title = t; }
+                                CoreEvent::CommandFinished { .. } => { pane.running = false; }
                                 CoreEvent::PtyError(msg) => {
-                                    if i == active {
-                                        state.renderer.set_top_alert(Some(msg));
-                                        needs_full_redraw = true;
-                                    }
+                                    if i == active { pty_errors.push(msg); }
                                 }
                                 CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                             }
                         }
+                    });
+                    // Process PtyErrors after the borrow on tab.tree is released.
+                    for msg in pty_errors {
+                        state.renderer.set_top_alert(Some(msg));
+                        needs_full_redraw = true;
                     }
                 }
 
@@ -1672,11 +1665,10 @@ impl ApplicationHandler<VoltEvent> for App {
 
             if !state.redraw_pending {
                 for (i, tab) in state.tabs.iter_mut().enumerate() {
-                    let leaf_ids = tab.tree.leaf_ids();
-                    for pane_id in leaf_ids {
+                    let mut pty_errors: Vec<String> = Vec::new();
+                    tab.tree.for_each_leaf_mut(&mut |pane_id, pane| {
                         loop {
-                            let Some(ev) = tab.tree.find_leaf_mut(pane_id)
-                                .and_then(|p| p.event_rx.try_recv().ok()) else { break; };
+                            let Some(ev) = pane.event_rx.try_recv().ok() else { break; };
                             match ev {
                                 CoreEvent::GridUpdated { damaged_rows } => {
                                     if i == active {
@@ -1694,38 +1686,32 @@ impl ApplicationHandler<VoltEvent> for App {
                                     }
                                 }
                                 CoreEvent::CwdChanged(path) => {
-                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
-                                        p.cwd = Some(path);
-                                    }
+                                    pane.cwd = Some(path);
                                     if i == active || show_tab_chrome {
                                         needs_redraw = true;
                                         needs_full_redraw = true;
                                     }
                                 }
                                 CoreEvent::TitleChanged(t) => {
-                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
-                                        p.title = t;
-                                    }
+                                    pane.title = t;
                                     if i == active || show_tab_chrome {
                                         needs_redraw = true;
                                         needs_full_redraw = true;
                                     }
                                 }
-                                CoreEvent::CommandFinished { .. } => {
-                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
-                                        p.running = false;
-                                    }
-                                }
+                                CoreEvent::CommandFinished { .. } => { pane.running = false; }
                                 CoreEvent::PtyError(msg) => {
-                                    if i == active {
-                                        state.renderer.set_top_alert(Some(msg));
-                                        needs_redraw = true;
-                                        needs_full_redraw = true;
-                                    }
+                                    if i == active { pty_errors.push(msg); }
                                 }
                                 CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                             }
                         }
+                    });
+                    // Process PtyErrors after the borrow on tab.tree is released.
+                    for msg in pty_errors {
+                        state.renderer.set_top_alert(Some(msg));
+                        needs_redraw = true;
+                        needs_full_redraw = true;
                     }
                 }
             }
