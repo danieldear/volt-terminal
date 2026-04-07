@@ -138,9 +138,50 @@ pub struct Config {
     pub theme: String,
     #[serde(default)]
     pub appearance: AppearanceConfig,
+    #[serde(default)]
+    pub ai: AiConfig,
 }
 fn default_theme() -> String {
     "catppuccin".to_string()
+}
+
+/// Configuration for the AI Chat Panel feature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    /// Base URL of an OpenAI-compatible API endpoint.
+    /// Example: "https://api.openai.com/v1"
+    #[serde(default = "default_ai_endpoint")]
+    pub endpoint: String,
+    /// API key (Bearer token). Empty string disables authentication.
+    #[serde(default)]
+    pub api_key: String,
+    /// Model name to request.
+    #[serde(default = "default_ai_model")]
+    pub model: String,
+    /// Number of terminal scrollback lines to inject as context with each query.
+    #[serde(default = "default_ai_context_lines")]
+    pub context_lines: usize,
+}
+
+fn default_ai_endpoint() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+fn default_ai_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+fn default_ai_context_lines() -> usize {
+    50
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: default_ai_endpoint(),
+            api_key: String::new(),
+            model: default_ai_model(),
+            context_lines: default_ai_context_lines(),
+        }
+    }
 }
 
 fn is_value_boundary(ch: char) -> bool {

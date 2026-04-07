@@ -29,8 +29,7 @@ const TAB_BAR_TAB_TOP_INSET: f32 = 4.0;
 const TAB_BAR_TAB_BOTTOM_INSET: f32 = 4.0;
 const TAB_BAR_BUTTON_INSET: f32 = 4.0;
 const TAB_BAR_BUTTON_PADDING: f32 = 5.0;
-#[cfg(target_os = "macos")]
-const MACOS_SINGLE_TAB_TITLEBAR_INSET: f32 = 26.0;
+
 
 /// Positioned glyph from a shaped Buffer run — everything needed to place it
 /// in the atlas and emit vertices, WITHOUT the colour (which varies per cell).
@@ -564,22 +563,10 @@ impl Renderer {
         self.shape_cache.clear();
     }
 
-    fn tab_bar_height_for_tab_count(&self, tab_count: usize) -> f32 {
-        if tab_count > 1 {
-            return self.tab_bar_height;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // With transparent/fullsize titlebar, macOS places traffic lights over content.
-            // Keep a minimal top inset in single-tab mode so the first row clears titlebar chrome.
-            return (MACOS_SINGLE_TAB_TITLEBAR_INSET * self.scale_factor)
-                .round()
-                .max(20.0);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            0.0
-        }
+    fn tab_bar_height_for_tab_count(&self, _tab_count: usize) -> f32 {
+        // Always show the full tab bar regardless of tab count.
+        // On macOS with transparent titlebar this also ensures traffic lights clear content.
+        self.tab_bar_height
     }
 
     fn alert_bar_height(&self) -> f32 {

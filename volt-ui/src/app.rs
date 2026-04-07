@@ -20,6 +20,7 @@ use volt_renderer::{Renderer, TabEntry};
 
 #[cfg(target_os = "macos")]
 use crate::display_link::DisplayLinkScheduler;
+use crate::chat_panel::ChatPanel;
 use crate::pane_tree::RemoveResult;
 use crate::tab::{PaneSplitDirection, Selection, TerminalPane, TerminalTab};
 use crate::tab_layout::TabLayout;
@@ -80,6 +81,8 @@ struct MainState {
     divider_drag: Option<DividerDrag>,
     /// ID of the divider the mouse is currently hovering over (for visual highlight).
     divider_hover_id: Option<usize>,
+    /// AI Chat Panel sidebar state.
+    chat_panel: ChatPanel,
 }
 
 impl MainState {
@@ -88,7 +91,8 @@ impl MainState {
     }
 
     fn show_custom_tab_bar(&self) -> bool {
-        self.layout_tab_count() > 1
+        // Tab bar is always visible — even with a single tab.
+        true
     }
 
     fn current_tab_bar_height(&self) -> f32 {
@@ -852,6 +856,7 @@ impl App {
             pty_wake_pending: Arc::clone(&self.pty_wake_pending),
             divider_drag: None,
             divider_hover_id: None,
+            chat_panel: ChatPanel::new(),
         };
         state
             .window
@@ -1343,6 +1348,12 @@ impl ApplicationHandler<VoltEvent> for App {
                             if state.split_active_tab(direction) {
                                 state.begin_redraw();
                             }
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyA) if shift => {
+                            // Cmd+Shift+A: toggle AI Chat Panel
+                            state.chat_panel.toggle();
+                            state.begin_redraw();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyT) => {

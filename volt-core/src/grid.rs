@@ -146,16 +146,19 @@ impl Grid {
         for col in from_col..=end {
             self.cells[row_start + col] = Cell::default();
         }
+        self.dirty[row] = true;
     }
 
     pub fn clear_screen(&mut self) {
         self.cells.fill(Cell::default());
         self.cursor_col = 0;
         self.cursor_row = 0;
+        self.mark_all_dirty();
     }
 
     pub fn erase_all(&mut self) {
         self.cells.fill(Cell::default());
+        self.mark_all_dirty();
     }
 
     pub fn advance_cursor(&mut self) {
