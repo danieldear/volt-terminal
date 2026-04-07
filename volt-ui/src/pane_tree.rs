@@ -448,14 +448,20 @@ fn for_each_leaf_mut_node(node: &mut PaneNode, f: &mut impl FnMut(usize, &mut Te
 
 fn left_cols_from_ratio(ratio: f32, cols: usize) -> usize {
     let usable = cols.saturating_sub(1);
-    let lc = (usable as f32 * ratio.clamp(0.1, 0.9)).round() as usize;
-    lc.max(1).min(usable.saturating_sub(1).max(1))
+    if usable < 2 { return 1; }
+    let min_ratio = 1.0 / usable as f32;
+    let max_ratio = (usable - 1) as f32 / usable as f32;
+    let lc = (usable as f32 * ratio.clamp(min_ratio, max_ratio)).round() as usize;
+    lc.max(1).min(usable - 1)
 }
 
 fn top_rows_from_ratio(ratio: f32, rows: usize) -> usize {
     let usable = rows.saturating_sub(1);
-    let tr = (usable as f32 * ratio.clamp(0.1, 0.9)).round() as usize;
-    tr.max(1).min(usable.saturating_sub(1).max(1))
+    if usable < 2 { return 1; }
+    let min_ratio = 1.0 / usable as f32;
+    let max_ratio = (usable - 1) as f32 / usable as f32;
+    let tr = (usable as f32 * ratio.clamp(min_ratio, max_ratio)).round() as usize;
+    tr.max(1).min(usable - 1)
 }
 
 

@@ -488,16 +488,9 @@ impl MainState {
 
     fn selected_text(&self) -> Option<String> {
         let sel = self.selection?.normalized();
-        if sel.pane_id != self.active_tab().tree.active_id {
-            return None;
-        }
-        let performer = self
-            .tabs
-            .get(self.active_tab)?
-            .active_pane()
-            .performer
-            .lock()
-            .ok()?;
+        let tab = self.tabs.get(self.active_tab)?;
+        let pane = tab.tree.find_leaf(sel.pane_id)?;
+        let performer = pane.performer.lock().ok()?;
         let grid = &performer.grid;
         if sel.start_row >= grid.rows || sel.end_row >= grid.rows {
             return None;
