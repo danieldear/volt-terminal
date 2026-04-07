@@ -169,6 +169,16 @@ pub struct TabEntry<'a> {
     pub pane_count: usize,
 }
 
+/// A pixel-precise divider line between panes.
+#[derive(Debug, Clone, Copy)]
+pub struct PaneDivider {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub color: [f32; 4],
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -1006,6 +1016,7 @@ impl Renderer {
         cursor_visible: bool,
         selection: Option<((usize, usize), (usize, usize))>,
         _damage_rows: Option<(usize, usize)>,
+        dividers: &[PaneDivider],
     ) {
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(o)
@@ -1542,6 +1553,9 @@ impl Renderer {
         }
 
         let bg_color = theme.background.to_f32();
+        for d in dividers {
+            self.draw_rect(&mut bg_verts, d.x, d.y, d.width, d.height, d.color);
+        }
         self.submit_frame(
             view,
             output,

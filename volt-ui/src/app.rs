@@ -191,6 +191,42 @@ impl MainState {
         Some((divider_px, direction))
     }
 
+    fn pane_divider_rect(&self) -> Option<volt_renderer::PaneDivider> {
+        let tab = &self.tabs[self.active_tab];
+        if tab.secondary.is_none() {
+            return None;
+        }
+        let direction = tab.split_direction.unwrap_or(PaneSplitDirection::Vertical);
+        let (total_cols, total_rows) = self.current_grid_size();
+        let ((primary_cols, primary_rows), _) =
+            Self::pane_grid_sizes_for_tab(tab, total_cols, total_rows);
+        let phys_pad = self.renderer.padding * self.renderer.scale_factor;
+        let content_top = self.current_content_top_offset();
+        let size = self.window.inner_size();
+        let sw = size.width as f32;
+        let sh = size.height as f32;
+        let sc = self.renderer.scale_factor;
+        let line_w = sc.max(1.0);
+        let color = [0.35_f32, 0.35, 0.35, 1.0];
+        let divider = match direction {
+            PaneSplitDirection::Vertical => volt_renderer::PaneDivider {
+                x: phys_pad + primary_cols as f32 * self.renderer.cell_width,
+                y: content_top,
+                width: line_w,
+                height: sh - content_top - phys_pad,
+                color,
+            },
+            PaneSplitDirection::Horizontal => volt_renderer::PaneDivider {
+                x: phys_pad,
+                y: content_top + phys_pad + primary_rows as f32 * self.renderer.cell_height,
+                width: sw - 2.0 * phys_pad,
+                height: line_w,
+                color,
+            },
+        };
+        Some(divider)
+    }
+
     fn resize_panes_for_active_tab(&mut self) {
         let (total_cols, total_rows) = self.current_grid_size();
         let active = self.active_tab;
@@ -503,35 +539,6 @@ impl MainState {
                 secondary_layout.0,
                 secondary_layout.1,
             );
-        }
-
-        if tab.secondary.is_some() {
-            let separator_char = if tab.active_pane == PaneSlot::Secondary {
-                '\u{2503}'
-            } else {
-                '\u{2502}'
-            };
-            match tab.split_direction.unwrap_or(PaneSplitDirection::Vertical) {
-                PaneSplitDirection::Vertical => {
-                    let separator_col = primary_layout.2.min(out.cols.saturating_sub(1));
-                    for row in 0..out.rows {
-                        let cell = out.cell_mut(separator_col, row);
-                        cell.c = separator_char;
-                    }
-                }
-                PaneSplitDirection::Horizontal => {
-                    let separator_row = primary_layout.3.min(out.rows.saturating_sub(1));
-                    let horiz = if tab.active_pane == PaneSlot::Secondary {
-                        '\u{2501}'
-                    } else {
-                        '\u{2500}'
-                    };
-                    for col in 0..out.cols {
-                        let cell = out.cell_mut(col, separator_row);
-                        cell.c = horiz;
-                    }
-                }
-            }
         }
 
         let (active_grid, active_cursor_visible) = if tab.active_pane == PaneSlot::Secondary {
@@ -1838,6 +1845,8 @@ impl ApplicationHandler<VoltEvent> for App {
                         return;
                     };
                     let damage_rows = state.take_render_damage_rows();
+                    let dividers: Vec<volt_renderer::PaneDivider> =
+                        state.pane_divider_rect().into_iter().collect();
                     state.renderer.render_frame(
                         &render_grid,
                         &state.theme,
@@ -1845,6 +1854,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         state.effective_cursor_visible(render_cursor_visible),
                         state.selection_tuple(),
                         damage_rows,
+                        &dividers,
                     );
                 }
             }
