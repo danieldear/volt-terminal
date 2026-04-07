@@ -14,3 +14,6 @@ AGENTS.md
 .cursor/
 .zed/
 .vscode/
+
+# icon build artifacts
+assets/AppIcon.iconset/

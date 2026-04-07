@@ -2,6 +2,15 @@
 name = "volt"
 version.workspace = true
 edition.workspace = true
+description = "A fast, GPU-accelerated terminal emulator"
+
+[package.metadata.bundle]
+name = "Volt"
+identifier = "com.danieldear.volt"
+icon = ["AppIcon.icns"]
+short_description = "A fast, GPU-accelerated terminal emulator"
+copyright = "Copyright © 2025 Daniel Dear. MIT License."
+category = "developer-tool"
 
 [[bin]]
 name = "volt"
