@@ -2145,6 +2145,14 @@ fn set_app_icon() {
         let image: *mut Object = msg_send![class!(NSImage), alloc];
         let image: *mut Object = msg_send![image, initWithData: data];
         if !image.is_null() {
+            // Set logical size to 128×128pt. rsvg exports at 72 DPI so a
+            // 512px PNG would have an NSImage size of 512pt — too large for
+            // the Dock. Standard macOS icon point size is 128pt.
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct NSSize { width: f64, height: f64 }
+            let sz = NSSize { width: 128.0, height: 128.0 };
+            let _: () = msg_send![image, setSize: sz];
             let app: *mut Object =
                 msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![app, setApplicationIconImage: image];

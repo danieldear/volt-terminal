@@ -1,8 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
   <defs>
-    <!-- Apple HIG: canvas 1024×1024, safe zone 824×824 (100px padding each side) -->
-    <!-- Corner radius ~185px per Apple spec -->
-
     <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" style="stop-color:#313244"/>
       <stop offset="100%" style="stop-color:#1e1e2e"/>
@@ -22,32 +19,28 @@
       </feMerge>
     </filter>
 
-    <!-- squircle clip — macOS does NOT auto-apply this, must be explicit -->
+    <!-- Apple HIG squircle: 1024x1024 canvas, rx≈185 -->
     <clipPath id="squircle">
       <rect width="1024" height="1024" rx="185" ry="185"/>
     </clipPath>
   </defs>
 
-  <!-- Everything clipped cleanly to the squircle -->
   <g clip-path="url(#squircle)">
-
-    <!-- Background plate -->
     <rect width="1024" height="1024" fill="url(#bg)"/>
 
     <!--
-      Lightning bolt — designed within safe zone (100–924px each axis).
-      Width: x 190→810 = 620px = 75% of 824 safe zone  ✓
-      Height: y 155→870 = 715px = 87% of 824 safe zone  ✓
+      Same proportions as original bolt (which looked good) but scaled to
+      fill ~60% width × 87% height of safe zone (100–924px each axis).
+      Horizontal lean: 164px over 715px — natural, not excessive.
     -->
     <polygon
-      points="680,155  190,530  510,530  330,870  810,480  490,480"
+      points="594,155  265,555  512,555  430,870  759,470  512,470"
       fill="url(#bolt)"
       filter="url(#glow)"
     />
-
   </g>
 
-  <!-- Visible border stroke — separates icon from dark Dock background -->
+  <!-- Visible border -->
   <rect x="14" y="14" width="996" height="996" rx="178" ry="178"
         fill="none" stroke="#585b70" stroke-width="16"/>
 </svg>
