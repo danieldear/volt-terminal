@@ -396,13 +396,23 @@ fn set_ratio_from_drag_node(
         PaneNode::Leaf { .. } => false,
         PaneNode::Split { divider_id, direction, ratio, children } => {
             if *divider_id == target_divider_id {
-                let total_px = match direction {
-                    PaneSplitDirection::Vertical  => cols.saturating_sub(1) as f32 * cell_w,
-                    PaneSplitDirection::Horizontal => rows.saturating_sub(1) as f32 * cell_h,
+                // Determine usable span (total cells minus the 1-cell divider).
+                let usable = match direction {
+                    PaneSplitDirection::Vertical   => cols.saturating_sub(1),
+                    PaneSplitDirection::Horizontal => rows.saturating_sub(1),
                 };
-                if total_px > 0.0 {
-                    *ratio = (start_ratio + delta_px / total_px).clamp(0.1, 0.9);
-                    if ratio.is_nan() { *ratio = 0.5; }
+                // Both children must get ≥ 1 cell — need at least 2 usable.
+                if usable < 2 { return true; }
+                let span_px = usable as f32 * match direction {
+                    PaneSplitDirection::Vertical   => cell_w,
+                    PaneSplitDirection::Horizontal => cell_h,
+                };
+                if span_px > 0.0 {
+                    // Cell-aware bounds: left ≥ 1 cell, right ≥ 1 cell.
+                    let min_ratio = 1.0 / usable as f32;
+                    let max_ratio = (usable - 1) as f32 / usable as f32;
+                    *ratio = (start_ratio + delta_px / span_px).clamp(min_ratio, max_ratio);
+                    if ratio.is_nan() { *ratio = 0.5_f32.clamp(min_ratio, max_ratio); }
                 }
                 return true;
             }
