@@ -1,18 +1,37 @@
+<!--
+  Apple macOS icon spec:
+  - Canvas:    1024×1024 px (transparent outside squircle)
+  - Safe zone: 824×824 px, offset (100, 100) — 10% margin on all sides
+  - Corner rx: 824 × 22.4% ≈ 185 px (relative to the 824 shape)
+  - System adds drop shadow in the 100px margin — do NOT bake one in
+-->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
   <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+    <!-- Background: dark Catppuccin Mocha -->
+    <linearGradient id="bg" x1="100" y1="100" x2="924" y2="924"
+                    gradientUnits="userSpaceOnUse">
       <stop offset="0%" style="stop-color:#313244"/>
       <stop offset="100%" style="stop-color:#1e1e2e"/>
     </linearGradient>
 
-    <linearGradient id="bolt" x1="20%" y1="0%" x2="80%" y2="100%">
+    <!-- Bolt gradient -->
+    <linearGradient id="bolt" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%"   style="stop-color:#cba6f7"/>
       <stop offset="50%"  style="stop-color:#89b4fa"/>
       <stop offset="100%" style="stop-color:#74c7ec"/>
     </linearGradient>
 
-    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
-      <feGaussianBlur stdDeviation="18" result="blur"/>
+    <!-- Glass specular: subtle top-down white highlight -->
+    <linearGradient id="glassshine" x1="0" y1="100" x2="0" y2="924"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   style="stop-color:#ffffff; stop-opacity:0.16"/>
+      <stop offset="50%"  style="stop-color:#ffffff; stop-opacity:0.03"/>
+      <stop offset="100%" style="stop-color:#ffffff; stop-opacity:0.00"/>
+    </linearGradient>
+
+    <!-- Soft glow for bolt -->
+    <filter id="glow" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="14" result="blur"/>
       <feMerge>
         <feMergeNode in="blur"/>
         <feMergeNode in="SourceGraphic"/>
@@ -20,30 +39,40 @@
     </filter>
 
     <!--
-      Apple HIG squircle: rx = 22.4% of 1024 = 230px.
-      This matches the corner curvature macOS uses for all app icons.
-      Previous value (185) was too small, making corners look rectangular.
+      Squircle lives in the 824×824 safe zone at offset (100,100).
+      rx=185 is 22.4% of 824 — matches Apple HIG.
     -->
     <clipPath id="squircle">
-      <rect width="1024" height="1024" rx="230" ry="230"/>
+      <rect x="100" y="100" width="824" height="824" rx="185" ry="185"/>
     </clipPath>
   </defs>
 
-  <!-- Everything clipped to the Apple-spec squircle -->
   <g clip-path="url(#squircle)">
-    <rect width="1024" height="1024" fill="url(#bg)"/>
+    <!-- 1. Background fills the 824×824 safe zone -->
+    <rect x="100" y="100" width="824" height="824" fill="url(#bg)"/>
 
     <!--
-      Bolt: same original proportions (natural lean) scaled to fill ~70%
-      of safe zone. Inner shadow line for subtle depth.
+      2. Lightning bolt — original proportions, scaled to 824×824 safe zone.
+         Scale factor = 824/1024; translate +100 on both axes.
+         Original: 594,155  265,555  512,555  430,870  759,470  512,470
+         Scaled:   579,225  313,547  512,547  446,800  711,478  512,478
     -->
     <polygon
-      points="594,155  265,555  512,555  430,870  759,470  512,470"
+      points="579,225  313,547  512,547  446,800  711,478  512,478"
       fill="url(#bolt)"
       filter="url(#glow)"
     />
 
-    <!-- Subtle inner edge: a semi-transparent highlight at the top -->
-    <rect width="1024" height="512" fill="url(#topshine)" opacity="0.04"/>
+    <!-- 3. Glass specular overlay -->
+    <rect x="100" y="100" width="824" height="824" fill="url(#glassshine)"/>
+
+    <!--
+      4. Inner border ring (glass rim) — 3px inset from squircle edge.
+         rx=183 keeps it inside the rx=185 clip.
+    -->
+    <rect x="103" y="103" width="818" height="818" rx="183" ry="183"
+          fill="none"
+          stroke="rgba(255,255,255,0.20)"
+          stroke-width="5"/>
   </g>
 </svg>
