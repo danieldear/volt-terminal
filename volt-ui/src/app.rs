@@ -20,7 +20,7 @@ use volt_renderer::{Renderer, TabEntry};
 
 #[cfg(target_os = "macos")]
 use crate::display_link::DisplayLinkScheduler;
-use crate::tab::{PaneSplitDirection, PaneSlot, Selection, TerminalPane, TerminalTab};
+use crate::tab::{PaneSplitDirection, Selection, TerminalPane, TerminalTab};
 use crate::tab_layout::TabLayout;
 
 // ── user events (used to wake the event loop from background threads) ────────
@@ -38,8 +38,9 @@ const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 #[derive(Debug, Clone, Copy)]
 struct DividerDrag {
-    start_ratio: f32,
+    divider_id: usize,
     start_px: f32,
+    is_vertical: bool,
 }
 
 // ── main window state ────────────────────────────────────────────────────────
@@ -100,37 +101,20 @@ impl MainState {
         self.renderer.grid_size_for_tab_count(self.layout_tab_count())
     }
 
-    fn pane_grid_sizes_for_tab(
-        tab: &TerminalTab,
-        total_cols: usize,
-        total_rows: usize,
-    ) -> ((usize, usize), Option<(usize, usize)>) {
-        if tab.secondary.is_none() || tab.split_direction.is_none() {
-            return ((total_cols.max(1), total_rows.max(1)), None);
-        }
-        let divider = 1usize;
-        match tab.split_direction.unwrap_or(PaneSplitDirection::Vertical) {
-            PaneSplitDirection::Vertical => {
-                let usable_cols = total_cols.saturating_sub(divider).max(2);
-                let left_cols = ((usable_cols as f32 * tab.split_ratio).round() as usize)
-                    .max(1)
-                    .min(usable_cols - 1);
-                let right_cols = usable_cols - left_cols;
-                (
-                    (left_cols, total_rows.max(1)),
-                    Some((right_cols, total_rows.max(1))),
-                )
-            }
-            PaneSplitDirection::Horizontal => {
-                let usable_rows = total_rows.saturating_sub(divider).max(2);
-                let top_rows = ((usable_rows as f32 * tab.split_ratio).round() as usize)
-                    .max(1)
-                    .min(usable_rows - 1);
-                let bottom_rows = usable_rows - top_rows;
-                (
-                    (total_cols.max(1), top_rows),
-                    Some((total_cols.max(1), bottom_rows)),
-                )
+    fn resize_all_tabs_to_current_grid(&mut self) {
+        let (total_cols, total_rows) = self.current_grid_size();
+        for tab in &mut self.tabs {
+            let rects = tab.tree.layout(total_cols, total_rows);
+            for rect in rects {
+                if let Some(pane) = tab.tree.find_leaf_mut(rect.id) {
+                    if let Err(err) = pane.pty.resize(rect.cols as u16, rect.rows as u16) {
+                        eprintln!("volt-ui: failed to resize PTY: {err}");
+                    }
+                    match pane.performer.lock() {
+                        Ok(mut performer) => performer.resize(rect.cols, rect.rows),
+                        Err(err) => eprintln!("volt-ui: failed to lock performer for resize: {err}"),
+                    }
+                }
             }
         }
     }
@@ -169,94 +153,17 @@ impl MainState {
         self.active_tab_mut().active_pane_mut()
     }
 
-    /// Returns the physical-pixel coordinate of the divider and its direction,
-    /// or None if the active tab has no secondary pane.
-    fn divider_px_coord(&self) -> Option<(f32, PaneSplitDirection)> {
+    fn active_tab_dividers(&self) -> Vec<crate::pane_tree::DividerInfo> {
         let tab = &self.tabs[self.active_tab];
-        if tab.secondary.is_none() {
-            return None;
-        }
-        let direction = tab.split_direction.unwrap_or(PaneSplitDirection::Vertical);
         let (total_cols, total_rows) = self.current_grid_size();
-        let ((primary_cols, primary_rows), _) =
-            Self::pane_grid_sizes_for_tab(tab, total_cols, total_rows);
         let phys_pad = self.renderer.padding * self.renderer.scale_factor;
         let content_top = self.current_content_top_offset();
-        let divider_px = match direction {
-            PaneSplitDirection::Vertical => phys_pad + primary_cols as f32 * self.renderer.cell_width,
-            PaneSplitDirection::Horizontal => {
-                content_top + phys_pad + primary_rows as f32 * self.renderer.cell_height
-            }
-        };
-        Some((divider_px, direction))
-    }
-
-    fn pane_divider_rect(&self) -> Option<volt_renderer::PaneDivider> {
-        let tab = &self.tabs[self.active_tab];
-        if tab.secondary.is_none() {
-            return None;
-        }
-        let direction = tab.split_direction.unwrap_or(PaneSplitDirection::Vertical);
-        let (total_cols, total_rows) = self.current_grid_size();
-        let ((primary_cols, primary_rows), _) =
-            Self::pane_grid_sizes_for_tab(tab, total_cols, total_rows);
-        let phys_pad = self.renderer.padding * self.renderer.scale_factor;
-        let content_top = self.current_content_top_offset();
-        let size = self.window.inner_size();
-        let sw = size.width as f32;
-        let sh = size.height as f32;
-        let sc = self.renderer.scale_factor;
-        let line_w = sc.max(1.0);
-        let color = [0.35_f32, 0.35, 0.35, 1.0];
-        let divider = match direction {
-            PaneSplitDirection::Vertical => volt_renderer::PaneDivider {
-                x: phys_pad + primary_cols as f32 * self.renderer.cell_width,
-                y: content_top,
-                width: line_w,
-                height: sh - content_top - phys_pad,
-                color,
-            },
-            PaneSplitDirection::Horizontal => volt_renderer::PaneDivider {
-                x: phys_pad,
-                y: content_top + phys_pad + primary_rows as f32 * self.renderer.cell_height,
-                width: sw - 2.0 * phys_pad,
-                height: line_w,
-                color,
-            },
-        };
-        Some(divider)
-    }
-
-    fn resize_panes_for_active_tab(&mut self) {
-        let (total_cols, total_rows) = self.current_grid_size();
-        let active = self.active_tab;
-        let ((primary_cols, primary_rows), secondary_size) = {
-            let tab = &self.tabs[active];
-            Self::pane_grid_sizes_for_tab(tab, total_cols, total_rows)
-        };
-        let tab = &mut self.tabs[active];
-        if let Err(err) = tab.primary.pty.resize(primary_cols as u16, primary_rows as u16) {
-            eprintln!("volt-ui: failed to resize primary PTY after divider drag: {err}");
-        }
-        match tab.primary.performer.lock() {
-            Ok(mut performer) => performer.resize(primary_cols, primary_rows),
-            Err(err) => {
-                eprintln!("volt-ui: failed to lock primary performer after divider drag: {err}")
-            }
-        }
-        if let (Some(secondary), Some((secondary_cols, secondary_rows))) =
-            (tab.secondary.as_mut(), secondary_size)
-        {
-            if let Err(err) = secondary.pty.resize(secondary_cols as u16, secondary_rows as u16) {
-                eprintln!("volt-ui: failed to resize secondary PTY after divider drag: {err}");
-            }
-            match secondary.performer.lock() {
-                Ok(mut performer) => performer.resize(secondary_cols, secondary_rows),
-                Err(err) => eprintln!(
-                    "volt-ui: failed to lock secondary performer after divider drag: {err}"
-                ),
-            }
-        }
+        let scale = self.renderer.scale_factor;
+        tab.tree.dividers_with_ids(
+            total_cols, total_rows,
+            self.renderer.cell_width, self.renderer.cell_height,
+            phys_pad, content_top, scale,
+        )
     }
 
     fn switch_tab(&mut self, idx: usize) {
@@ -297,40 +204,7 @@ impl MainState {
         ) {
             self.tabs.push(tab);
             self.active_tab = self.tabs.len() - 1;
-            let (total_cols, total_rows) = self.current_grid_size();
-            for tab in &mut self.tabs {
-                let ((primary_cols, primary_rows), secondary_size) =
-                    Self::pane_grid_sizes_for_tab(tab, total_cols, total_rows);
-                if let Err(err) = tab
-                    .primary
-                    .pty
-                    .resize(primary_cols as u16, primary_rows as u16)
-                {
-                    eprintln!("volt-ui: failed to resize primary PTY after new tab: {err}");
-                }
-                match tab.primary.performer.lock() {
-                    Ok(mut performer) => performer.resize(primary_cols, primary_rows),
-                    Err(err) => {
-                        eprintln!("volt-ui: failed to lock primary performer after new tab: {err}")
-                    }
-                }
-                if let (Some(secondary), Some((secondary_cols, secondary_rows))) =
-                    (tab.secondary.as_mut(), secondary_size)
-                {
-                    if let Err(err) = secondary
-                        .pty
-                        .resize(secondary_cols as u16, secondary_rows as u16)
-                    {
-                        eprintln!("volt-ui: failed to resize secondary PTY after new tab: {err}");
-                    }
-                    match secondary.performer.lock() {
-                        Ok(mut performer) => performer.resize(secondary_cols, secondary_rows),
-                        Err(err) => eprintln!(
-                            "volt-ui: failed to lock secondary performer after new tab: {err}"
-                        ),
-                    }
-                }
-            }
+            self.resize_all_tabs_to_current_grid();
         }
     }
 
@@ -342,155 +216,44 @@ impl MainState {
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         }
-        let (total_cols, total_rows) = self.current_grid_size();
-        for tab in &mut self.tabs {
-            let ((primary_cols, primary_rows), secondary_size) =
-                Self::pane_grid_sizes_for_tab(tab, total_cols, total_rows);
-            if let Err(err) = tab
-                .primary
-                .pty
-                .resize(primary_cols as u16, primary_rows as u16)
-            {
-                eprintln!("volt-ui: failed to resize primary PTY after tab close: {err}");
-            }
-            match tab.primary.performer.lock() {
-                Ok(mut performer) => performer.resize(primary_cols, primary_rows),
-                Err(err) => {
-                    eprintln!("volt-ui: failed to lock primary performer after tab close: {err}")
-                }
-            }
-            if let (Some(secondary), Some((secondary_cols, secondary_rows))) =
-                (tab.secondary.as_mut(), secondary_size)
-            {
-                if let Err(err) = secondary
-                    .pty
-                    .resize(secondary_cols as u16, secondary_rows as u16)
-                {
-                    eprintln!("volt-ui: failed to resize secondary PTY after tab close: {err}");
-                }
-                match secondary.performer.lock() {
-                    Ok(mut performer) => performer.resize(secondary_cols, secondary_rows),
-                    Err(err) => eprintln!(
-                        "volt-ui: failed to lock secondary performer after tab close: {err}"
-                    ),
-                }
-            }
-        }
-    }
-
-    fn resize_all_tabs_to_current_grid(&mut self) {
-        let (total_cols, total_rows) = self.current_grid_size();
-        for tab in &mut self.tabs {
-            let ((primary_cols, primary_rows), secondary_size) =
-                Self::pane_grid_sizes_for_tab(tab, total_cols, total_rows);
-            if let Err(err) = tab
-                .primary
-                .pty
-                .resize(primary_cols as u16, primary_rows as u16)
-            {
-                eprintln!("volt-ui: failed to resize primary PTY: {err}");
-            }
-            match tab.primary.performer.lock() {
-                Ok(mut performer) => performer.resize(primary_cols, primary_rows),
-                Err(err) => {
-                    eprintln!("volt-ui: failed to lock primary performer for resize: {err}")
-                }
-            }
-            if let (Some(secondary), Some((secondary_cols, secondary_rows))) =
-                (tab.secondary.as_mut(), secondary_size)
-            {
-                if let Err(err) = secondary
-                    .pty
-                    .resize(secondary_cols as u16, secondary_rows as u16)
-                {
-                    eprintln!("volt-ui: failed to resize secondary PTY: {err}");
-                }
-                match secondary.performer.lock() {
-                    Ok(mut performer) => performer.resize(secondary_cols, secondary_rows),
-                    Err(err) => {
-                        eprintln!("volt-ui: failed to lock secondary performer for resize: {err}")
-                    }
-                }
-            }
-        }
+        self.resize_all_tabs_to_current_grid();
     }
 
     fn split_active_tab(&mut self, direction: PaneSplitDirection) -> bool {
         let (total_cols, total_rows) = self.current_grid_size();
-        let (primary_size, secondary_size) = {
-            let tab = self.active_tab();
-            Self::pane_grid_sizes_for_tab(tab, total_cols, total_rows)
+        let active_id = self.active_tab().tree.active_id;
+        let rects = self.active_tab().tree.layout(total_cols, total_rows);
+        let active_rect = rects.iter().find(|r| r.id == active_id).copied();
+        let (pane_cols, pane_rows) = match (active_rect, direction) {
+            (Some(r), PaneSplitDirection::Vertical) => ((r.cols / 2).max(1), r.rows),
+            (Some(r), PaneSplitDirection::Horizontal) => (r.cols, (r.rows / 2).max(1)),
+            (None, _) => (total_cols.max(1), total_rows.max(1)),
         };
-        let (secondary_cols, secondary_rows) = secondary_size.unwrap_or(primary_size);
-        let spawned = {
-            let config = self.config.clone();
-            let proxy = self.proxy.clone();
-            let wake_pending = Arc::clone(&self.pty_wake_pending);
-            self.active_tab_mut().split(
-                direction,
-                &config,
-                secondary_cols as u16,
-                secondary_rows as u16,
-                proxy,
-                wake_pending,
-            )
-        };
-        if !spawned {
+        let config = self.config.clone();
+        let proxy = self.proxy.clone();
+        let wake = Arc::clone(&self.pty_wake_pending);
+        let Ok(new_pane) = TerminalPane::spawn(&config, pane_cols as u16, pane_rows as u16, proxy, wake) else {
             return false;
-        }
+        };
+        self.active_tab_mut().tree.split(active_id, direction, new_pane);
         self.resize_all_tabs_to_current_grid();
         self.selection = None;
         true
-    }
-
-    fn pane_layout_for_slot(
-        tab: &TerminalTab,
-        total_cols: usize,
-        total_rows: usize,
-        slot: PaneSlot,
-    ) -> Option<(usize, usize, usize, usize)> {
-        let ((primary_cols, primary_rows), secondary_size) =
-            Self::pane_grid_sizes_for_tab(tab, total_cols, total_rows);
-        match slot {
-            PaneSlot::Primary => Some((0, 0, primary_cols, primary_rows)),
-            PaneSlot::Secondary => {
-                let (secondary_cols, secondary_rows) = secondary_size?;
-                let divider = 1usize;
-                match tab.split_direction.unwrap_or(PaneSplitDirection::Vertical) {
-                    PaneSplitDirection::Vertical => {
-                        Some((primary_cols + divider, 0, secondary_cols, secondary_rows))
-                    }
-                    PaneSplitDirection::Horizontal => {
-                        Some((0, primary_rows + divider, secondary_cols, secondary_rows))
-                    }
-                }
-            }
-        }
     }
 
     fn pane_cell_from_global_cell(
         &self,
         col: usize,
         row: usize,
-    ) -> Option<(PaneSlot, usize, usize)> {
+    ) -> Option<(usize, usize, usize)> {
         let (total_cols, total_rows) = self.current_grid_size();
-        let tab = self.active_tab();
-        let primary = Self::pane_layout_for_slot(tab, total_cols, total_rows, PaneSlot::Primary)?;
-        if col >= primary.0
-            && col < primary.0 + primary.2
-            && row >= primary.1
-            && row < primary.1 + primary.3
-        {
-            return Some((PaneSlot::Primary, col - primary.0, row - primary.1));
-        }
-        let secondary =
-            Self::pane_layout_for_slot(tab, total_cols, total_rows, PaneSlot::Secondary)?;
-        if col >= secondary.0
-            && col < secondary.0 + secondary.2
-            && row >= secondary.1
-            && row < secondary.1 + secondary.3
-        {
-            return Some((PaneSlot::Secondary, col - secondary.0, row - secondary.1));
+        let rects = self.active_tab().tree.layout(total_cols, total_rows);
+        for rect in &rects {
+            if col >= rect.col && col < rect.col + rect.cols
+                && row >= rect.row && row < rect.row + rect.rows
+            {
+                return Some((rect.id, col - rect.col, row - rect.row));
+            }
         }
         None
     }
@@ -511,57 +274,35 @@ impl MainState {
     fn build_render_grid_for_active_tab(&self) -> Option<(Grid, bool)> {
         let (total_cols, total_rows) = self.current_grid_size();
         let tab = self.active_tab();
-
-        let (primary_grid, primary_cursor_visible) = {
-            let performer = tab.primary.performer.lock().ok()?;
-            (performer.grid.clone(), performer.cursor_visible)
-        };
-
-        let secondary_snapshot = if let Some(secondary) = tab.secondary.as_ref() {
-            let performer = secondary.performer.lock().ok()?;
-            Some((performer.grid.clone(), performer.cursor_visible))
-        } else {
-            None
-        };
+        let active_id = tab.tree.active_id;
+        let rects = tab.tree.layout(total_cols, total_rows);
 
         let mut out = Grid::new(total_cols.max(1), total_rows.max(1));
-        let primary_layout =
-            Self::pane_layout_for_slot(tab, total_cols, total_rows, PaneSlot::Primary)?;
-        Self::blit_grid(&mut out, &primary_grid, primary_layout.0, primary_layout.1);
+        let mut active_cursor_visible = false;
 
-        if let (Some((secondary_grid, _)), Some(secondary_layout)) = (
-            secondary_snapshot.as_ref(),
-            Self::pane_layout_for_slot(tab, total_cols, total_rows, PaneSlot::Secondary),
-        ) {
-            Self::blit_grid(
-                &mut out,
-                secondary_grid,
-                secondary_layout.0,
-                secondary_layout.1,
-            );
-        }
-
-        let (active_grid, active_cursor_visible) = if tab.active_pane == PaneSlot::Secondary {
-            if let Some((grid, cursor_visible)) = secondary_snapshot {
-                (grid, cursor_visible)
-            } else {
-                (primary_grid, primary_cursor_visible)
+        for rect in &rects {
+            let Some(pane) = tab.tree.find_leaf(rect.id) else { continue; };
+            let (grid, cursor_visible) = {
+                let performer = pane.performer.lock().ok()?;
+                (performer.grid.clone(), performer.cursor_visible)
+            };
+            Self::blit_grid(&mut out, &grid, rect.col, rect.row);
+            if rect.id == active_id {
+                active_cursor_visible = cursor_visible;
+                out.cursor_col = (rect.col + grid.cursor_col).min(rect.col + rect.cols.saturating_sub(1));
+                out.cursor_row = (rect.row + grid.cursor_row).min(rect.row + rect.rows.saturating_sub(1));
             }
-        } else {
-            (primary_grid, primary_cursor_visible)
-        };
-
-        if let Some((offset_col, offset_row, pane_cols, pane_rows)) =
-            Self::pane_layout_for_slot(tab, total_cols, total_rows, tab.active_pane)
-        {
-            out.cursor_col =
-                (offset_col + active_grid.cursor_col).min(offset_col + pane_cols.saturating_sub(1));
-            out.cursor_row =
-                (offset_row + active_grid.cursor_row).min(offset_row + pane_rows.saturating_sub(1));
         }
 
         Some((out, active_cursor_visible))
     }
+
+
+
+
+
+
+
 
     fn apply_config(&mut self, config: &Config) {
         self.theme = Theme::by_name(&config.theme);
@@ -682,17 +423,17 @@ impl MainState {
         Some((col, row))
     }
 
-    fn pane_cell_from_mouse(&self, mx: f32, my: f32) -> Option<(PaneSlot, usize, usize)> {
+    fn pane_cell_from_mouse(&self, mx: f32, my: f32) -> Option<(usize, usize, usize)> {
         let (col, row) = self.global_cell_from_mouse(mx, my)?;
         self.pane_cell_from_global_cell(col, row)
     }
 
     fn update_selection_end(&mut self, mx: f32, my: f32) {
-        let Some((pane, col, row)) = self.pane_cell_from_mouse(mx, my) else {
+        let Some((pane_id, col, row)) = self.pane_cell_from_mouse(mx, my) else {
             return;
         };
         if let Some(sel) = &mut self.selection {
-            if sel.pane != pane {
+            if sel.pane_id != pane_id {
                 return;
             }
             sel.end_col = col;
@@ -703,7 +444,7 @@ impl MainState {
 
     fn selected_text(&self) -> Option<String> {
         let sel = self.selection?.normalized();
-        if sel.pane != self.active_tab().active_pane {
+        if sel.pane_id != self.active_tab().tree.active_id {
             return None;
         }
         let performer = self
@@ -791,11 +532,11 @@ impl MainState {
     fn selection_tuple(&self) -> Option<((usize, usize), (usize, usize))> {
         let sel = self.selection?.normalized();
         let (total_cols, total_rows) = self.current_grid_size();
-        let (offset_col, offset_row, _, _) =
-            Self::pane_layout_for_slot(self.active_tab(), total_cols, total_rows, sel.pane)?;
+        let rects = self.active_tab().tree.layout(total_cols, total_rows);
+        let rect = rects.iter().find(|r| r.id == sel.pane_id)?;
         Some((
-            (sel.start_col + offset_col, sel.start_row + offset_row),
-            (sel.end_col + offset_col, sel.end_row + offset_row),
+            (sel.start_col + rect.col, sel.start_row + rect.row),
+            (sel.end_col + rect.col, sel.end_row + rect.row),
         ))
     }
 
@@ -1240,56 +981,57 @@ impl ApplicationHandler<VoltEvent> for App {
                 state.mouse_pos = (position.x as f32, position.y as f32);
 
                 if let Some(drag) = state.divider_drag {
-                    // Update divider position during drag
+                    let delta = if drag.is_vertical {
+                        position.x as f32 - drag.start_px
+                    } else {
+                        position.y as f32 - drag.start_px
+                    };
+                    let (total_cols, total_rows) = state.current_grid_size();
                     let active = state.active_tab;
-                    if state.tabs[active].secondary.is_some() {
-                        let direction = state.tabs[active]
-                            .split_direction
-                            .unwrap_or(PaneSplitDirection::Vertical);
-                        let (total_cols, total_rows) = state.current_grid_size();
-                        let cell_w = state.renderer.cell_width;
-                        let cell_h = state.renderer.cell_height;
-                        let delta = match direction {
-                            PaneSplitDirection::Vertical => position.x as f32 - drag.start_px,
-                            PaneSplitDirection::Horizontal => position.y as f32 - drag.start_px,
-                        };
-                        let dim = match direction {
-                            PaneSplitDirection::Vertical => total_cols as f32 * cell_w,
-                            PaneSplitDirection::Horizontal => total_rows as f32 * cell_h,
-                        };
-                        if dim > 0.0 {
-                            let new_ratio = drag.start_ratio + delta / dim;
-                            state.tabs[active].set_split_ratio(new_ratio);
-                            state.begin_redraw();
-                        }
-                    }
+                    state.tabs[active].tree.adjust_ratio(
+                        drag.divider_id, delta,
+                        state.renderer.cell_width, state.renderer.cell_height,
+                        total_cols, total_rows,
+                    );
+                    // reset start_px so delta is incremental on next move
+                    state.divider_drag = Some(DividerDrag {
+                        start_px: if drag.is_vertical { position.x as f32 } else { position.y as f32 },
+                        ..drag
+                    });
+                    state.begin_redraw();
                 } else {
-                    // Update cursor icon when hovering near the divider
-                    if let Some((divider_px, direction)) = state.divider_px_coord() {
-                        let mouse_coord = match direction {
-                            PaneSplitDirection::Vertical => position.x as f32,
-                            PaneSplitDirection::Horizontal => position.y as f32,
+                    // Update cursor icon near any divider
+                    let dividers = state.active_tab_dividers();
+                    let mut hovering = false;
+                    for div in &dividers {
+                        let mouse_coord = if matches!(div.direction, PaneSplitDirection::Vertical) {
+                            position.x as f32
+                        } else {
+                            position.y as f32
                         };
-                        if (mouse_coord - divider_px).abs() < 6.0 {
-                            let icon = match direction {
-                                PaneSplitDirection::Vertical => {
-                                    winit::window::CursorIcon::ColResize
-                                }
-                                PaneSplitDirection::Horizontal => {
-                                    winit::window::CursorIcon::RowResize
-                                }
+                        let div_coord = if matches!(div.direction, PaneSplitDirection::Vertical) {
+                            div.phys.x
+                        } else {
+                            div.phys.y
+                        };
+                        if (mouse_coord - div_coord).abs() < 6.0 {
+                            let icon = if matches!(div.direction, PaneSplitDirection::Vertical) {
+                                winit::window::CursorIcon::ColResize
+                            } else {
+                                winit::window::CursorIcon::RowResize
                             };
                             state.window.set_cursor(icon);
-                        } else {
-                            state.window.set_cursor(winit::window::CursorIcon::Default);
+                            hovering = true;
+                            break;
                         }
-                    } else {
+                    }
+                    if !hovering {
                         state.window.set_cursor(winit::window::CursorIcon::Default);
                     }
 
                     let cell = state.pane_cell_from_mouse(state.mouse_pos.0, state.mouse_pos.1);
-                    if let Some((pane, col, row)) = cell {
-                        if pane == state.active_tab().active_pane {
+                    if let Some((pane_id, col, row)) = cell {
+                        if pane_id == state.active_tab().tree.active_id {
                             if state.last_reported_mouse_cell != Some((col, row)) {
                                 let _ = state.report_mouse_motion(col, row);
                                 state.last_reported_mouse_cell = Some((col, row));
@@ -1327,7 +1069,7 @@ impl ApplicationHandler<VoltEvent> for App {
                 // Divider drag: release
                 if btn_state == ElementState::Released {
                     if state.divider_drag.take().is_some() {
-                        state.resize_panes_for_active_tab();
+                        state.resize_all_tabs_to_current_grid();
                         state.window.set_cursor(winit::window::CursorIcon::Default);
                         state.begin_redraw();
                         return;
@@ -1336,28 +1078,29 @@ impl ApplicationHandler<VoltEvent> for App {
 
                 // Divider drag: press
                 if button == MouseButton::Left && btn_state == ElementState::Pressed {
-                    if let Some((divider_px, direction)) = state.divider_px_coord() {
-                        let mouse_coord = match direction {
-                            PaneSplitDirection::Vertical => mx,
-                            PaneSplitDirection::Horizontal => my,
-                        };
-                        if (mouse_coord - divider_px).abs() < 6.0 {
-                            let start_px = match direction {
-                                PaneSplitDirection::Vertical => mx,
-                                PaneSplitDirection::Horizontal => my,
-                            };
-                            let start_ratio = state.tabs[state.active_tab].split_ratio;
+                    let dividers = state.active_tab_dividers();
+                    let mut started_drag = false;
+                    for div in &dividers {
+                        let is_vertical = matches!(div.direction, PaneSplitDirection::Vertical);
+                        let mouse_coord = if is_vertical { mx } else { my };
+                        let div_coord = if is_vertical { div.phys.x } else { div.phys.y };
+                        if (mouse_coord - div_coord).abs() < 6.0 {
                             state.divider_drag = Some(DividerDrag {
-                                start_ratio,
-                                start_px,
+                                divider_id: div.id,
+                                start_px: mouse_coord,
+                                is_vertical,
                             });
-                            return;
+                            started_drag = true;
+                            break;
                         }
+                    }
+                    if started_drag {
+                        return;
                     }
                 }
 
-                if let Some((pane, col, row)) = state.pane_cell_from_mouse(mx, my) {
-                    state.active_tab_mut().set_active_pane(pane);
+                if let Some((pane_id, col, row)) = state.pane_cell_from_mouse(mx, my) {
+                    state.active_tab_mut().tree.active_id = pane_id;
                     if state.report_mouse_button(button, btn_state, col, row) {
                         return;
                     }
@@ -1365,10 +1108,10 @@ impl ApplicationHandler<VoltEvent> for App {
 
                 if button == MouseButton::Left {
                     if btn_state == ElementState::Pressed {
-                        if let Some((pane, col, row)) = state.pane_cell_from_mouse(mx, my) {
-                            state.active_tab_mut().set_active_pane(pane);
+                        if let Some((pane_id, col, row)) = state.pane_cell_from_mouse(mx, my) {
+                            state.active_tab_mut().tree.active_id = pane_id;
                             state.selection = Some(Selection {
-                                pane,
+                                pane_id,
                                 start_col: col,
                                 start_row: row,
                                 end_col: col,
@@ -1439,10 +1182,10 @@ impl ApplicationHandler<VoltEvent> for App {
                     }
                 }
 
-                if let Some((pane, col, row)) =
+                if let Some((pane_id, col, row)) =
                     state.pane_cell_from_mouse(state.mouse_pos.0, state.mouse_pos.1)
                 {
-                    state.active_tab_mut().set_active_pane(pane);
+                    state.active_tab_mut().tree.active_id = pane_id;
                     let _ = state.report_mouse_wheel(delta, col, row);
                 }
             }
@@ -1557,11 +1300,15 @@ impl ApplicationHandler<VoltEvent> for App {
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyW) => {
-                            if state.tabs.len() > 1 {
-                                let i = state.active_tab;
-                                state.close_tab(i);
-                                state.begin_redraw();
+                            let active_id = state.active_tab().tree.active_id;
+                            if !state.active_tab_mut().tree.remove(active_id) {
+                                // last pane — close the whole tab
+                                if state.tabs.len() > 1 {
+                                    let i = state.active_tab;
+                                    state.close_tab(i);
+                                }
                             }
+                            state.begin_redraw();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyC) => {
@@ -1692,46 +1439,15 @@ impl ApplicationHandler<VoltEvent> for App {
                 let active = state.active_tab;
                 let mut needs_full_redraw = false;
                 let mut pending_partial_damage: Option<(usize, usize)> = None;
-                let mut closed_primary = Vec::new();
-                let mut closed_secondary = Vec::new();
+                // (tab_idx, pane_id)
+                let mut closed_panes: Vec<(usize, usize)> = Vec::new();
+
                 for (i, tab) in state.tabs.iter_mut().enumerate() {
-                    while let Ok(ev) = tab.primary.event_rx.try_recv() {
-                        match ev {
-                            CoreEvent::GridUpdated { damaged_rows } => {
-                                if i == active {
-                                    if let Some((start, end)) = damaged_rows {
-                                        pending_partial_damage =
-                                            Some(match pending_partial_damage {
-                                                Some((cur_start, cur_end)) => {
-                                                    (cur_start.min(start), cur_end.max(end))
-                                                }
-                                                None => (start, end),
-                                            });
-                                    } else {
-                                        needs_full_redraw = true;
-                                    }
-                                }
-                            }
-                            CoreEvent::CwdChanged(path) => {
-                                tab.primary.cwd = Some(path);
-                            }
-                            CoreEvent::TitleChanged(t) => {
-                                tab.primary.title = t;
-                            }
-                            CoreEvent::CommandFinished { .. } => {
-                                tab.primary.running = false;
-                            }
-                            CoreEvent::PtyError(msg) => {
-                                if i == active {
-                                    state.renderer.set_top_alert(Some(msg));
-                                    needs_full_redraw = true;
-                                }
-                            }
-                            CoreEvent::PtyClosed => closed_primary.push(i),
-                        }
-                    }
-                    if let Some(secondary) = tab.secondary.as_mut() {
-                        while let Ok(ev) = secondary.event_rx.try_recv() {
+                    let leaf_ids = tab.tree.leaf_ids();
+                    for pane_id in leaf_ids {
+                        loop {
+                            let Some(ev) = tab.tree.find_leaf_mut(pane_id)
+                                .and_then(|p| p.event_rx.try_recv().ok()) else { break; };
                             match ev {
                                 CoreEvent::GridUpdated { damaged_rows } => {
                                     if i == active {
@@ -1749,13 +1465,19 @@ impl ApplicationHandler<VoltEvent> for App {
                                     }
                                 }
                                 CoreEvent::CwdChanged(path) => {
-                                    secondary.cwd = Some(path);
+                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
+                                        p.cwd = Some(path);
+                                    }
                                 }
                                 CoreEvent::TitleChanged(t) => {
-                                    secondary.title = t;
+                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
+                                        p.title = t;
+                                    }
                                 }
                                 CoreEvent::CommandFinished { .. } => {
-                                    secondary.running = false;
+                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
+                                        p.running = false;
+                                    }
                                 }
                                 CoreEvent::PtyError(msg) => {
                                     if i == active {
@@ -1763,52 +1485,33 @@ impl ApplicationHandler<VoltEvent> for App {
                                         needs_full_redraw = true;
                                     }
                                 }
-                                CoreEvent::PtyClosed => closed_secondary.push(i),
+                                CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                             }
                         }
                     }
                 }
-                if !closed_secondary.is_empty() || !closed_primary.is_empty() {
-                    closed_secondary.sort_unstable();
-                    closed_secondary.dedup();
-                    closed_primary.sort_unstable();
-                    closed_primary.dedup();
 
-                    for idx in closed_secondary.into_iter().rev() {
-                        if closed_primary.binary_search(&idx).is_ok() {
-                            continue;
-                        }
-                        if let Some(tab) = state.tabs.get_mut(idx) {
-                            tab.close_secondary();
-                        }
-                    }
-
-                    for idx in closed_primary.into_iter().rev() {
-                        if idx >= state.tabs.len() {
-                            continue;
-                        }
-                        let close_tab = {
-                            let tab = &mut state.tabs[idx];
-                            if tab.secondary.is_some() {
-                                tab.promote_secondary_to_primary();
-                                false
-                            } else {
-                                true
+                // Handle closed panes
+                if !closed_panes.is_empty() {
+                    // Process from highest tab index to lowest to avoid index shifting
+                    closed_panes.sort_unstable();
+                    closed_panes.dedup();
+                    for (tab_idx, pane_id) in closed_panes.into_iter().rev() {
+                        if tab_idx >= state.tabs.len() { continue; }
+                        let still_has_panes = state.tabs[tab_idx].tree.remove(pane_id);
+                        if !still_has_panes {
+                            if state.tabs.len() <= 1 {
+                                close_window_after_event = true;
+                                break;
                             }
-                        };
-                        if !close_tab {
-                            continue;
+                            state.close_tab(tab_idx);
                         }
-                        if state.tabs.len() <= 1 {
-                            close_window_after_event = true;
-                            break;
-                        }
-                        state.close_tab(idx);
                     }
                     if !close_window_after_event {
                         needs_full_redraw = true;
                     }
                 }
+
                 if !close_window_after_event {
                     if needs_full_redraw {
                         state.mark_full_redraw();
@@ -1846,7 +1549,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     };
                     let damage_rows = state.take_render_damage_rows();
                     let dividers: Vec<volt_renderer::PaneDivider> =
-                        state.pane_divider_rect().into_iter().collect();
+                        state.active_tab_dividers().into_iter().map(|d| d.phys).collect();
                     state.renderer.render_frame(
                         &render_grid,
                         &state.theme,
@@ -1903,90 +1606,53 @@ impl ApplicationHandler<VoltEvent> for App {
             let mut needs_redraw = false;
             let mut needs_full_redraw = false;
             let mut pending_partial_damage: Option<(usize, usize)> = None;
-            let mut closed_primary = Vec::new();
-            let mut closed_secondary = Vec::new();
+            let mut closed_panes: Vec<(usize, usize)> = Vec::new();
 
             if !state.redraw_pending {
                 for (i, tab) in state.tabs.iter_mut().enumerate() {
-                    while let Ok(ev) = tab.primary.event_rx.try_recv() {
-                        match ev {
-                            CoreEvent::GridUpdated { damaged_rows } => {
-                                if i == active {
-                                    needs_redraw = true;
-                                    if let Some((start, end)) = damaged_rows {
-                                        pending_partial_damage = Some(match pending_partial_damage {
-                                            Some((cur_start, cur_end)) => {
-                                                (cur_start.min(start), cur_end.max(end))
-                                            }
-                                            None => (start, end),
-                                        });
-                                    } else {
-                                        needs_full_redraw = true;
-                                    }
-                                }
-                            }
-                            CoreEvent::CwdChanged(path) => {
-                                tab.primary.cwd = Some(path);
-                                if i == active || show_tab_chrome {
-                                    needs_redraw = true;
-                                    needs_full_redraw = true;
-                                }
-                            }
-                            CoreEvent::TitleChanged(t) => {
-                                tab.primary.title = t;
-                                if i == active || show_tab_chrome {
-                                    needs_redraw = true;
-                                    needs_full_redraw = true;
-                                }
-                            }
-                            CoreEvent::CommandFinished { .. } => {
-                                tab.primary.running = false;
-                            }
-                            CoreEvent::PtyError(msg) => {
-                                if i == active {
-                                    state.renderer.set_top_alert(Some(msg));
-                                    needs_redraw = true;
-                                    needs_full_redraw = true;
-                                }
-                            }
-                            CoreEvent::PtyClosed => closed_primary.push(i),
-                        }
-                    }
-                    if let Some(secondary) = tab.secondary.as_mut() {
-                        while let Ok(ev) = secondary.event_rx.try_recv() {
+                    let leaf_ids = tab.tree.leaf_ids();
+                    for pane_id in leaf_ids {
+                        loop {
+                            let Some(ev) = tab.tree.find_leaf_mut(pane_id)
+                                .and_then(|p| p.event_rx.try_recv().ok()) else { break; };
                             match ev {
                                 CoreEvent::GridUpdated { damaged_rows } => {
                                     if i == active {
                                         needs_redraw = true;
                                         if let Some((start, end)) = damaged_rows {
-                                            pending_partial_damage =
-                                                Some(match pending_partial_damage {
-                                                    Some((cur_start, cur_end)) => {
-                                                        (cur_start.min(start), cur_end.max(end))
-                                                    }
-                                                    None => (start, end),
-                                                });
+                                            pending_partial_damage = Some(match pending_partial_damage {
+                                                Some((cur_start, cur_end)) => {
+                                                    (cur_start.min(start), cur_end.max(end))
+                                                }
+                                                None => (start, end),
+                                            });
                                         } else {
                                             needs_full_redraw = true;
                                         }
                                     }
                                 }
                                 CoreEvent::CwdChanged(path) => {
-                                    secondary.cwd = Some(path);
+                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
+                                        p.cwd = Some(path);
+                                    }
                                     if i == active || show_tab_chrome {
                                         needs_redraw = true;
                                         needs_full_redraw = true;
                                     }
                                 }
                                 CoreEvent::TitleChanged(t) => {
-                                    secondary.title = t;
+                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
+                                        p.title = t;
+                                    }
                                     if i == active || show_tab_chrome {
                                         needs_redraw = true;
                                         needs_full_redraw = true;
                                     }
                                 }
                                 CoreEvent::CommandFinished { .. } => {
-                                    secondary.running = false;
+                                    if let Some(p) = tab.tree.find_leaf_mut(pane_id) {
+                                        p.running = false;
+                                    }
                                 }
                                 CoreEvent::PtyError(msg) => {
                                     if i == active {
@@ -1995,49 +1661,26 @@ impl ApplicationHandler<VoltEvent> for App {
                                         needs_full_redraw = true;
                                     }
                                 }
-                                CoreEvent::PtyClosed => closed_secondary.push(i),
+                                CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                             }
                         }
                     }
                 }
             }
 
-            if !closed_secondary.is_empty() || !closed_primary.is_empty() {
-                closed_secondary.sort_unstable();
-                closed_secondary.dedup();
-                closed_primary.sort_unstable();
-                closed_primary.dedup();
-
-                for idx in closed_secondary.into_iter().rev() {
-                    if closed_primary.binary_search(&idx).is_ok() {
-                        continue;
-                    }
-                    if let Some(tab) = state.tabs.get_mut(idx) {
-                        tab.close_secondary();
-                    }
-                }
-
-                for idx in closed_primary.into_iter().rev() {
-                    if idx >= state.tabs.len() {
-                        continue;
-                    }
-                    let close_tab = {
-                        let tab = &mut state.tabs[idx];
-                        if tab.secondary.is_some() {
-                            tab.promote_secondary_to_primary();
-                            false
-                        } else {
-                            true
+            if !closed_panes.is_empty() {
+                closed_panes.sort_unstable();
+                closed_panes.dedup();
+                for (tab_idx, pane_id) in closed_panes.into_iter().rev() {
+                    if tab_idx >= state.tabs.len() { continue; }
+                    let still_has_panes = state.tabs[tab_idx].tree.remove(pane_id);
+                    if !still_has_panes {
+                        if state.tabs.len() <= 1 {
+                            windows_to_close.push(*window_id);
+                            break;
                         }
-                    };
-                    if !close_tab {
-                        continue;
+                        state.close_tab(tab_idx);
                     }
-                    if state.tabs.len() <= 1 {
-                        windows_to_close.push(*window_id);
-                        break;
-                    }
-                    state.close_tab(idx);
                 }
                 needs_redraw = true;
                 needs_full_redraw = true;

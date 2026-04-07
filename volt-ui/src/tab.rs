@@ -11,12 +11,7 @@ use volt_core::performer::Performer;
 use volt_core::pty::Pty;
 
 use crate::app::VoltEvent;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaneSlot {
-    Primary,
-    Secondary,
-}
+use crate::pane_tree::PaneTree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneSplitDirection {
@@ -34,16 +29,12 @@ pub struct TerminalPane {
 }
 
 pub struct TerminalTab {
-    pub primary: TerminalPane,
-    pub secondary: Option<TerminalPane>,
-    pub split_direction: Option<PaneSplitDirection>,
-    pub active_pane: PaneSlot,
-    pub split_ratio: f32,
+    pub tree: PaneTree,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Selection {
-    pub pane: PaneSlot,
+    pub pane_id: usize,
     pub start_col: usize,
     pub start_row: usize,
     pub end_col: usize,
@@ -56,7 +47,7 @@ impl Selection {
             self
         } else {
             Self {
-                pane: self.pane,
+                pane_id: self.pane_id,
                 start_col: self.end_col,
                 start_row: self.end_row,
                 end_col: self.start_col,
@@ -141,88 +132,28 @@ impl TerminalTab {
         proxy: EventLoopProxy<VoltEvent>,
         wake_pending: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
+        let primary = TerminalPane::spawn(config, cols, rows, proxy, wake_pending)?;
         Ok(Self {
-            primary: TerminalPane::spawn(config, cols, rows, proxy, wake_pending)?,
-            secondary: None,
-            split_direction: None,
-            active_pane: PaneSlot::Primary,
-            split_ratio: 0.5,
+            tree: PaneTree::new(primary),
         })
     }
 
-    pub fn set_split_ratio(&mut self, r: f32) {
-        self.split_ratio = r.clamp(0.1, 0.9);
-    }
-
     pub fn pane_count(&self) -> usize {
-        if self.secondary.is_some() { 2 } else { 1 }
+        self.tree.pane_count()
     }
 
     pub fn is_busy(&self) -> bool {
-        self.primary.running || self.secondary.as_ref().is_some_and(|pane| pane.running)
+        self.tree.leaf_ids().into_iter().any(|id| {
+            self.tree.find_leaf(id).is_some_and(|p| p.running)
+        })
     }
 
     pub fn active_pane(&self) -> &TerminalPane {
-        if self.active_pane == PaneSlot::Secondary {
-            if let Some(secondary) = self.secondary.as_ref() {
-                return secondary;
-            }
-        }
-        &self.primary
+        self.tree.active_pane().expect("active pane missing")
     }
 
     pub fn active_pane_mut(&mut self) -> &mut TerminalPane {
-        if self.active_pane == PaneSlot::Secondary {
-            if let Some(secondary) = self.secondary.as_mut() {
-                return secondary;
-            }
-        }
-        &mut self.primary
-    }
-
-    pub fn set_active_pane(&mut self, slot: PaneSlot) {
-        if slot == PaneSlot::Secondary && self.secondary.is_none() {
-            self.active_pane = PaneSlot::Primary;
-            return;
-        }
-        self.active_pane = slot;
-    }
-
-    pub fn split(
-        &mut self,
-        direction: PaneSplitDirection,
-        config: &Config,
-        cols: u16,
-        rows: u16,
-        proxy: EventLoopProxy<VoltEvent>,
-        wake_pending: Arc<AtomicBool>,
-    ) -> bool {
-        if self.secondary.is_none() {
-            let Ok(pane) = TerminalPane::spawn(config, cols, rows, proxy, wake_pending) else {
-                return false;
-            };
-            self.secondary = Some(pane);
-        }
-        let changed_direction = self.split_direction != Some(direction);
-        self.split_direction = Some(direction);
-        self.active_pane = PaneSlot::Secondary;
-        changed_direction || self.secondary.is_some()
-    }
-
-    pub fn close_secondary(&mut self) {
-        self.secondary = None;
-        self.split_direction = None;
-        if self.active_pane == PaneSlot::Secondary {
-            self.active_pane = PaneSlot::Primary;
-        }
-    }
-
-    pub fn promote_secondary_to_primary(&mut self) {
-        if let Some(secondary) = self.secondary.take() {
-            self.primary = secondary;
-            self.split_direction = None;
-            self.active_pane = PaneSlot::Primary;
-        }
+        self.tree.active_pane_mut().expect("active pane missing")
     }
 
     pub fn display_title(&self, index: usize) -> String {
@@ -230,3 +161,4 @@ impl TerminalTab {
         self.active_pane().display_title()
     }
 }
+
