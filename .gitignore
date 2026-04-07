@@ -1,7 +1,16 @@
-AGENTS.md
-.zed
-.claude
-.agent007
-.cursor
+# Build artifacts
 target/
 Cargo.lock
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# AI / editor tooling (local only)
+AGENTS.md
+.agent007/
+.codex/
+.claude/
+.cursor/
+.zed/
+.vscode/
