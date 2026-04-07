@@ -20,6 +20,7 @@ use volt_renderer::{Renderer, TabEntry};
 
 #[cfg(target_os = "macos")]
 use crate::display_link::DisplayLinkScheduler;
+use crate::pane_tree::RemoveResult;
 use crate::tab::{PaneSplitDirection, Selection, TerminalPane, TerminalTab};
 use crate::tab_layout::TabLayout;
 
@@ -77,6 +78,8 @@ struct MainState {
     proxy: EventLoopProxy<VoltEvent>,
     pty_wake_pending: Arc<AtomicBool>,
     divider_drag: Option<DividerDrag>,
+    /// ID of the divider the mouse is currently hovering over (for visual highlight).
+    divider_hover_id: Option<usize>,
 }
 
 impl MainState {
@@ -159,10 +162,13 @@ impl MainState {
         let phys_pad = self.renderer.padding * self.renderer.scale_factor;
         let content_top = self.current_content_top_offset();
         let scale = self.renderer.scale_factor;
+        let drag_id = self.divider_drag.map(|d| d.divider_id);
         tab.tree.dividers_with_ids(
             total_cols, total_rows,
             self.renderer.cell_width, self.renderer.cell_height,
             phys_pad, content_top, scale,
+            self.divider_hover_id,
+            drag_id,
         )
     }
 
@@ -170,6 +176,9 @@ impl MainState {
         if idx < self.tabs.len() {
             self.active_tab = idx;
             self.selection = None;
+            self.divider_drag = None;
+            self.divider_hover_id = None;
+            self.last_reported_mouse_cell = None;
         }
     }
 
@@ -239,6 +248,32 @@ impl MainState {
         self.resize_all_tabs_to_current_grid();
         self.selection = None;
         true
+    }
+
+    /// Remove a pane from the given tab by id. Returns `true` if the tab itself
+    /// should now be closed (was the last pane).  On successful removal the
+    /// surviving panes are immediately resized so TUI apps see the correct geometry.
+    fn remove_pane_from_tab(&mut self, tab_idx: usize, pane_id: usize) -> bool {
+        if tab_idx >= self.tabs.len() {
+            return false;
+        }
+        match self.tabs[tab_idx].tree.remove(pane_id) {
+            RemoveResult::NotFound => false,
+            RemoveResult::RemovedLastLeaf => true,
+            RemoveResult::Removed => {
+                // Immediately resize all surviving panes so PTYs know their new geometry.
+                self.resize_all_tabs_to_current_grid();
+                // Invalidate any selection that pointed at the removed pane.
+                if self.selection.map_or(false, |s| {
+                    self.tabs.get(tab_idx)
+                        .map_or(true, |t| t.tree.find_leaf(s.pane_id).is_none())
+                }) {
+                    self.selection = None;
+                }
+                self.last_reported_mouse_cell = None;
+                false
+            }
+        }
     }
 
     fn pane_cell_from_global_cell(
@@ -816,6 +851,7 @@ impl App {
             proxy,
             pty_wake_pending: Arc::clone(&self.pty_wake_pending),
             divider_drag: None,
+            divider_hover_id: None,
         };
         state
             .window
@@ -1000,9 +1036,9 @@ impl ApplicationHandler<VoltEvent> for App {
                     });
                     state.begin_redraw();
                 } else {
-                    // Update cursor icon near any divider
+                    // Update cursor icon and hover state near any divider.
                     let dividers = state.active_tab_dividers();
-                    let mut hovering = false;
+                    let mut hovered_id: Option<usize> = None;
                     for div in &dividers {
                         let is_vertical = matches!(div.direction, PaneSplitDirection::Vertical);
                         // For vertical dividers: check x proximity AND y in [div.y, div.y+div.height]
@@ -1024,12 +1060,17 @@ impl ApplicationHandler<VoltEvent> for App {
                                 winit::window::CursorIcon::RowResize
                             };
                             state.window.set_cursor(icon);
-                            hovering = true;
+                            hovered_id = Some(div.id);
                             break;
                         }
                     }
-                    if !hovering {
+                    if hovered_id.is_none() {
                         state.window.set_cursor(winit::window::CursorIcon::Default);
+                    }
+                    // Trigger redraw when hover state changes so divider color updates.
+                    if state.divider_hover_id != hovered_id {
+                        state.divider_hover_id = hovered_id;
+                        state.begin_redraw();
                     }
 
                     let cell = state.pane_cell_from_mouse(state.mouse_pos.0, state.mouse_pos.1);
@@ -1298,6 +1339,7 @@ impl ApplicationHandler<VoltEvent> for App {
                             } else {
                                 PaneSplitDirection::Vertical
                             };
+                            state.divider_drag = None;
                             if state.split_active_tab(direction) {
                                 state.begin_redraw();
                             }
@@ -1310,15 +1352,11 @@ impl ApplicationHandler<VoltEvent> for App {
                         }
                         PhysicalKey::Code(KeyCode::KeyW) => {
                             state.divider_drag = None;
-                            state.selection = None;
-                            state.last_reported_mouse_cell = None;
                             let active_id = state.active_tab().tree.active_id;
-                            if !state.active_tab_mut().tree.remove(active_id) {
-                                // last pane — close the whole tab
-                                if state.tabs.len() > 1 {
-                                    let i = state.active_tab;
-                                    state.close_tab(i);
-                                }
+                            let tab_idx = state.active_tab;
+                            let should_close_tab = state.remove_pane_from_tab(tab_idx, active_id);
+                            if should_close_tab && state.tabs.len() > 1 {
+                                state.close_tab(tab_idx);
                             }
                             state.begin_redraw();
                             return;
@@ -1509,9 +1547,8 @@ impl ApplicationHandler<VoltEvent> for App {
                     closed_panes.sort_unstable();
                     closed_panes.dedup();
                     for (tab_idx, pane_id) in closed_panes.into_iter().rev() {
-                        if tab_idx >= state.tabs.len() { continue; }
-                        let still_has_panes = state.tabs[tab_idx].tree.remove(pane_id);
-                        if !still_has_panes {
+                        let should_close_tab = state.remove_pane_from_tab(tab_idx, pane_id);
+                        if should_close_tab {
                             if state.tabs.len() <= 1 {
                                 close_window_after_event = true;
                                 break;
@@ -1520,13 +1557,6 @@ impl ApplicationHandler<VoltEvent> for App {
                         }
                     }
                     if !close_window_after_event {
-                        // Repair UI state after structural change
-                        if state.selection.map_or(false, |s| {
-                            state.active_tab().tree.find_leaf(s.pane_id).is_none()
-                        }) {
-                            state.selection = None;
-                        }
-                        state.last_reported_mouse_cell = None;
                         needs_full_redraw = true;
                     }
                 }
@@ -1691,9 +1721,8 @@ impl ApplicationHandler<VoltEvent> for App {
                 closed_panes.sort_unstable();
                 closed_panes.dedup();
                 for (tab_idx, pane_id) in closed_panes.into_iter().rev() {
-                    if tab_idx >= state.tabs.len() { continue; }
-                    let still_has_panes = state.tabs[tab_idx].tree.remove(pane_id);
-                    if !still_has_panes {
+                    let should_close_tab = state.remove_pane_from_tab(tab_idx, pane_id);
+                    if should_close_tab {
                         if state.tabs.len() <= 1 {
                             windows_to_close.push(*window_id);
                             break;
@@ -1701,13 +1730,6 @@ impl ApplicationHandler<VoltEvent> for App {
                         state.close_tab(tab_idx);
                     }
                 }
-                // Repair UI state after structural change
-                if state.selection.map_or(false, |s| {
-                    state.active_tab().tree.find_leaf(s.pane_id).is_none()
-                }) {
-                    state.selection = None;
-                }
-                state.last_reported_mouse_cell = None;
                 needs_redraw = true;
                 needs_full_redraw = true;
             }

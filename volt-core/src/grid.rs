@@ -15,6 +15,9 @@ pub struct Grid {
     /// This matches xterm / ghostty behaviour and prevents zsh PROMPT_SP from
     /// leaving a visible `%` on its own line.
     pub pending_wrap: bool,
+    /// Per-row dirty flag: set when a row's content changes, cleared after render.
+    /// Used by the renderer for damage tracking to skip unchanged rows.
+    dirty: Vec<bool>,
 }
 
 impl Grid {
@@ -29,6 +32,7 @@ impl Grid {
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             pending_wrap: false,
+            dirty: vec![true; rows],
         }
     }
 
@@ -38,8 +42,24 @@ impl Grid {
     }
 
     pub fn cell_mut(&mut self, col: usize, row: usize) -> &mut Cell {
+        self.dirty[row] = true;
         let idx = self.row_map[row] * self.cols + col;
         &mut self.cells[idx]
+    }
+
+    /// Returns a slice of per-row dirty flags. `true` means the row changed since last `clear_dirty()`.
+    pub fn dirty_rows(&self) -> &[bool] {
+        &self.dirty
+    }
+
+    /// Clears all dirty flags after the renderer has consumed them.
+    pub fn clear_dirty(&mut self) {
+        self.dirty.fill(false);
+    }
+
+    /// Marks every row dirty (e.g. after resize or full clear).
+    fn mark_all_dirty(&mut self) {
+        self.dirty.fill(true);
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -56,6 +76,7 @@ impl Grid {
         self.row_map = (0..rows).collect();
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        self.dirty = vec![true; rows];
     }
 
     pub fn scroll_down(&mut self, top: usize, bottom: usize, count: usize) {
@@ -78,6 +99,10 @@ impl Grid {
             let start = self.row_map[row] * self.cols;
             let end = start + self.cols;
             self.cells[start..end].fill(Cell::default());
+        }
+        // Mark affected region dirty.
+        for row in top..=bottom {
+            self.dirty[row] = true;
         }
     }
 
@@ -102,6 +127,10 @@ impl Grid {
             let start = self.row_map[row] * self.cols;
             let end = start + self.cols;
             self.cells[start..end].fill(Cell::default());
+        }
+        // Mark affected region dirty.
+        for row in top..=bottom {
+            self.dirty[row] = true;
         }
     }
 
