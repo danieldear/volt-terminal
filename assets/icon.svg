@@ -25,9 +25,9 @@
   <rect x="1.5" y="1.5" width="93" height="93" rx="21" ry="21"
         fill="none" stroke="#585b70" stroke-width="1.5"/>
 
-  <!-- Lightning bolt — centred, slightly inset -->
+  <!-- Lightning bolt — large, fills ~75% of canvas like other macOS icons -->
   <polygon
-    points="54,10 30,52 48,52 42,86 66,44 48,44"
+    points="67,7  14,54  46,54  29,89  82,42  50,42"
     fill="url(#bolt)"
     filter="url(#glow)"
   />
