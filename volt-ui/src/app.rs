@@ -265,6 +265,8 @@ impl MainState {
             RemoveResult::NotFound => false,
             RemoveResult::RemovedLastLeaf => true,
             RemoveResult::Removed => {
+                // Cancel any in-progress divider drag — the topology just changed.
+                self.divider_drag = None;
                 // Immediately resize all surviving panes so PTYs know their new geometry.
                 self.resize_all_tabs_to_current_grid();
                 // Invalidate any selection that pointed at the removed pane.
