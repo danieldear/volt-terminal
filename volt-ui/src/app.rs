@@ -1004,18 +1004,21 @@ impl ApplicationHandler<VoltEvent> for App {
                     let dividers = state.active_tab_dividers();
                     let mut hovering = false;
                     for div in &dividers {
-                        let mouse_coord = if matches!(div.direction, PaneSplitDirection::Vertical) {
-                            position.x as f32
+                        let is_vertical = matches!(div.direction, PaneSplitDirection::Vertical);
+                        // For vertical dividers: check x proximity AND y in [div.y, div.y+div.height]
+                        // For horizontal dividers: check y proximity AND x in [div.x, div.x+div.width]
+                        let (axis_coord, axis_divider, span_coord, span_start, span_end) = if is_vertical {
+                            (position.x as f32, div.phys.x, position.y as f32,
+                             div.phys.y, div.phys.y + div.phys.height)
                         } else {
-                            position.y as f32
+                            (position.y as f32, div.phys.y, position.x as f32,
+                             div.phys.x, div.phys.x + div.phys.width)
                         };
-                        let div_coord = if matches!(div.direction, PaneSplitDirection::Vertical) {
-                            div.phys.x
-                        } else {
-                            div.phys.y
-                        };
-                        if (mouse_coord - div_coord).abs() < 6.0 {
-                            let icon = if matches!(div.direction, PaneSplitDirection::Vertical) {
+                        if (axis_coord - axis_divider).abs() < 6.0
+                            && span_coord >= span_start - 4.0
+                            && span_coord <= span_end + 4.0
+                        {
+                            let icon = if is_vertical {
                                 winit::window::CursorIcon::ColResize
                             } else {
                                 winit::window::CursorIcon::RowResize
@@ -1082,12 +1085,18 @@ impl ApplicationHandler<VoltEvent> for App {
                     let mut started_drag = false;
                     for div in &dividers {
                         let is_vertical = matches!(div.direction, PaneSplitDirection::Vertical);
-                        let mouse_coord = if is_vertical { mx } else { my };
-                        let div_coord = if is_vertical { div.phys.x } else { div.phys.y };
-                        if (mouse_coord - div_coord).abs() < 6.0 {
+                        let (axis_coord, axis_div, span_coord, span_start, span_end) = if is_vertical {
+                            (mx, div.phys.x, my, div.phys.y, div.phys.y + div.phys.height)
+                        } else {
+                            (my, div.phys.y, mx, div.phys.x, div.phys.x + div.phys.width)
+                        };
+                        if (axis_coord - axis_div).abs() < 6.0
+                            && span_coord >= span_start - 4.0
+                            && span_coord <= span_end + 4.0
+                        {
                             state.divider_drag = Some(DividerDrag {
                                 divider_id: div.id,
-                                start_px: mouse_coord,
+                                start_px: axis_coord,
                                 is_vertical,
                             });
                             started_drag = true;
@@ -1300,6 +1309,9 @@ impl ApplicationHandler<VoltEvent> for App {
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyW) => {
+                            state.divider_drag = None;
+                            state.selection = None;
+                            state.last_reported_mouse_cell = None;
                             let active_id = state.active_tab().tree.active_id;
                             if !state.active_tab_mut().tree.remove(active_id) {
                                 // last pane — close the whole tab
@@ -1508,6 +1520,13 @@ impl ApplicationHandler<VoltEvent> for App {
                         }
                     }
                     if !close_window_after_event {
+                        // Repair UI state after structural change
+                        if state.selection.map_or(false, |s| {
+                            state.active_tab().tree.find_leaf(s.pane_id).is_none()
+                        }) {
+                            state.selection = None;
+                        }
+                        state.last_reported_mouse_cell = None;
                         needs_full_redraw = true;
                     }
                 }
@@ -1682,6 +1701,13 @@ impl ApplicationHandler<VoltEvent> for App {
                         state.close_tab(tab_idx);
                     }
                 }
+                // Repair UI state after structural change
+                if state.selection.map_or(false, |s| {
+                    state.active_tab().tree.find_leaf(s.pane_id).is_none()
+                }) {
+                    state.selection = None;
+                }
+                state.last_reported_mouse_cell = None;
                 needs_redraw = true;
                 needs_full_redraw = true;
             }

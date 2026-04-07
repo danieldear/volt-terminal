@@ -287,16 +287,18 @@ fn remove_node(node: &mut PaneNode, target_id: usize, active_id: &mut usize) -> 
 
     if left_is_target || right_is_target {
         let survivor = if left_is_target {
-            let mut ids = Vec::new();
-            collect_leaf_ids(right, &mut ids);
-            if let Some(&id) = ids.first() { *active_id = id; }
             std::mem::replace(right, PaneNode::Tombstone)
         } else {
-            let mut ids = Vec::new();
-            collect_leaf_ids(left, &mut ids);
-            if let Some(&id) = ids.first() { *active_id = id; }
             std::mem::replace(left, PaneNode::Tombstone)
         };
+        // Since we only remove individual leaf nodes, the removed subtree is exactly {target_id}.
+        if *active_id == target_id {
+            let mut survivor_ids = Vec::new();
+            collect_leaf_ids(&survivor, &mut survivor_ids);
+            if let Some(&id) = survivor_ids.first() {
+                *active_id = id;
+            }
+        }
         *node = survivor;
         return true;
     }
@@ -326,12 +328,14 @@ fn adjust_ratio_node(
                         if total_px > 0.0 {
                             *ratio = (*ratio + delta_px / total_px).clamp(0.1, 0.9);
                         }
+                        if ratio.is_nan() { *ratio = 0.5; }
                     }
                     PaneSplitDirection::Horizontal => {
                         let total_px = rows.saturating_sub(1) as f32 * cell_h;
                         if total_px > 0.0 {
                             *ratio = (*ratio + delta_px / total_px).clamp(0.1, 0.9);
                         }
+                        if ratio.is_nan() { *ratio = 0.5; }
                     }
                 }
                 return true;
