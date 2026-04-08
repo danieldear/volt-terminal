@@ -18,6 +18,15 @@ pub struct Grid {
     /// Per-row dirty flag: set when a row's content changes, cleared after render.
     /// Used by the renderer for damage tracking to skip unchanged rows.
     dirty: Vec<bool>,
+    /// Flat ring buffer for scrollback history.
+    /// Stored as contiguous cells: row i starts at physical_row(i) * cols.
+    /// Growing phase: buf grows by `cols` cells per line until capacity is reached.
+    /// Steady state: oldest row slot is overwritten in place — zero allocations.
+    scrollback_buf: Vec<Cell>,
+    scrollback_start: usize,   // index of the oldest row in the ring
+    scrollback_count: usize,   // number of rows currently stored
+    /// Maximum number of scrollback lines to retain.
+    pub scrollback_limit: usize,
 }
 
 impl Grid {
@@ -33,6 +42,10 @@ impl Grid {
             scroll_bottom: rows.saturating_sub(1),
             pending_wrap: false,
             dirty: vec![true; rows],
+            scrollback_buf: Vec::new(),
+            scrollback_start: 0,
+            scrollback_count: 0,
+            scrollback_limit: 10_000,
         }
     }
 
@@ -63,6 +76,7 @@ impl Grid {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        let old_cols = self.cols;
         let mut new_cells = vec![Cell::default(); cols * rows];
         for row in 0..rows.min(self.rows) {
             for col in 0..cols.min(self.cols) {
@@ -77,6 +91,33 @@ impl Grid {
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.dirty = vec![true; rows];
+        // Migrate scrollback to the new column width.
+        // Row-only resizes leave the buffer intact; col changes rewrite it.
+        if old_cols != cols {
+            self.reflow_scrollback(old_cols, cols);
+        }
+    }
+
+    /// Rewrite the flat scrollback ring buffer to use `new_cols` as the stride.
+    /// Rows are truncated (narrowing) or right-padded with blanks (widening).
+    /// After this call the buffer is sequential (scrollback_start = 0).
+    fn reflow_scrollback(&mut self, old_cols: usize, new_cols: usize) {
+        if self.scrollback_count == 0 {
+            return;
+        }
+        let count = self.scrollback_count;
+        let copy_cols = old_cols.min(new_cols);
+        let mut new_buf = vec![Cell::default(); count * new_cols];
+        for i in 0..count {
+            let physical = (self.scrollback_start + i) % self.scrollback_limit;
+            let src = physical * old_cols;
+            let dst = i * new_cols;
+            new_buf[dst..dst + copy_cols]
+                .copy_from_slice(&self.scrollback_buf[src..src + copy_cols]);
+        }
+        self.scrollback_buf = new_buf;
+        self.scrollback_start = 0;
+        // scrollback_count is unchanged; limit stays the same
     }
 
     pub fn scroll_down(&mut self, top: usize, bottom: usize, count: usize) {
@@ -119,6 +160,31 @@ impl Grid {
         let count = count.min(region_rows);
         if count == 0 {
             return;
+        }
+
+        // Save rows scrolling off the top into the scrollback buffer.
+        // Only do this for full-screen scrolls (top == 0) so that partial
+        // scroll regions used by apps like vim don't pollute history.
+        if top == 0 && self.scrollback_limit > 0 && self.cols > 0 {
+            for i in 0..count {
+                if self.scrollback_count < self.scrollback_limit {
+                    // Growing phase: extend the flat buffer by one row.
+                    // Vec doubling means amortised O(1); once full, no more allocs.
+                    for col in 0..self.cols {
+                        self.scrollback_buf.push(self.cells[self.row_map[i] * self.cols + col]);
+                    }
+                    self.scrollback_count += 1;
+                } else {
+                    // Steady state: overwrite the oldest row slot in place.
+                    let dst = self.scrollback_start * self.cols;
+                    for col in 0..self.cols {
+                        self.scrollback_buf[dst + col] =
+                            self.cells[self.row_map[i] * self.cols + col];
+                    }
+                    self.scrollback_start =
+                        (self.scrollback_start + 1) % self.scrollback_limit;
+                }
+            }
         }
 
         self.row_map[top..=bottom].rotate_left(count);
@@ -176,6 +242,18 @@ impl Grid {
         } else if self.cursor_row < self.rows.saturating_sub(1) {
             self.cursor_row += 1;
         }
+    }
+
+    /// Number of lines stored in the scrollback buffer.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback_count
+    }
+
+    /// Returns the cell at `col` in a scrollback row.
+    /// `sb_row` is 0-indexed from the oldest line.
+    pub fn scrollback_cell(&self, sb_row: usize, col: usize) -> &Cell {
+        let physical = (self.scrollback_start + sb_row) % self.scrollback_limit;
+        &self.scrollback_buf[physical * self.cols + col]
     }
 }
 

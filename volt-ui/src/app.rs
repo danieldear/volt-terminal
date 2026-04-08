@@ -124,6 +124,9 @@ impl MainState {
                         Ok(mut performer) => performer.resize(rect.cols, rect.rows),
                         Err(err) => eprintln!("volt-ui: failed to lock performer for resize: {err}"),
                     }
+                    // Return to live output after resize — the scrollback is still
+                    // intact but the user should see the current content first.
+                    pane.scroll_view_offset = 0;
                 }
             }
         }
@@ -315,6 +318,46 @@ impl MainState {
         }
     }
 
+    /// Blit `src` into `dst` while applying a scrollback view offset.
+    /// The top `offset` rows of the destination pane area are filled from the
+    /// scrollback buffer; the remaining rows show the beginning of the live grid.
+    fn blit_grid_with_scrollback(
+        dst: &mut Grid,
+        src: &Grid,
+        dst_col: usize,
+        dst_row: usize,
+        pane_rows: usize,
+        offset: usize,
+    ) {
+        if dst_col >= dst.cols || dst_row >= dst.rows {
+            return;
+        }
+        let cols = src.cols.min(dst.cols.saturating_sub(dst_col));
+        let rows = pane_rows.min(dst.rows.saturating_sub(dst_row));
+
+        let sb_len = src.scrollback_len();
+        // Number of rows sourced from scrollback vs. the live grid.
+        let sb_rows = offset.min(rows);
+        let grid_rows = rows - sb_rows;
+        // Index into scrollback of the first row to show.
+        let sb_start = sb_len.saturating_sub(offset);
+
+        for r in 0..sb_rows {
+            let sb_idx = sb_start + r;
+            if sb_idx >= sb_len {
+                break;
+            }
+            for c in 0..cols {
+                *dst.cell_mut(dst_col + c, dst_row + r) = *src.scrollback_cell(sb_idx, c);
+            }
+        }
+        for r in 0..grid_rows {
+            for c in 0..cols {
+                *dst.cell_mut(dst_col + c, dst_row + sb_rows + r) = *src.cell(c, r);
+            }
+        }
+    }
+
     fn build_render_grid_for_active_tab(&self) -> Option<(Grid, bool)> {
         let (total_cols, total_rows) = self.current_grid_size();
         let tab = self.active_tab();
@@ -326,15 +369,27 @@ impl MainState {
 
         for rect in &rects {
             let Some(pane) = tab.tree.find_leaf(rect.id) else { continue; };
-            let (grid, cursor_visible) = {
-                let performer = pane.performer.lock().ok()?;
-                (performer.grid.clone(), performer.cursor_visible)
-            };
-            Self::blit_grid(&mut out, &grid, rect.col, rect.row);
+            // Blit directly while holding the lock — avoids cloning the grid
+            // (and its scrollback buffer), which is expensive under heavy output.
+            let performer = pane.performer.lock().ok()?;
+            let grid = &performer.grid;
+            let offset = pane
+                .scroll_view_offset
+                .min(grid.scrollback_len());
+            if offset == 0 {
+                Self::blit_grid(&mut out, grid, rect.col, rect.row);
+            } else {
+                Self::blit_grid_with_scrollback(
+                    &mut out, grid, rect.col, rect.row, rect.rows, offset,
+                );
+            }
             if rect.id == active_id {
-                active_cursor_visible = cursor_visible;
-                out.cursor_col = (rect.col + grid.cursor_col).min(rect.col + rect.cols.saturating_sub(1));
-                out.cursor_row = (rect.row + grid.cursor_row).min(rect.row + rect.rows.saturating_sub(1));
+                if offset == 0 {
+                    active_cursor_visible = performer.cursor_visible;
+                    out.cursor_col = (rect.col + grid.cursor_col).min(rect.col + rect.cols.saturating_sub(1));
+                    out.cursor_row = (rect.row + grid.cursor_row).min(rect.row + rect.rows.saturating_sub(1));
+                }
+                // When scrolled back, hide the cursor — the user is viewing history.
             }
         }
 
@@ -703,9 +758,6 @@ impl MainState {
     }
 
     fn report_mouse_wheel(&mut self, delta: MouseScrollDelta, col: usize, row: usize) -> bool {
-        let Some((_mode, sgr)) = self.active_mouse_reporting() else {
-            return false;
-        };
         let amount = match delta {
             MouseScrollDelta::LineDelta(_, y) => y,
             MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / self.renderer.cell_height.max(1.0),
@@ -713,11 +765,36 @@ impl MainState {
         if amount == 0.0 {
             return false;
         }
-        let steps = amount.abs().ceil().max(1.0) as usize;
-        let base = if amount > 0.0 { 64u8 } else { 65u8 };
-        let cb = base.saturating_add(self.mouse_modifier_bits());
-        for _ in 0..steps {
-            self.write_mouse_report(cb, col, row, false, sgr);
+
+        // If the active pane has mouse reporting enabled, forward the wheel
+        // event to the PTY (e.g. vim, less).
+        if let Some((_mode, sgr)) = self.active_mouse_reporting() {
+            let steps = amount.abs().ceil().max(1.0) as usize;
+            let base = if amount > 0.0 { 64u8 } else { 65u8 };
+            let cb = base.saturating_add(self.mouse_modifier_bits());
+            for _ in 0..steps {
+                self.write_mouse_report(cb, col, row, false, sgr);
+            }
+            return true;
+        }
+
+        // No mouse reporting — scroll the scrollback view instead.
+        let steps = amount.abs().ceil().max(1.0) as usize * 3;
+        let pane = self.active_pane_mut();
+        let scrollback_len = pane
+            .performer
+            .lock()
+            .ok()
+            .map(|p| p.grid.scrollback_len())
+            .unwrap_or(0);
+        if amount > 0.0 {
+            // Scroll up: reveal older lines.
+            pane.scroll_view_offset =
+                (pane.scroll_view_offset + steps).min(scrollback_len);
+        } else {
+            // Scroll down: return toward live output.
+            pane.scroll_view_offset =
+                pane.scroll_view_offset.saturating_sub(steps);
         }
         true
     }
@@ -1240,7 +1317,9 @@ impl ApplicationHandler<VoltEvent> for App {
                     state.pane_cell_from_mouse(state.mouse_pos.0, state.mouse_pos.1)
                 {
                     state.active_tab_mut().tree.active_id = pane_id;
-                    let _ = state.report_mouse_wheel(delta, col, row);
+                    if state.report_mouse_wheel(delta, col, row) {
+                        state.begin_redraw();
+                    }
                 }
             }
 
@@ -1280,6 +1359,8 @@ impl ApplicationHandler<VoltEvent> for App {
                 if key_state != ElementState::Pressed {
                     return;
                 }
+                // Any key press returns the view to live output.
+                state.active_pane_mut().scroll_view_offset = 0;
                 state.bump_cursor_blink();
 
                 let ctrl = state.ctrl_down();

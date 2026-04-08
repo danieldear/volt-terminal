@@ -128,6 +128,24 @@ impl AppearanceConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalConfig {
+    /// Number of lines to keep in the scrollback buffer per pane.
+    /// Increase this for high-output commands like `adb logcat`.
+    #[serde(default = "default_scrollback_lines")]
+    pub scrollback_lines: usize,
+}
+fn default_scrollback_lines() -> usize {
+    100_000
+}
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            scrollback_lines: default_scrollback_lines(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -138,6 +156,8 @@ pub struct Config {
     pub theme: String,
     #[serde(default)]
     pub appearance: AppearanceConfig,
+    #[serde(default)]
+    pub terminal: TerminalConfig,
     #[serde(default)]
     pub ai: AiConfig,
 }
@@ -390,6 +410,13 @@ cursor_style = "block"
 
 # Blink cursor when focused
 cursor_blink = true
+
+# ── Terminal ────────────────────────────────────────────────────────────────────
+[terminal]
+# Number of lines retained in the scrollback buffer per pane.
+# Increase this for high-output commands such as `adb logcat`.
+# Memory usage is roughly: scrollback_lines × terminal_cols × 24 bytes.
+scrollback_lines = 100000
 "#,
         shell = shell
     )

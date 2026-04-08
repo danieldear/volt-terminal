@@ -26,6 +26,9 @@ pub struct TerminalPane {
     pub title: String,
     pub cwd: Option<PathBuf>,
     pub running: bool,
+    /// How many lines the user has scrolled back into the scrollback buffer.
+    /// 0 means the live view (bottom of output).
+    pub scroll_view_offset: usize,
 }
 
 pub struct TerminalTab {
@@ -78,6 +81,9 @@ impl TerminalPane {
                 }
             },
         )?;
+        if let Ok(mut p) = performer.lock() {
+            p.set_scrollback_limit(config.terminal.scrollback_lines);
+        }
         Ok(Self {
             pty,
             performer,
@@ -85,6 +91,7 @@ impl TerminalPane {
             title: "~".to_string(),
             cwd: None,
             running: false,
+            scroll_view_offset: 0,
         })
     }
 
