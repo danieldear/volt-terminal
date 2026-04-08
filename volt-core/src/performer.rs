@@ -73,7 +73,8 @@ impl Performer {
     /// Set the scrollback line limit on the main grid.
     /// The alt screen never accumulates scrollback, so only the main grid is updated.
     pub fn set_scrollback_limit(&mut self, limit: usize) {
-        self.grid.scrollback_limit = limit;
+        // Treat 0 as "no scrollback"; clamp to 1 so ring-buffer modulo never panics.
+        self.grid.scrollback_limit = limit.max(1);
     }
 
     pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {

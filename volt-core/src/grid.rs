@@ -167,20 +167,18 @@ impl Grid {
         // scroll regions used by apps like vim don't pollute history.
         if top == 0 && self.scrollback_limit > 0 && self.cols > 0 {
             for i in 0..count {
+                let row_start = self.row_map[i] * self.cols;
+                let row_end = row_start + self.cols;
                 if self.scrollback_count < self.scrollback_limit {
                     // Growing phase: extend the flat buffer by one row.
                     // Vec doubling means amortised O(1); once full, no more allocs.
-                    for col in 0..self.cols {
-                        self.scrollback_buf.push(self.cells[self.row_map[i] * self.cols + col]);
-                    }
+                    self.scrollback_buf.extend_from_slice(&self.cells[row_start..row_end]);
                     self.scrollback_count += 1;
                 } else {
                     // Steady state: overwrite the oldest row slot in place.
                     let dst = self.scrollback_start * self.cols;
-                    for col in 0..self.cols {
-                        self.scrollback_buf[dst + col] =
-                            self.cells[self.row_map[i] * self.cols + col];
-                    }
+                    self.scrollback_buf[dst..dst + self.cols]
+                        .copy_from_slice(&self.cells[row_start..row_end]);
                     self.scrollback_start =
                         (self.scrollback_start + 1) % self.scrollback_limit;
                 }

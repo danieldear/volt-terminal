@@ -136,7 +136,7 @@ pub struct TerminalConfig {
     pub scrollback_lines: usize,
 }
 fn default_scrollback_lines() -> usize {
-    100_000
+    10_000
 }
 impl Default for TerminalConfig {
     fn default() -> Self {
@@ -416,7 +416,7 @@ cursor_blink = true
 # Number of lines retained in the scrollback buffer per pane.
 # Increase this for high-output commands such as `adb logcat`.
 # Memory usage is roughly: scrollback_lines × terminal_cols × 24 bytes.
-scrollback_lines = 100000
+scrollback_lines = 10000
 "#,
         shell = shell
     )
