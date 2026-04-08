@@ -193,6 +193,8 @@ pub struct Renderer {
     pub cell_width: f32,
     pub cell_height: f32,
     pub tab_bar_height: f32,
+    /// When false, the custom GPU tab bar is suppressed (e.g. native macOS window tabbing active).
+    pub custom_tab_bar: bool,
     pub scale_factor: f32,
     font_size_phys: f32,
     pub background_opacity: f32,
@@ -476,6 +478,7 @@ impl Renderer {
             cell_width,
             cell_height,
             tab_bar_height,
+            custom_tab_bar: true,
             scale_factor,
             font_size_phys,
             background_opacity: background_opacity.clamp(0.0, 1.0),
@@ -564,9 +567,9 @@ impl Renderer {
     }
 
     fn tab_bar_height_for_tab_count(&self, _tab_count: usize) -> f32 {
-        // Always show the full tab bar regardless of tab count.
-        // On macOS with transparent titlebar this also ensures traffic lights clear content.
-        self.tab_bar_height
+        // When custom_tab_bar is disabled (e.g. native macOS window tabbing), return 0
+        // so the terminal content fills from the top of the content view.
+        if self.custom_tab_bar { self.tab_bar_height } else { 0.0 }
     }
 
     fn alert_bar_height(&self) -> f32 {

@@ -215,13 +215,14 @@ fn dividers_node(
         PaneNode::Leaf { .. } => {}
         PaneNode::Split { direction, ratio, children, divider_id } => {
             let line_w = scale.max(1.0);
-            // Color priority: drag (blue accent) > hover (lighter gray) > idle (dark gray)
+            // Colors match NSColor.separatorColor semantics: translucent overlays that
+            // blend naturally over the terminal background via alpha blending.
             let color = if drag_id == Some(*divider_id) {
-                [0.29_f32, 0.56, 0.85, 1.0]   // drag: blue accent
+                [0.29_f32, 0.56, 0.85, 0.75]  // drag: blue accent, semi-transparent
             } else if hover_id == Some(*divider_id) {
-                [0.50_f32, 0.50, 0.50, 1.0]   // hover: lighter gray
+                [1.00_f32, 1.00, 1.00, 0.30]  // hover: white tint
             } else {
-                [0.24_f32, 0.24, 0.24, 1.0]   // idle: dark gray (crisp, Ghostty-like)
+                [1.00_f32, 1.00, 1.00, 0.09]  // idle: NSColor.separatorColor equivalent
             };
             match direction {
                 PaneSplitDirection::Vertical => {

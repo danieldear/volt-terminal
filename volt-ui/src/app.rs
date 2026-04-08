@@ -34,6 +34,9 @@ pub enum VoltEvent {
     #[cfg(target_os = "macos")]
     /// Display link tick — redraw on display cadence when needed.
     DisplayLinkTick,
+    #[cfg(target_os = "macos")]
+    /// Request to open a new terminal window (used for native macOS tab creation).
+    CreateNewWindow,
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -94,7 +97,10 @@ impl MainState {
     }
 
     fn show_custom_tab_bar(&self) -> bool {
-        // Tab bar is always visible — even with a single tab.
+        // On macOS use the native window tab bar; suppress the custom GPU one.
+        #[cfg(target_os = "macos")]
+        return false;
+        #[cfg(not(target_os = "macos"))]
         true
     }
 
@@ -849,11 +855,11 @@ impl App {
         #[cfg(target_os = "macos")]
         {
             use winit::platform::macos::WindowAttributesExtMacOS;
-            event_loop.set_allows_automatic_window_tabbing(false);
+            // Enable native macOS window tabbing so each new window joins the tab strip.
+            event_loop.set_allows_automatic_window_tabbing(true);
             window_attrs = window_attrs
                 .with_titlebar_transparent(true)
-                .with_fullsize_content_view(true)
-                .with_title_hidden(true);
+                .with_tabbing_identifier("volt.terminal");
         }
         window_attrs = window_attrs
             .with_transparent(self.config.appearance.transparent_enabled())
@@ -876,6 +882,9 @@ impl App {
             self.config.appearance.cursor_style,
         ))?;
         renderer.set_top_alert(self.config_alert.clone());
+        if cfg!(target_os = "macos") {
+            renderer.custom_tab_bar = false;
+        }
         #[cfg(target_os = "macos")]
         let (cols, rows) = renderer.grid_size_for_tab_count(native_tab_count);
         #[cfg(not(target_os = "macos"))]
@@ -1010,7 +1019,7 @@ impl ApplicationHandler<VoltEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: VoltEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: VoltEvent) {
         match event {
             VoltEvent::PtyData => {
                 self.pty_wake_pending.store(false, Ordering::Release);
@@ -1025,6 +1034,10 @@ impl ApplicationHandler<VoltEvent> for App {
                         state.window.request_redraw();
                     }
                 }
+            }
+            #[cfg(target_os = "macos")]
+            VoltEvent::CreateNewWindow => {
+                let _ = self.create_main_window(event_loop, None);
             }
         }
     }
@@ -1437,8 +1450,18 @@ impl ApplicationHandler<VoltEvent> for App {
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyT) => {
-                            state.new_tab();
-                            state.begin_redraw();
+                            #[cfg(target_os = "macos")]
+                            {
+                                // On macOS, open a new window (becomes a native tab via tabbingIdentifier).
+                                if let Some(proxy) = self.proxy.as_ref() {
+                                    let _ = proxy.send_event(VoltEvent::CreateNewWindow);
+                                }
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                state.new_tab();
+                                state.begin_redraw();
+                            }
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyW) => {
@@ -1446,8 +1469,36 @@ impl ApplicationHandler<VoltEvent> for App {
                             let active_id = state.active_tab().tree.active_id;
                             let tab_idx = state.active_tab;
                             let should_close_tab = state.remove_pane_from_tab(tab_idx, active_id);
-                            if should_close_tab && state.tabs.len() > 1 {
-                                state.close_tab(tab_idx);
+                            if should_close_tab {
+                                if state.tabs.len() > 1 {
+                                    state.close_tab(tab_idx);
+                                } else {
+                                    // On native tabs (macOS) the last pane should close the window;
+                                    // do NOT return early so close_window_after_event is checked.
+                                    #[cfg(target_os = "macos")]
+                                    {
+                                        close_window_after_event = true;
+                                        state.begin_redraw();
+                                    }
+                                    #[cfg(not(target_os = "macos"))]
+                                    {
+                                        state.begin_redraw();
+                                        return;
+                                    }
+                                }
+                            } else {
+                                state.begin_redraw();
+                                return;
+                            }
+                            #[cfg(target_os = "macos")]
+                            if close_window_after_event {
+                                // Drop state borrow so self.windows.remove can run below.
+                                let _ = state;
+                                self.windows.remove(&window_id);
+                                if self.windows.is_empty() {
+                                    event_loop.exit();
+                                }
+                                return;
                             }
                             state.begin_redraw();
                             return;
