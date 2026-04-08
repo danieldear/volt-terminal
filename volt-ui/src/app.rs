@@ -859,11 +859,17 @@ impl App {
             use winit::platform::macos::WindowAttributesExtMacOS;
             let use_native = self.config.appearance.native_tabs;
             event_loop.set_allows_automatic_window_tabbing(use_native);
-            window_attrs = window_attrs.with_titlebar_transparent(true);
             if use_native {
-                window_attrs = window_attrs.with_tabbing_identifier("volt.terminal");
-            } else {
+                // Native mode: transparent title bar (unified look like iTerm2/Ghostty).
+                // The title bar is still present and shows traffic lights + window title;
+                // it just blends with the window background colour.
                 window_attrs = window_attrs
+                    .with_titlebar_transparent(true)
+                    .with_tabbing_identifier("volt.terminal");
+            } else {
+                // Custom tab bar mode: hide native chrome, extend content to fill window.
+                window_attrs = window_attrs
+                    .with_titlebar_transparent(true)
                     .with_fullsize_content_view(true)
                     .with_title_hidden(true);
             }
