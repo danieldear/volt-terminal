@@ -97,9 +97,9 @@ impl MainState {
     }
 
     fn show_custom_tab_bar(&self) -> bool {
-        // On macOS use the native window tab bar; suppress the custom GPU one.
+        // On macOS, respect the native_tabs config option.
         #[cfg(target_os = "macos")]
-        return false;
+        return !self.config.appearance.native_tabs;
         #[cfg(not(target_os = "macos"))]
         true
     }
@@ -179,12 +179,14 @@ impl MainState {
         let content_top = self.current_content_top_offset();
         let scale = self.renderer.scale_factor;
         let drag_id = self.divider_drag.map(|d| d.divider_id);
+        let divider_opacity = self.config.appearance.divider_opacity;
         tab.tree.dividers_with_ids(
             total_cols, total_rows,
             self.renderer.cell_width, self.renderer.cell_height,
             phys_pad, content_top, scale,
             self.divider_hover_id,
             drag_id,
+            divider_opacity,
         )
     }
 
@@ -855,11 +857,16 @@ impl App {
         #[cfg(target_os = "macos")]
         {
             use winit::platform::macos::WindowAttributesExtMacOS;
-            // Enable native macOS window tabbing so each new window joins the tab strip.
-            event_loop.set_allows_automatic_window_tabbing(true);
-            window_attrs = window_attrs
-                .with_titlebar_transparent(true)
-                .with_tabbing_identifier("volt.terminal");
+            let use_native = self.config.appearance.native_tabs;
+            event_loop.set_allows_automatic_window_tabbing(use_native);
+            window_attrs = window_attrs.with_titlebar_transparent(true);
+            if use_native {
+                window_attrs = window_attrs.with_tabbing_identifier("volt.terminal");
+            } else {
+                window_attrs = window_attrs
+                    .with_fullsize_content_view(true)
+                    .with_title_hidden(true);
+            }
         }
         window_attrs = window_attrs
             .with_transparent(self.config.appearance.transparent_enabled())
@@ -882,7 +889,7 @@ impl App {
             self.config.appearance.cursor_style,
         ))?;
         renderer.set_top_alert(self.config_alert.clone());
-        if cfg!(target_os = "macos") {
+        if cfg!(target_os = "macos") && self.config.appearance.native_tabs {
             renderer.custom_tab_bar = false;
         }
         #[cfg(target_os = "macos")]
@@ -1451,17 +1458,15 @@ impl ApplicationHandler<VoltEvent> for App {
                         }
                         PhysicalKey::Code(KeyCode::KeyT) => {
                             #[cfg(target_os = "macos")]
-                            {
-                                // On macOS, open a new window (becomes a native tab via tabbingIdentifier).
+                            if state.config.appearance.native_tabs {
+                                // Open a new window — macOS groups it as a native tab.
                                 if let Some(proxy) = self.proxy.as_ref() {
                                     let _ = proxy.send_event(VoltEvent::CreateNewWindow);
                                 }
+                                return;
                             }
-                            #[cfg(not(target_os = "macos"))]
-                            {
-                                state.new_tab();
-                                state.begin_redraw();
-                            }
+                            state.new_tab();
+                            state.begin_redraw();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyW) => {

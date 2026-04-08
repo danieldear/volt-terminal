@@ -102,10 +102,11 @@ impl PaneTree {
         scale: f32,
         hover_id: Option<usize>,
         drag_id: Option<usize>,
+        divider_opacity: f32,
     ) -> Vec<DividerInfo> {
         let mut out = Vec::new();
         if let Some(root) = &self.root {
-            dividers_node(root, 0, 0, cols, rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, &mut out);
+            dividers_node(root, 0, 0, cols, rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, divider_opacity, &mut out);
         }
         out
     }
@@ -209,20 +210,20 @@ fn dividers_node(
     scale: f32,
     hover_id: Option<usize>,
     drag_id: Option<usize>,
+    divider_opacity: f32,
     out: &mut Vec<DividerInfo>,
 ) {
     match node {
         PaneNode::Leaf { .. } => {}
         PaneNode::Split { direction, ratio, children, divider_id } => {
             let line_w = scale.max(1.0);
-            // Colors match NSColor.separatorColor semantics: translucent overlays that
-            // blend naturally over the terminal background via alpha blending.
+            // Colors blend over the terminal background via alpha compositing.
             let color = if drag_id == Some(*divider_id) {
-                [0.29_f32, 0.56, 0.85, 0.75]  // drag: blue accent, semi-transparent
+                [0.29_f32, 0.56, 0.85, 0.75]
             } else if hover_id == Some(*divider_id) {
-                [1.00_f32, 1.00, 1.00, 0.30]  // hover: white tint
+                [1.00_f32, 1.00, 1.00, (divider_opacity * 3.0).min(1.0)]
             } else {
-                [1.00_f32, 1.00, 1.00, 0.09]  // idle: NSColor.separatorColor equivalent
+                [1.00_f32, 1.00, 1.00, divider_opacity.clamp(0.0, 1.0)]
             };
             match direction {
                 PaneSplitDirection::Vertical => {
@@ -236,8 +237,8 @@ fn dividers_node(
                         direction: PaneSplitDirection::Vertical,
                     });
                     let right_cols = cols.saturating_sub(left_cols + 1).max(1);
-                    dividers_node(&children[0], base_col, base_row, left_cols, rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, out);
-                    dividers_node(&children[1], base_col + left_cols + 1, base_row, right_cols, rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, out);
+                    dividers_node(&children[0], base_col, base_row, left_cols, rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, divider_opacity, out);
+                    dividers_node(&children[1], base_col + left_cols + 1, base_row, right_cols, rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, divider_opacity, out);
                 }
                 PaneSplitDirection::Horizontal => {
                     let top_rows = top_rows_from_ratio(*ratio, rows);
@@ -250,8 +251,8 @@ fn dividers_node(
                         direction: PaneSplitDirection::Horizontal,
                     });
                     let bot_rows = rows.saturating_sub(top_rows + 1).max(1);
-                    dividers_node(&children[0], base_col, base_row, cols, top_rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, out);
-                    dividers_node(&children[1], base_col, base_row + top_rows + 1, cols, bot_rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, out);
+                    dividers_node(&children[0], base_col, base_row, cols, top_rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, divider_opacity, out);
+                    dividers_node(&children[1], base_col, base_row + top_rows + 1, cols, bot_rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, divider_opacity, out);
                 }
             }
         }

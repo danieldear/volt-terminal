@@ -65,6 +65,13 @@ pub struct AppearanceConfig {
     pub cursor_style: CursorStyle,
     #[serde(default = "default_cursor_blink")]
     pub cursor_blink: bool,
+    /// Use the native macOS window tab bar instead of the custom GPU-rendered one.
+    /// Only has effect on macOS. Default: true.
+    #[serde(default = "default_native_tabs")]
+    pub native_tabs: bool,
+    /// Alpha (opacity) of the idle pane divider line, 0.0–1.0. Default: 0.09.
+    #[serde(default = "default_divider_opacity")]
+    pub divider_opacity: f32,
 }
 fn default_padding() -> u16 {
     8
@@ -80,6 +87,12 @@ fn default_blur_amount() -> f32 {
 }
 fn default_cursor_blink() -> bool {
     true
+}
+fn default_native_tabs() -> bool {
+    true
+}
+fn default_divider_opacity() -> f32 {
+    0.09
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -103,6 +116,8 @@ impl Default for AppearanceConfig {
             blur: false,
             cursor_style: CursorStyle::Block,
             cursor_blink: default_cursor_blink(),
+            native_tabs: default_native_tabs(),
+            divider_opacity: default_divider_opacity(),
         }
     }
 }
@@ -410,6 +425,15 @@ cursor_style = "block"
 
 # Blink cursor when focused
 cursor_blink = true
+
+# Use the native macOS window tab bar (macOS only). When true, each new tab
+# opens as a native OS window grouped in the system tab strip. When false,
+# the custom GPU-rendered tab bar is used instead.
+# native_tabs = true
+
+# Opacity of the idle pane-split divider line (0.0 = invisible, 1.0 = opaque).
+# The hover and drag states scale from this value automatically.
+# divider_opacity = 0.09
 
 # ── Terminal ────────────────────────────────────────────────────────────────────
 [terminal]
