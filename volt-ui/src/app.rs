@@ -887,6 +887,11 @@ impl App {
         let native_tab_count = window.num_tabs().max(1);
         #[cfg(target_os = "macos")]
         configure_macos_tab_chrome(window.as_ref(), native_tab_count);
+        #[cfg(target_os = "macos")]
+        if self.config.appearance.native_tabs {
+            let theme = Theme::by_name(&self.config.theme);
+            apply_macos_titlebar_style(window.as_ref(), theme.background);
+        }
         let scale_factor = window.scale_factor() as f32;
         let mut renderer = self.rt.block_on(Renderer::new(
             window.clone(),
@@ -978,6 +983,49 @@ impl App {
 fn configure_macos_tab_chrome(_window: &Window, _native_tab_count: usize) {
     // Keep macOS tab handling fully native for stability.
     // We only use winit's tabbing identifier / native APIs.
+}
+
+/// On macOS native-tabs mode, make the title bar blend seamlessly with the terminal:
+/// - Remove the hairline separator between title bar and content
+/// - Set the window background colour to match the terminal theme background
+///
+/// This gives the same "unified" appearance as Ghostty/iTerm2 where the title bar
+/// is visually indistinguishable from the terminal background.
+#[cfg(target_os = "macos")]
+fn apply_macos_titlebar_style(window: &Window, theme_bg: volt_config::theme::Color) {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = window.window_handle() else { return };
+    let ns_view = match handle.as_raw() {
+        RawWindowHandle::AppKit(h) => h.ns_view.as_ptr() as *mut Object,
+        _ => return,
+    };
+    unsafe {
+        // Get the NSWindow that owns this view.
+        let ns_window: *mut Object = msg_send![ns_view, window];
+        if ns_window.is_null() {
+            return;
+        }
+        // NSTitlebarSeparatorStyleNone = 1 — hides the hairline divider drawn by
+        // macOS between the title bar and the content view.
+        let _: () = msg_send![ns_window, setTitlebarSeparatorStyle: 1usize];
+
+        // Set the window background colour to match the terminal theme so that the
+        // transparent title bar blends seamlessly instead of showing system gray.
+        let r = theme_bg.r as f64 / 255.0;
+        let g = theme_bg.g as f64 / 255.0;
+        let b = theme_bg.b as f64 / 255.0;
+        let color: *mut Object = msg_send![
+            class!(NSColor),
+            colorWithSRGBRed: r
+            green: g
+            blue: b
+            alpha: 1.0f64
+        ];
+        let _: () = msg_send![ns_window, setBackgroundColor: color];
+    }
 }
 
 fn open_config_in_editor() {
