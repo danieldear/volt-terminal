@@ -180,10 +180,14 @@ impl MainState {
         let scale = self.renderer.scale_factor;
         let drag_id = self.divider_drag.map(|d| d.divider_id);
         let divider_opacity = self.config.appearance.divider_opacity;
+        let phys_right = self.renderer.surface_width() as f32 - phys_pad;
+        let phys_bottom = self.renderer.surface_height() as f32;
         tab.tree.dividers_with_ids(
             total_cols, total_rows,
             self.renderer.cell_width, self.renderer.cell_height,
-            phys_pad, content_top, scale,
+            phys_pad, content_top,
+            phys_right, phys_bottom,
+            scale,
             self.divider_hover_id,
             drag_id,
             divider_opacity,

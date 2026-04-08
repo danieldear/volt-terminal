@@ -99,6 +99,8 @@ impl PaneTree {
         cell_h: f32,
         phys_pad: f32,
         content_top: f32,
+        phys_right: f32,
+        phys_bottom: f32,
         scale: f32,
         hover_id: Option<usize>,
         drag_id: Option<usize>,
@@ -106,7 +108,7 @@ impl PaneTree {
     ) -> Vec<DividerInfo> {
         let mut out = Vec::new();
         if let Some(root) = &self.root {
-            dividers_node(root, 0, 0, cols, rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, divider_opacity, &mut out);
+            dividers_node(root, 0, 0, cols, rows, cell_w, cell_h, phys_pad, content_top, phys_right, phys_bottom, scale, hover_id, drag_id, divider_opacity, &mut out);
         }
         out
     }
@@ -207,6 +209,9 @@ fn dividers_node(
     cols: usize, rows: usize,
     cell_w: f32, cell_h: f32,
     phys_pad: f32, content_top: f32,
+    // Physical extents for this subtree — used to extend dividers to fill
+    // leftover pixels that don't fit in a whole cell.
+    phys_right: f32, phys_bottom: f32,
     scale: f32,
     hover_id: Option<usize>,
     drag_id: Option<usize>,
@@ -230,29 +235,33 @@ fn dividers_node(
                     let left_cols = left_cols_from_ratio(*ratio, cols);
                     let div_x = phys_pad + (base_col + left_cols) as f32 * cell_w;
                     let div_y = content_top + base_row as f32 * cell_h;
-                    let div_h = rows as f32 * cell_h;
+                    // Extend to phys_bottom to fill sub-cell remainder at the bottom edge.
+                    let div_h = phys_bottom - div_y;
                     out.push(DividerInfo {
                         id: *divider_id,
                         phys: PaneDivider { x: div_x, y: div_y, width: line_w, height: div_h, color },
                         direction: PaneSplitDirection::Vertical,
                     });
                     let right_cols = cols.saturating_sub(left_cols + 1).max(1);
-                    dividers_node(&children[0], base_col, base_row, left_cols, rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, divider_opacity, out);
-                    dividers_node(&children[1], base_col + left_cols + 1, base_row, right_cols, rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, divider_opacity, out);
+                    // Left child's right boundary is the divider line; right child keeps parent's right.
+                    dividers_node(&children[0], base_col, base_row, left_cols, rows, cell_w, cell_h, phys_pad, content_top, div_x, phys_bottom, scale, hover_id, drag_id, divider_opacity, out);
+                    dividers_node(&children[1], base_col + left_cols + 1, base_row, right_cols, rows, cell_w, cell_h, phys_pad, content_top, phys_right, phys_bottom, scale, hover_id, drag_id, divider_opacity, out);
                 }
                 PaneSplitDirection::Horizontal => {
                     let top_rows = top_rows_from_ratio(*ratio, rows);
                     let div_x = phys_pad + base_col as f32 * cell_w;
-                    let div_y = content_top + phys_pad + (base_row + top_rows) as f32 * cell_h;
-                    let div_w = cols as f32 * cell_w;
+                    let div_y = content_top + (base_row + top_rows) as f32 * cell_h;
+                    // Extend to phys_right to fill sub-cell remainder at the right edge.
+                    let div_w = phys_right - div_x;
                     out.push(DividerInfo {
                         id: *divider_id,
                         phys: PaneDivider { x: div_x, y: div_y, width: div_w, height: line_w, color },
                         direction: PaneSplitDirection::Horizontal,
                     });
                     let bot_rows = rows.saturating_sub(top_rows + 1).max(1);
-                    dividers_node(&children[0], base_col, base_row, cols, top_rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, divider_opacity, out);
-                    dividers_node(&children[1], base_col, base_row + top_rows + 1, cols, bot_rows, cell_w, cell_h, phys_pad, content_top, scale, hover_id, drag_id, divider_opacity, out);
+                    // Top child's bottom boundary is the divider line; bottom child keeps parent's bottom.
+                    dividers_node(&children[0], base_col, base_row, cols, top_rows, cell_w, cell_h, phys_pad, content_top, phys_right, div_y, scale, hover_id, drag_id, divider_opacity, out);
+                    dividers_node(&children[1], base_col, base_row + top_rows + 1, cols, bot_rows, cell_w, cell_h, phys_pad, content_top, phys_right, phys_bottom, scale, hover_id, drag_id, divider_opacity, out);
                 }
             }
         }

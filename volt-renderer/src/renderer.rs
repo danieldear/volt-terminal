@@ -603,6 +603,9 @@ impl Renderer {
         self.grid_size_for_tab_count(2)
     }
 
+    pub fn surface_width(&self) -> u32 { self.config.width }
+    pub fn surface_height(&self) -> u32 { self.config.height }
+
     pub fn grid_size_for_tab_count(&self, tab_count: usize) -> (usize, usize) {
         let phys_pad = self.padding * self.scale_factor;
         let term_w = self.config.width as f32 - 2.0 * phys_pad;
@@ -1235,7 +1238,7 @@ impl Renderer {
         }
 
         // ── tab bar ──────────────────────────────────────────────────────────
-        if tabs.len() > 1 && full_redraw {
+        if self.custom_tab_bar && tabs.len() > 1 && full_redraw {
             let sc = self.scale_factor;
             let ui_line_height = TAB_BAR_UI_LINE_HEIGHT;
             self.draw_rect(
