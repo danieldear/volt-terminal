@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cosmic_text::{Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight};
+use cosmic_text::{
+    Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight,
+};
 
 use crate::atlas::CpuAtlas;
 use crate::pipeline::{bg_pipeline, glyph_pipeline, BgVertex, GlyphVertex};
@@ -29,7 +31,6 @@ const TAB_BAR_TAB_TOP_INSET: f32 = 4.0;
 const TAB_BAR_TAB_BOTTOM_INSET: f32 = 4.0;
 const TAB_BAR_BUTTON_INSET: f32 = 4.0;
 const TAB_BAR_BUTTON_PADDING: f32 = 5.0;
-
 
 /// Positioned glyph from a shaped Buffer run — everything needed to place it
 /// in the atlas and emit vertices, WITHOUT the colour (which varies per cell).
@@ -569,7 +570,11 @@ impl Renderer {
     fn tab_bar_height_for_tab_count(&self, _tab_count: usize) -> f32 {
         // When custom_tab_bar is disabled (e.g. native macOS window tabbing), return 0
         // so the terminal content fills from the top of the content view.
-        if self.custom_tab_bar { self.tab_bar_height } else { 0.0 }
+        if self.custom_tab_bar {
+            self.tab_bar_height
+        } else {
+            0.0
+        }
     }
 
     fn alert_bar_height(&self) -> f32 {
@@ -603,8 +608,12 @@ impl Renderer {
         self.grid_size_for_tab_count(2)
     }
 
-    pub fn surface_width(&self) -> u32 { self.config.width }
-    pub fn surface_height(&self) -> u32 { self.config.height }
+    pub fn surface_width(&self) -> u32 {
+        self.config.width
+    }
+    pub fn surface_height(&self) -> u32 {
+        self.config.height
+    }
 
     pub fn grid_size_for_tab_count(&self, tab_count: usize) -> (usize, usize) {
         let phys_pad = self.padding * self.scale_factor;
@@ -895,7 +904,15 @@ impl Renderer {
         font_size_phys: f32,
         color: [f32; 4],
     ) {
-        self.draw_text_with_line_height(glyphs, text, px, py, font_size_phys, self.line_height, color);
+        self.draw_text_with_line_height(
+            glyphs,
+            text,
+            px,
+            py,
+            font_size_phys,
+            self.line_height,
+            color,
+        );
     }
 
     // ── GPU present helper ───────────────────────────────────────────────────
@@ -1008,6 +1025,7 @@ impl Renderer {
         tabs: &[TabEntry],
         cursor_visible: bool,
         selection: Option<((usize, usize), (usize, usize))>,
+        selection_block: bool,
         _damage_rows: Option<(usize, usize)>,
         dividers: &[PaneDivider],
     ) {
@@ -1057,8 +1075,16 @@ impl Renderer {
             let Some(((start_col, start_row), (end_col, end_row))) = selection else {
                 return false;
             };
-            (row > start_row || (row == start_row && col >= start_col))
-                && (row < end_row || (row == end_row && col <= end_col))
+            if selection_block {
+                let min_col = start_col.min(end_col);
+                let max_col = start_col.max(end_col);
+                let min_row = start_row.min(end_row);
+                let max_row = start_row.max(end_row);
+                row >= min_row && row <= max_row && col >= min_col && col <= max_col
+            } else {
+                (row > start_row || (row == start_row && col >= start_col))
+                    && (row < end_row || (row == end_row && col <= end_col))
+            }
         };
 
         if partial_redraw && row_start < row_end_exclusive {
@@ -1290,21 +1316,32 @@ impl Renderer {
                 let tx = left_pad + i as f32 * (tab_w + tab_gap);
                 let title = tab.title;
                 let active = tab.active;
-                let tab_edge = theme.foreground.to_f32_alpha(if active { 0.14 } else { 0.07 });
+                let tab_edge = theme
+                    .foreground
+                    .to_f32_alpha(if active { 0.14 } else { 0.07 });
                 let tab_bg = if active {
                     theme.background.to_f32_alpha(0.68)
                 } else {
                     theme.background.to_f32_alpha(0.30)
                 };
                 self.draw_rect(&mut bg_verts, tx, tab_y, tab_w, tab_h, tab_bg);
-                self.draw_rect(&mut bg_verts, tx, tab_y, tab_w, (1.0 * sc).max(1.0), tab_edge);
+                self.draw_rect(
+                    &mut bg_verts,
+                    tx,
+                    tab_y,
+                    tab_w,
+                    (1.0 * sc).max(1.0),
+                    tab_edge,
+                );
                 self.draw_rect(
                     &mut bg_verts,
                     tx,
                     tab_y + tab_h - (1.0 * sc).max(1.0),
                     tab_w,
                     (1.0 * sc).max(1.0),
-                    theme.background.to_f32_alpha(if active { 0.44 } else { 0.28 }),
+                    theme
+                        .background
+                        .to_f32_alpha(if active { 0.44 } else { 0.28 }),
                 );
                 self.draw_rect(
                     &mut bg_verts,
@@ -1361,7 +1398,8 @@ impl Renderer {
                 };
                 let info_x = close_box_x - TAB_BAR_STATUS_RIGHT_RESERVE * sc;
                 let title_left = tx + TAB_BAR_TITLE_LEFT_PAD * sc;
-                let title_right = (info_x - TAB_BAR_TITLE_RIGHT_RESERVE * sc).max(title_left + 12.0 * sc);
+                let title_right =
+                    (info_x - TAB_BAR_TITLE_RIGHT_RESERVE * sc).max(title_left + 12.0 * sc);
                 let max_text_w = (title_right - title_left).max(12.0 * sc);
                 let title_color = if active {
                     theme.foreground.to_f32()
@@ -1458,7 +1496,9 @@ impl Renderer {
                     close_box_y,
                     close_box_w,
                     close_box_h,
-                    theme.background.to_f32_alpha(if active { 0.44 } else { 0.24 }),
+                    theme
+                        .background
+                        .to_f32_alpha(if active { 0.44 } else { 0.24 }),
                 );
                 let cx = close_box_x + (TAB_BAR_BUTTON_PADDING * 0.75) * sc;
                 let close_color = if active {

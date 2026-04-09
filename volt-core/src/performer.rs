@@ -241,6 +241,7 @@ impl Perform for Performer {
         // Deferred wrap: fire the pending wrap before placing the new character.
         if self.grid.pending_wrap {
             self.grid.pending_wrap = false;
+            self.grid.set_row_soft_wrapped(self.grid.cursor_row, true);
             self.grid.cursor_col = 0;
             let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
             self.grid.newline();
@@ -250,6 +251,7 @@ impl Perform for Performer {
         }
 
         if width == 2 && self.grid.cursor_col + 1 >= self.grid.cols {
+            self.grid.set_row_soft_wrapped(self.grid.cursor_row, true);
             self.grid.cursor_col = 0;
             let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
             self.grid.newline();
@@ -261,6 +263,7 @@ impl Perform for Performer {
         let col = self.grid.cursor_col;
         let row = self.grid.cursor_row;
         if col < self.grid.cols && row < self.grid.rows {
+            self.grid.set_row_soft_wrapped(row, false);
             *self.grid.cell_mut(col, row) = self.make_cell(c);
             if width == 2 && col + 1 < self.grid.cols {
                 *self.grid.cell_mut(col + 1, row) = self.make_cell(' ');
@@ -299,6 +302,7 @@ impl Perform for Performer {
             }
             0x0a..=0x0c => {
                 // LF/VT/FF
+                self.grid.set_row_soft_wrapped(self.grid.cursor_row, false);
                 let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
                 self.grid.newline();
                 if will_scroll {
@@ -745,6 +749,26 @@ mod tests {
         }
     }
 
+    fn collect_logical_lines(p: &Performer) -> Vec<String> {
+        let mut logical_lines = Vec::new();
+        let mut current = String::new();
+        for row in 0..p.grid.rows {
+            let mut row_text = String::new();
+            for col in 0..p.grid.cols {
+                row_text.push(p.grid.cell(col, row).c);
+            }
+            current.push_str(row_text.trim_end());
+            if !p.grid.row_soft_wrapped(row) {
+                logical_lines.push(current.clone());
+                current.clear();
+            }
+        }
+        if !current.is_empty() {
+            logical_lines.push(current);
+        }
+        logical_lines
+    }
+
     #[test]
     fn test_print_places_char() {
         let mut p = Performer::new(80, 24);
@@ -936,6 +960,117 @@ mod tests {
         feed(&mut p, b"\x1b8"); // restore
         assert_eq!(p.grid.cursor_col, 10);
         assert_eq!(p.grid.cursor_row, 5);
+    }
+
+    #[test]
+    fn test_resize_wider_clears_pending_wrap_without_newline() {
+        let mut p = Performer::new(5, 3);
+        feed(&mut p, b"ABCDE");
+        assert!(p.grid.pending_wrap);
+        assert_eq!(p.grid.cursor_col, 4);
+
+        p.resize(10, 3);
+        assert!(!p.grid.pending_wrap);
+        assert_eq!(p.grid.cursor_col, 5);
+
+        feed(&mut p, b"F");
+        assert_eq!(p.grid.cell(5, 0).c, 'F');
+        assert_eq!(p.grid.cell(0, 1).c, ' ');
+        assert_eq!(p.grid.cursor_row, 0);
+        assert_eq!(p.grid.cursor_col, 6);
+    }
+
+    #[test]
+    fn test_resize_narrow_reflows_pending_wrap_position() {
+        let mut p = Performer::new(5, 3);
+        feed(&mut p, b"ABCDE");
+        assert!(p.grid.pending_wrap);
+
+        p.resize(4, 3);
+        assert!(!p.grid.pending_wrap);
+        assert_eq!(p.grid.cursor_row, 1);
+        assert_eq!(p.grid.cursor_col, 1);
+
+        feed(&mut p, b"F");
+        assert_eq!(p.grid.cell(0, 1).c, 'E');
+        assert_eq!(p.grid.cell(1, 1).c, 'F');
+        assert_eq!(p.grid.cursor_row, 1);
+        assert_eq!(p.grid.cursor_col, 2);
+    }
+
+    #[test]
+    fn test_resize_wider_reflows_soft_wrapped_history() {
+        let mut p = Performer::new(12, 6);
+        feed(&mut p, b"Federated Learning.key\r\n$ ");
+
+        p.resize(24, 6);
+
+        let logical_lines = collect_logical_lines(&p);
+        assert!(
+            logical_lines
+                .iter()
+                .any(|line| line.contains("Federated Learning.key"))
+        );
+        assert!(logical_lines.iter().any(|line| line.starts_with("$")));
+    }
+
+    #[test]
+    fn test_repeated_resize_keeps_wrapped_text() {
+        let mut p = Performer::new(12, 8);
+        feed(&mut p, b"Federated Learning.key\r\n$ ");
+
+        p.resize(8, 8);
+        p.resize(20, 8);
+        p.resize(10, 8);
+        p.resize(24, 8);
+
+        let logical_lines = collect_logical_lines(&p);
+
+        assert!(
+            logical_lines
+                .iter()
+                .any(|line| line.contains("Federated Learning.key"))
+        );
+    }
+
+    #[test]
+    fn test_resize_does_not_merge_hard_newlines_at_margin() {
+        let mut p = Performer::new(5, 4);
+        feed(&mut p, b"ABCDE\r\nFGHIJ");
+
+        p.resize(10, 4);
+
+        let logical_lines = collect_logical_lines(&p);
+        assert!(logical_lines.iter().any(|line| line == "ABCDE"));
+        assert!(logical_lines.iter().any(|line| line.starts_with("FGHIJ")));
+        assert!(!logical_lines.iter().any(|line| line.contains("ABCDEFGHIJ")));
+    }
+
+    #[test]
+    fn test_resize_after_el0_clears_stale_soft_wrap() {
+        let mut p = Performer::new(6, 4);
+        feed(&mut p, b"ABCDEFG");
+        feed(&mut p, b"\x1b[1;4H");
+        feed(&mut p, b"\x1b[K");
+
+        p.resize(12, 4);
+
+        let logical_lines = collect_logical_lines(&p);
+        assert!(logical_lines.iter().any(|line| line == "ABC"));
+        assert!(logical_lines.iter().any(|line| line.starts_with("G")));
+        assert!(!logical_lines.iter().any(|line| line.contains("ABCG")));
+    }
+
+    #[test]
+    fn test_row_only_resize_keeps_cursor_context_not_top_rows() {
+        let mut p = Performer::new(6, 4);
+        feed(&mut p, b"A\r\nB\r\nC\r\nD");
+
+        p.resize(6, 2);
+
+        assert_eq!(p.grid.cursor_row, 1);
+        assert_eq!(p.grid.cell(0, 0).c, 'C');
+        assert_eq!(p.grid.cell(0, 1).c, 'D');
     }
 
     #[test]

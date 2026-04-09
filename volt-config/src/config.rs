@@ -66,7 +66,7 @@ pub struct AppearanceConfig {
     #[serde(default = "default_cursor_blink")]
     pub cursor_blink: bool,
     /// Use the native macOS window tab bar instead of the custom GPU-rendered one.
-    /// Only has effect on macOS. Default: true.
+    /// Only has effect on macOS. Default: false.
     #[serde(default = "default_native_tabs")]
     pub native_tabs: bool,
     /// Alpha (opacity) of the idle pane divider line, 0.0–1.0. Default: 0.09.
@@ -89,7 +89,7 @@ fn default_cursor_blink() -> bool {
     true
 }
 fn default_native_tabs() -> bool {
-    true
+    false
 }
 fn default_divider_opacity() -> f32 {
     0.09
@@ -426,10 +426,10 @@ cursor_style = "block"
 # Blink cursor when focused
 cursor_blink = true
 
-# Use the native macOS window tab bar (macOS only). When true, each new tab
-# opens as a native OS window grouped in the system tab strip. When false,
-# the custom GPU-rendered tab bar is used instead.
-# native_tabs = true
+# Use the native macOS window tab bar (macOS only). Default is false to keep
+# the Ghostty-style custom curved tab strip integrated into the title area.
+# When true, each new tab opens as a native OS window grouped in the system tab strip.
+# native_tabs = false
 
 # Opacity of the idle pane-split divider line (0.0 = invisible, 1.0 = opaque).
 # The hover and drag states scale from this value automatically.

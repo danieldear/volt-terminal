@@ -36,8 +36,15 @@ pub struct TerminalTab {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub enum SelectionMode {
+    Linear,
+    Block,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct Selection {
     pub pane_id: usize,
+    pub mode: SelectionMode,
     pub start_col: usize,
     pub start_row: usize,
     pub end_col: usize,
@@ -46,16 +53,29 @@ pub struct Selection {
 
 impl Selection {
     pub fn normalized(self) -> Self {
-        if (self.start_row, self.start_col) <= (self.end_row, self.end_col) {
-            self
-        } else {
-            Self {
-                pane_id: self.pane_id,
-                start_col: self.end_col,
-                start_row: self.end_row,
-                end_col: self.start_col,
-                end_row: self.start_row,
+        match self.mode {
+            SelectionMode::Linear => {
+                if (self.start_row, self.start_col) <= (self.end_row, self.end_col) {
+                    self
+                } else {
+                    Self {
+                        pane_id: self.pane_id,
+                        mode: self.mode,
+                        start_col: self.end_col,
+                        start_row: self.end_row,
+                        end_col: self.start_col,
+                        end_row: self.start_row,
+                    }
+                }
             }
+            SelectionMode::Block => Self {
+                pane_id: self.pane_id,
+                mode: self.mode,
+                start_col: self.start_col.min(self.end_col),
+                start_row: self.start_row.min(self.end_row),
+                end_col: self.start_col.max(self.end_col),
+                end_row: self.start_row.max(self.end_row),
+            },
         }
     }
 }
@@ -150,9 +170,10 @@ impl TerminalTab {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.tree.leaf_ids().into_iter().any(|id| {
-            self.tree.find_leaf(id).is_some_and(|p| p.running)
-        })
+        self.tree
+            .leaf_ids()
+            .into_iter()
+            .any(|id| self.tree.find_leaf(id).is_some_and(|p| p.running))
     }
 
     pub fn active_pane(&self) -> &TerminalPane {
@@ -164,8 +185,11 @@ impl TerminalTab {
     }
 
     pub fn display_title(&self, index: usize) -> String {
-        let _ = index;
-        self.active_pane().display_title()
+        let title = self.active_pane().display_title();
+        if title == "~" {
+            format!("Tab {index}")
+        } else {
+            title
+        }
     }
 }
-

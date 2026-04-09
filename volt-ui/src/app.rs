@@ -18,11 +18,11 @@ use volt_core::performer::MouseTrackingMode;
 
 use volt_renderer::{Renderer, TabEntry};
 
+use crate::chat_panel::ChatPanel;
 #[cfg(target_os = "macos")]
 use crate::display_link::DisplayLinkScheduler;
-use crate::chat_panel::ChatPanel;
 use crate::pane_tree::RemoveResult;
-use crate::tab::{PaneSplitDirection, Selection, TerminalPane, TerminalTab};
+use crate::tab::{PaneSplitDirection, Selection, SelectionMode, TerminalPane, TerminalTab};
 use crate::tab_layout::TabLayout;
 
 // ── user events (used to wake the event loop from background threads) ────────
@@ -51,6 +51,14 @@ struct DividerDrag {
     is_vertical: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PaneFocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 // ── main window state ────────────────────────────────────────────────────────
 
 struct MainState {
@@ -74,6 +82,8 @@ struct MainState {
     pressed_mouse_button: Option<MouseButton>,
     last_reported_mouse_cell: Option<(usize, usize)>,
     redraw_pending: bool,
+    /// Extra full redraw passes requested after a window resize settles.
+    post_resize_redraws: u8,
     pending_damage_rows: Option<(usize, usize)>,
     force_full_redraw: bool,
     blink_state: bool,
@@ -105,7 +115,8 @@ impl MainState {
     }
 
     fn current_tab_bar_height(&self) -> f32 {
-        self.renderer.top_offset_for_tab_count(self.layout_tab_count())
+        self.renderer
+            .top_offset_for_tab_count(self.layout_tab_count())
     }
 
     fn current_content_top_offset(&self) -> f32 {
@@ -114,7 +125,8 @@ impl MainState {
     }
 
     fn current_grid_size(&self) -> (usize, usize) {
-        self.renderer.grid_size_for_tab_count(self.layout_tab_count())
+        self.renderer
+            .grid_size_for_tab_count(self.layout_tab_count())
     }
 
     fn resize_all_tabs_to_current_grid(&mut self) {
@@ -128,7 +140,9 @@ impl MainState {
                     }
                     match pane.performer.lock() {
                         Ok(mut performer) => performer.resize(rect.cols, rect.rows),
-                        Err(err) => eprintln!("volt-ui: failed to lock performer for resize: {err}"),
+                        Err(err) => {
+                            eprintln!("volt-ui: failed to lock performer for resize: {err}")
+                        }
                     }
                     // Return to live output after resize — the scrollback is still
                     // intact but the user should see the current content first.
@@ -183,15 +197,109 @@ impl MainState {
         let phys_right = self.renderer.surface_width() as f32 - phys_pad;
         let phys_bottom = self.renderer.surface_height() as f32;
         tab.tree.dividers_with_ids(
-            total_cols, total_rows,
-            self.renderer.cell_width, self.renderer.cell_height,
-            phys_pad, content_top,
-            phys_right, phys_bottom,
+            total_cols,
+            total_rows,
+            self.renderer.cell_width,
+            self.renderer.cell_height,
+            phys_pad,
+            content_top,
+            phys_right,
+            phys_bottom,
             scale,
             self.divider_hover_id,
             drag_id,
             divider_opacity,
         )
+    }
+
+    fn move_focus_in_direction(&mut self, direction: PaneFocusDirection) -> bool {
+        let (total_cols, total_rows) = self.current_grid_size();
+        let tab = self.active_tab();
+        let active_id = tab.tree.active_id;
+        let rects = tab.tree.layout(total_cols, total_rows);
+        let Some(active) = rects.iter().find(|r| r.id == active_id).copied() else {
+            return false;
+        };
+        let active_center_col = active.col as isize + active.cols as isize / 2;
+        let active_center_row = active.row as isize + active.rows as isize / 2;
+        let mut best: Option<(usize, isize, isize)> = None;
+
+        for rect in rects.into_iter().filter(|r| r.id != active_id) {
+            let center_col = rect.col as isize + rect.cols as isize / 2;
+            let center_row = rect.row as isize + rect.rows as isize / 2;
+            let candidate = match direction {
+                PaneFocusDirection::Left => {
+                    if rect.col + rect.cols > active.col {
+                        None
+                    } else {
+                        Some((
+                            active.col as isize - (rect.col + rect.cols) as isize,
+                            (active_center_row - center_row).abs(),
+                        ))
+                    }
+                }
+                PaneFocusDirection::Right => {
+                    if rect.col < active.col + active.cols {
+                        None
+                    } else {
+                        Some((
+                            rect.col as isize - (active.col + active.cols) as isize,
+                            (active_center_row - center_row).abs(),
+                        ))
+                    }
+                }
+                PaneFocusDirection::Up => {
+                    if rect.row + rect.rows > active.row {
+                        None
+                    } else {
+                        Some((
+                            active.row as isize - (rect.row + rect.rows) as isize,
+                            (active_center_col - center_col).abs(),
+                        ))
+                    }
+                }
+                PaneFocusDirection::Down => {
+                    if rect.row < active.row + active.rows {
+                        None
+                    } else {
+                        Some((
+                            rect.row as isize - (active.row + active.rows) as isize,
+                            (active_center_col - center_col).abs(),
+                        ))
+                    }
+                }
+            };
+            let Some((primary, secondary)) = candidate else {
+                continue;
+            };
+            if best
+                .map(|(_, best_primary, best_secondary)| {
+                    primary < best_primary
+                        || (primary == best_primary && secondary < best_secondary)
+                })
+                .unwrap_or(true)
+            {
+                best = Some((rect.id, primary, secondary));
+            }
+        }
+
+        let Some((target_id, _, _)) = best else {
+            return false;
+        };
+        self.active_tab_mut().tree.active_id = target_id;
+        self.selection = None;
+        true
+    }
+
+    fn adjust_font_size(&mut self, delta: f32) -> bool {
+        let mut next = self.config.clone();
+        let new_size = (next.font.size + delta).clamp(6.0, 72.0);
+        if (new_size - next.font.size).abs() < f32::EPSILON {
+            return false;
+        }
+        next.font.size = (new_size * 10.0).round() / 10.0;
+        self.apply_config(&next);
+        true
     }
 
     fn switch_tab(&mut self, idx: usize) {
@@ -263,10 +371,14 @@ impl MainState {
         let config = self.config.clone();
         let proxy = self.proxy.clone();
         let wake = Arc::clone(&self.pty_wake_pending);
-        let Ok(new_pane) = TerminalPane::spawn(&config, pane_cols as u16, pane_rows as u16, proxy, wake) else {
+        let Ok(new_pane) =
+            TerminalPane::spawn(&config, pane_cols as u16, pane_rows as u16, proxy, wake)
+        else {
             return false;
         };
-        self.active_tab_mut().tree.split(active_id, direction, new_pane);
+        self.active_tab_mut()
+            .tree
+            .split(active_id, direction, new_pane);
         self.resize_all_tabs_to_current_grid();
         self.selection = None;
         true
@@ -289,7 +401,8 @@ impl MainState {
                 self.resize_all_tabs_to_current_grid();
                 // Invalidate any selection that pointed at the removed pane.
                 if self.selection.map_or(false, |s| {
-                    self.tabs.get(tab_idx)
+                    self.tabs
+                        .get(tab_idx)
                         .map_or(true, |t| t.tree.find_leaf(s.pane_id).is_none())
                 }) {
                     self.selection = None;
@@ -300,16 +413,14 @@ impl MainState {
         }
     }
 
-    fn pane_cell_from_global_cell(
-        &self,
-        col: usize,
-        row: usize,
-    ) -> Option<(usize, usize, usize)> {
+    fn pane_cell_from_global_cell(&self, col: usize, row: usize) -> Option<(usize, usize, usize)> {
         let (total_cols, total_rows) = self.current_grid_size();
         let rects = self.active_tab().tree.layout(total_cols, total_rows);
         for rect in &rects {
-            if col >= rect.col && col < rect.col + rect.cols
-                && row >= rect.row && row < rect.row + rect.rows
+            if col >= rect.col
+                && col < rect.col + rect.cols
+                && row >= rect.row
+                && row < rect.row + rect.rows
             {
                 return Some((rect.id, col - rect.col, row - rect.row));
             }
@@ -380,14 +491,14 @@ impl MainState {
         let mut active_cursor_visible = false;
 
         for rect in &rects {
-            let Some(pane) = tab.tree.find_leaf(rect.id) else { continue; };
+            let Some(pane) = tab.tree.find_leaf(rect.id) else {
+                continue;
+            };
             // Blit directly while holding the lock — avoids cloning the grid
             // (and its scrollback buffer), which is expensive under heavy output.
             let performer = pane.performer.lock().ok()?;
             let grid = &performer.grid;
-            let offset = pane
-                .scroll_view_offset
-                .min(grid.scrollback_len());
+            let offset = pane.scroll_view_offset.min(grid.scrollback_len());
             if offset == 0 {
                 Self::blit_grid(&mut out, grid, rect.col, rect.row);
             } else {
@@ -398,8 +509,10 @@ impl MainState {
             if rect.id == active_id {
                 if offset == 0 {
                     active_cursor_visible = performer.cursor_visible;
-                    out.cursor_col = (rect.col + grid.cursor_col).min(rect.col + rect.cols.saturating_sub(1));
-                    out.cursor_row = (rect.row + grid.cursor_row).min(rect.row + rect.rows.saturating_sub(1));
+                    out.cursor_col =
+                        (rect.col + grid.cursor_col).min(rect.col + rect.cols.saturating_sub(1));
+                    out.cursor_row =
+                        (rect.row + grid.cursor_row).min(rect.row + rect.rows.saturating_sub(1));
                 }
                 // When scrolled back, hide the cursor — the user is viewing history.
             }
@@ -407,13 +520,6 @@ impl MainState {
 
         Some((out, active_cursor_visible))
     }
-
-
-
-
-
-
-
 
     fn apply_config(&mut self, config: &Config) {
         self.theme = Theme::by_name(&config.theme);
@@ -564,15 +670,24 @@ impl MainState {
         }
         let mut out = String::new();
         for row in sel.start_row..=sel.end_row {
-            let start_col = if row == sel.start_row {
-                sel.start_col
-            } else {
-                0
-            };
-            let end_col = if row == sel.end_row {
-                sel.end_col.min(grid.cols.saturating_sub(1))
-            } else {
-                grid.cols.saturating_sub(1)
+            let (start_col, end_col) = match sel.mode {
+                SelectionMode::Block => (
+                    sel.start_col.min(grid.cols.saturating_sub(1)),
+                    sel.end_col.min(grid.cols.saturating_sub(1)),
+                ),
+                SelectionMode::Linear => {
+                    let start_col = if row == sel.start_row {
+                        sel.start_col
+                    } else {
+                        0
+                    };
+                    let end_col = if row == sel.end_row {
+                        sel.end_col.min(grid.cols.saturating_sub(1))
+                    } else {
+                        grid.cols.saturating_sub(1)
+                    };
+                    (start_col, end_col)
+                }
             };
             if start_col > end_col || start_col >= grid.cols {
                 continue;
@@ -581,7 +696,11 @@ impl MainState {
             for col in start_col..=end_col {
                 line.push(grid.cell(col, row).c);
             }
-            out.push_str(line.trim_end_matches(' '));
+            if matches!(sel.mode, SelectionMode::Block) {
+                out.push_str(&line);
+            } else {
+                out.push_str(line.trim_end_matches(' '));
+            }
             if row != sel.end_row {
                 out.push('\n');
             }
@@ -589,9 +708,9 @@ impl MainState {
         Some(out)
     }
 
-    fn copy_selection(&self) {
+    fn copy_selection(&mut self) -> bool {
         let Some(text) = self.selected_text() else {
-            return;
+            return false;
         };
         #[cfg(target_os = "macos")]
         {
@@ -613,6 +732,8 @@ impl MainState {
                 Err(err) => eprintln!("volt-ui: failed to launch pbcopy: {err}"),
             }
         }
+        self.selection = None;
+        true
     }
 
     fn paste_clipboard(&mut self) {
@@ -642,6 +763,12 @@ impl MainState {
             (sel.start_col + rect.col, sel.start_row + rect.row),
             (sel.end_col + rect.col, sel.end_row + rect.row),
         ))
+    }
+
+    fn selection_is_block(&self) -> bool {
+        self.selection
+            .map(|sel| matches!(sel.mode, SelectionMode::Block))
+            .unwrap_or(false)
     }
 
     fn active_mouse_reporting(&self) -> Option<(MouseTrackingMode, bool)> {
@@ -801,12 +928,10 @@ impl MainState {
             .unwrap_or(0);
         if amount > 0.0 {
             // Scroll up: reveal older lines.
-            pane.scroll_view_offset =
-                (pane.scroll_view_offset + steps).min(scrollback_len);
+            pane.scroll_view_offset = (pane.scroll_view_offset + steps).min(scrollback_len);
         } else {
             // Scroll down: return toward live output.
-            pane.scroll_view_offset =
-                pane.scroll_view_offset.saturating_sub(steps);
+            pane.scroll_view_offset = pane.scroll_view_offset.saturating_sub(steps);
         }
         true
     }
@@ -864,11 +989,10 @@ impl App {
             let use_native = self.config.appearance.native_tabs;
             event_loop.set_allows_automatic_window_tabbing(use_native);
             if use_native {
-                // Native mode: transparent title bar (unified look like iTerm2/Ghostty).
-                // The title bar is still present and shows traffic lights + window title;
-                // it just blends with the window background colour.
+                // Native mode: keep the system title bar visible so traffic lights and
+                // tab-strip chrome are rendered by macOS as a distinct title area.
                 window_attrs = window_attrs
-                    .with_titlebar_transparent(true)
+                    .with_titlebar_transparent(false)
                     .with_tabbing_identifier("volt.terminal");
             } else {
                 // Custom tab bar mode: hide native chrome, extend content to fill window.
@@ -887,11 +1011,6 @@ impl App {
         let native_tab_count = window.num_tabs().max(1);
         #[cfg(target_os = "macos")]
         configure_macos_tab_chrome(window.as_ref(), native_tab_count);
-        #[cfg(target_os = "macos")]
-        if self.config.appearance.native_tabs {
-            let theme = Theme::by_name(&self.config.theme);
-            apply_macos_titlebar_style(window.as_ref(), theme.background);
-        }
         let scale_factor = window.scale_factor() as f32;
         let mut renderer = self.rt.block_on(Renderer::new(
             window.clone(),
@@ -950,6 +1069,7 @@ impl App {
             pressed_mouse_button: None,
             last_reported_mouse_cell: None,
             redraw_pending: false,
+            post_resize_redraws: 0,
             pending_damage_rows: None,
             force_full_redraw: true,
             blink_state: true,
@@ -967,9 +1087,7 @@ impl App {
         state
             .window
             .set_transparent(self.config.appearance.transparent_enabled());
-        state
-            .window
-            .set_blur(self.config.appearance.blur_enabled());
+        state.window.set_blur(self.config.appearance.blur_enabled());
         #[cfg(target_os = "macos")]
         state.sync_native_window_title();
         let id = state.id;
@@ -983,49 +1101,6 @@ impl App {
 fn configure_macos_tab_chrome(_window: &Window, _native_tab_count: usize) {
     // Keep macOS tab handling fully native for stability.
     // We only use winit's tabbing identifier / native APIs.
-}
-
-/// On macOS native-tabs mode, make the title bar blend seamlessly with the terminal:
-/// - Remove the hairline separator between title bar and content
-/// - Set the window background colour to match the terminal theme background
-///
-/// This gives the same "unified" appearance as Ghostty/iTerm2 where the title bar
-/// is visually indistinguishable from the terminal background.
-#[cfg(target_os = "macos")]
-fn apply_macos_titlebar_style(window: &Window, theme_bg: volt_config::theme::Color) {
-    use objc::runtime::Object;
-    use objc::{class, msg_send, sel, sel_impl};
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let Ok(handle) = window.window_handle() else { return };
-    let ns_view = match handle.as_raw() {
-        RawWindowHandle::AppKit(h) => h.ns_view.as_ptr() as *mut Object,
-        _ => return,
-    };
-    unsafe {
-        // Get the NSWindow that owns this view.
-        let ns_window: *mut Object = msg_send![ns_view, window];
-        if ns_window.is_null() {
-            return;
-        }
-        // NSTitlebarSeparatorStyleNone = 1 — hides the hairline divider drawn by
-        // macOS between the title bar and the content view.
-        let _: () = msg_send![ns_window, setTitlebarSeparatorStyle: 1usize];
-
-        // Set the window background colour to match the terminal theme so that the
-        // transparent title bar blends seamlessly instead of showing system gray.
-        let r = theme_bg.r as f64 / 255.0;
-        let g = theme_bg.g as f64 / 255.0;
-        let b = theme_bg.b as f64 / 255.0;
-        let color: *mut Object = msg_send![
-            class!(NSColor),
-            colorWithSRGBRed: r
-            green: g
-            blue: b
-            alpha: 1.0f64
-        ];
-        let _: () = msg_send![ns_window, setBackgroundColor: color];
-    }
 }
 
 fn open_config_in_editor() {
@@ -1136,6 +1211,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     configure_macos_tab_chrome(state.window.as_ref(), native_tab_count);
                 }
                 state.begin_redraw();
+                state.post_resize_redraws = 1;
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -1150,6 +1226,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     configure_macos_tab_chrome(state.window.as_ref(), native_tab_count);
                 }
                 state.begin_redraw();
+                state.post_resize_redraws = 1;
             }
 
             WindowEvent::ModifiersChanged(mods) => {
@@ -1177,7 +1254,11 @@ impl ApplicationHandler<VoltEvent> for App {
                 if let Some(drag) = state.divider_drag {
                     // Absolute ratio: start_ratio + total_delta / local_span.
                     // delta_px is the total movement since drag began — no per-frame reset needed.
-                    let current_px = if drag.is_vertical { position.x as f32 } else { position.y as f32 };
+                    let current_px = if drag.is_vertical {
+                        position.x as f32
+                    } else {
+                        position.y as f32
+                    };
                     let delta_px = current_px - drag.start_px;
                     let (total_cols, total_rows) = state.current_grid_size();
                     let active = state.active_tab;
@@ -1199,13 +1280,24 @@ impl ApplicationHandler<VoltEvent> for App {
                         let is_vertical = matches!(div.direction, PaneSplitDirection::Vertical);
                         // For vertical dividers: check x proximity AND y in [div.y, div.y+div.height]
                         // For horizontal dividers: check y proximity AND x in [div.x, div.x+div.width]
-                        let (axis_coord, axis_divider, span_coord, span_start, span_end) = if is_vertical {
-                            (position.x as f32, div.phys.x, position.y as f32,
-                             div.phys.y, div.phys.y + div.phys.height)
-                        } else {
-                            (position.y as f32, div.phys.y, position.x as f32,
-                             div.phys.x, div.phys.x + div.phys.width)
-                        };
+                        let (axis_coord, axis_divider, span_coord, span_start, span_end) =
+                            if is_vertical {
+                                (
+                                    position.x as f32,
+                                    div.phys.x,
+                                    position.y as f32,
+                                    div.phys.y,
+                                    div.phys.y + div.phys.height,
+                                )
+                            } else {
+                                (
+                                    position.y as f32,
+                                    div.phys.y,
+                                    position.x as f32,
+                                    div.phys.x,
+                                    div.phys.x + div.phys.width,
+                                )
+                            };
                         if (axis_coord - axis_divider).abs() < 6.0
                             && span_coord >= span_start - 4.0
                             && span_coord <= span_end + 4.0
@@ -1282,17 +1374,18 @@ impl ApplicationHandler<VoltEvent> for App {
                     let mut started_drag = false;
                     for div in &dividers {
                         let is_vertical = matches!(div.direction, PaneSplitDirection::Vertical);
-                        let (axis_coord, axis_div, span_coord, span_start, span_end) = if is_vertical {
-                            (mx, div.phys.x, my, div.phys.y, div.phys.y + div.phys.height)
-                        } else {
-                            (my, div.phys.y, mx, div.phys.x, div.phys.x + div.phys.width)
-                        };
+                        let (axis_coord, axis_div, span_coord, span_start, span_end) =
+                            if is_vertical {
+                                (mx, div.phys.x, my, div.phys.y, div.phys.y + div.phys.height)
+                            } else {
+                                (my, div.phys.y, mx, div.phys.x, div.phys.x + div.phys.width)
+                            };
                         if (axis_coord - axis_div).abs() < 6.0
                             && span_coord >= span_start - 4.0
                             && span_coord <= span_end + 4.0
                         {
-                            let start_ratio = state.active_tab().tree
-                                .get_ratio(div.id).unwrap_or(0.5);
+                            let start_ratio =
+                                state.active_tab().tree.get_ratio(div.id).unwrap_or(0.5);
                             state.divider_drag = Some(DividerDrag {
                                 divider_id: div.id,
                                 start_px: axis_coord,
@@ -1321,6 +1414,11 @@ impl ApplicationHandler<VoltEvent> for App {
                             state.active_tab_mut().tree.active_id = pane_id;
                             state.selection = Some(Selection {
                                 pane_id,
+                                mode: if state.modifiers.alt_key() {
+                                    SelectionMode::Block
+                                } else {
+                                    SelectionMode::Linear
+                                },
                                 start_col: col,
                                 start_row: row,
                                 end_col: col,
@@ -1514,6 +1612,42 @@ impl ApplicationHandler<VoltEvent> for App {
                             state.begin_redraw();
                             return;
                         }
+                        PhysicalKey::Code(KeyCode::ArrowLeft) if alt => {
+                            if state.move_focus_in_direction(PaneFocusDirection::Left) {
+                                state.begin_redraw();
+                            }
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowRight) if alt => {
+                            if state.move_focus_in_direction(PaneFocusDirection::Right) {
+                                state.begin_redraw();
+                            }
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowUp) if alt => {
+                            if state.move_focus_in_direction(PaneFocusDirection::Up) {
+                                state.begin_redraw();
+                            }
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowDown) if alt => {
+                            if state.move_focus_in_direction(PaneFocusDirection::Down) {
+                                state.begin_redraw();
+                            }
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => {
+                            if state.adjust_font_size(1.0) {
+                                self.config.font.size = state.config.font.size;
+                            }
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Minus | KeyCode::NumpadSubtract) => {
+                            if state.adjust_font_size(-1.0) {
+                                self.config.font.size = state.config.font.size;
+                            }
+                            return;
+                        }
                         PhysicalKey::Code(KeyCode::KeyT) => {
                             #[cfg(target_os = "macos")]
                             if state.config.appearance.native_tabs {
@@ -1567,7 +1701,12 @@ impl ApplicationHandler<VoltEvent> for App {
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyC) => {
-                            state.copy_selection();
+                            if !state.copy_selection() {
+                                if let Err(err) = state.active_pane_mut().pty.write(&[0x03]) {
+                                    eprintln!("volt-ui: failed to send Ctrl+C to PTY: {err}");
+                                }
+                            }
+                            state.begin_redraw();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyV) => {
@@ -1621,6 +1760,28 @@ impl ApplicationHandler<VoltEvent> for App {
                             return;
                         }
                         _ => {}
+                    }
+                }
+
+                if alt && ctrl {
+                    let moved = match physical_key {
+                        PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                            state.move_focus_in_direction(PaneFocusDirection::Left)
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowRight) => {
+                            state.move_focus_in_direction(PaneFocusDirection::Right)
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowUp) => {
+                            state.move_focus_in_direction(PaneFocusDirection::Up)
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowDown) => {
+                            state.move_focus_in_direction(PaneFocusDirection::Down)
+                        }
+                        _ => false,
+                    };
+                    if moved {
+                        state.begin_redraw();
+                        return;
                     }
                 }
 
@@ -1699,33 +1860,41 @@ impl ApplicationHandler<VoltEvent> for App {
 
                 for (i, tab) in state.tabs.iter_mut().enumerate() {
                     let mut pty_errors: Vec<String> = Vec::new();
-                    tab.tree.for_each_leaf_mut(&mut |pane_id, pane| {
-                        loop {
-                            let Some(ev) = pane.event_rx.try_recv().ok() else { break; };
-                            match ev {
-                                CoreEvent::GridUpdated { damaged_rows } => {
-                                    if i == active {
-                                        if let Some((start, end)) = damaged_rows {
-                                            pending_partial_damage =
-                                                Some(match pending_partial_damage {
-                                                    Some((cur_start, cur_end)) => {
-                                                        (cur_start.min(start), cur_end.max(end))
-                                                    }
-                                                    None => (start, end),
-                                                });
-                                        } else {
-                                            needs_full_redraw = true;
-                                        }
+                    tab.tree.for_each_leaf_mut(&mut |pane_id, pane| loop {
+                        let Some(ev) = pane.event_rx.try_recv().ok() else {
+                            break;
+                        };
+                        match ev {
+                            CoreEvent::GridUpdated { damaged_rows } => {
+                                if i == active {
+                                    if let Some((start, end)) = damaged_rows {
+                                        pending_partial_damage =
+                                            Some(match pending_partial_damage {
+                                                Some((cur_start, cur_end)) => {
+                                                    (cur_start.min(start), cur_end.max(end))
+                                                }
+                                                None => (start, end),
+                                            });
+                                    } else {
+                                        needs_full_redraw = true;
                                     }
                                 }
-                                CoreEvent::CwdChanged(path) => { pane.cwd = Some(path); }
-                                CoreEvent::TitleChanged(t)   => { pane.title = t; }
-                                CoreEvent::CommandFinished { .. } => { pane.running = false; }
-                                CoreEvent::PtyError(msg) => {
-                                    if i == active { pty_errors.push(msg); }
-                                }
-                                CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                             }
+                            CoreEvent::CwdChanged(path) => {
+                                pane.cwd = Some(path);
+                            }
+                            CoreEvent::TitleChanged(t) => {
+                                pane.title = t;
+                            }
+                            CoreEvent::CommandFinished { .. } => {
+                                pane.running = false;
+                            }
+                            CoreEvent::PtyError(msg) => {
+                                if i == active {
+                                    pty_errors.push(msg);
+                                }
+                            }
+                            CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                         }
                     });
                     // Process PtyErrors after the borrow on tab.tree is released.
@@ -1791,17 +1960,26 @@ impl ApplicationHandler<VoltEvent> for App {
                         return;
                     };
                     let damage_rows = state.take_render_damage_rows();
-                    let dividers: Vec<volt_renderer::PaneDivider> =
-                        state.active_tab_dividers().into_iter().map(|d| d.phys).collect();
+                    let mut dividers: Vec<volt_renderer::PaneDivider> = state
+                        .active_tab_dividers()
+                        .into_iter()
+                        .map(|d| d.phys)
+                        .collect();
                     state.renderer.render_frame(
                         &render_grid,
                         &state.theme,
                         &tab_entries,
                         state.effective_cursor_visible(render_cursor_visible),
                         state.selection_tuple(),
+                        state.selection_is_block(),
                         damage_rows,
                         &dividers,
                     );
+                    if state.post_resize_redraws > 0 {
+                        state.post_resize_redraws -= 1;
+                        state.mark_full_redraw();
+                        state.queue_redraw();
+                    }
                 }
             }
 
@@ -1854,45 +2032,50 @@ impl ApplicationHandler<VoltEvent> for App {
             if !state.redraw_pending {
                 for (i, tab) in state.tabs.iter_mut().enumerate() {
                     let mut pty_errors: Vec<String> = Vec::new();
-                    tab.tree.for_each_leaf_mut(&mut |pane_id, pane| {
-                        loop {
-                            let Some(ev) = pane.event_rx.try_recv().ok() else { break; };
-                            match ev {
-                                CoreEvent::GridUpdated { damaged_rows } => {
-                                    if i == active {
-                                        needs_redraw = true;
-                                        if let Some((start, end)) = damaged_rows {
-                                            pending_partial_damage = Some(match pending_partial_damage {
+                    tab.tree.for_each_leaf_mut(&mut |pane_id, pane| loop {
+                        let Some(ev) = pane.event_rx.try_recv().ok() else {
+                            break;
+                        };
+                        match ev {
+                            CoreEvent::GridUpdated { damaged_rows } => {
+                                if i == active {
+                                    needs_redraw = true;
+                                    if let Some((start, end)) = damaged_rows {
+                                        pending_partial_damage =
+                                            Some(match pending_partial_damage {
                                                 Some((cur_start, cur_end)) => {
                                                     (cur_start.min(start), cur_end.max(end))
                                                 }
                                                 None => (start, end),
                                             });
-                                        } else {
-                                            needs_full_redraw = true;
-                                        }
-                                    }
-                                }
-                                CoreEvent::CwdChanged(path) => {
-                                    pane.cwd = Some(path);
-                                    if i == active || show_tab_chrome {
-                                        needs_redraw = true;
+                                    } else {
                                         needs_full_redraw = true;
                                     }
                                 }
-                                CoreEvent::TitleChanged(t) => {
-                                    pane.title = t;
-                                    if i == active || show_tab_chrome {
-                                        needs_redraw = true;
-                                        needs_full_redraw = true;
-                                    }
-                                }
-                                CoreEvent::CommandFinished { .. } => { pane.running = false; }
-                                CoreEvent::PtyError(msg) => {
-                                    if i == active { pty_errors.push(msg); }
-                                }
-                                CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                             }
+                            CoreEvent::CwdChanged(path) => {
+                                pane.cwd = Some(path);
+                                if i == active || show_tab_chrome {
+                                    needs_redraw = true;
+                                    needs_full_redraw = true;
+                                }
+                            }
+                            CoreEvent::TitleChanged(t) => {
+                                pane.title = t;
+                                if i == active || show_tab_chrome {
+                                    needs_redraw = true;
+                                    needs_full_redraw = true;
+                                }
+                            }
+                            CoreEvent::CommandFinished { .. } => {
+                                pane.running = false;
+                            }
+                            CoreEvent::PtyError(msg) => {
+                                if i == active {
+                                    pty_errors.push(msg);
+                                }
+                            }
+                            CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                         }
                     });
                     // Process PtyErrors after the borrow on tab.tree is released.
@@ -2187,11 +2370,16 @@ fn set_app_icon() {
             // render a 512px PNG at 512pt — far too large.
             #[repr(C)]
             #[derive(Clone, Copy)]
-            struct NSSize { width: f64, height: f64 }
-            let sz = NSSize { width: 256.0, height: 256.0 };
+            struct NSSize {
+                width: f64,
+                height: f64,
+            }
+            let sz = NSSize {
+                width: 256.0,
+                height: 256.0,
+            };
             let _: () = msg_send![image, setSize: sz];
-            let app: *mut Object =
-                msg_send![class!(NSApplication), sharedApplication];
+            let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![app, setApplicationIconImage: image];
             let _: () = msg_send![image, release];
         }

@@ -6,6 +6,9 @@ pub struct Grid {
     pub rows: usize,
     cells: Vec<Cell>,
     row_map: Vec<usize>,
+    /// Whether a visual row soft-wraps into the next row.
+    /// Stored by physical row index so it naturally follows row_map rotations.
+    soft_wrapped: Vec<bool>,
     pub cursor_col: usize,
     pub cursor_row: usize,
     pub scroll_top: usize,
@@ -36,6 +39,7 @@ impl Grid {
             rows,
             cells: vec![Cell::default(); cols * rows],
             row_map: (0..rows).collect(),
+            soft_wrapped: vec![false; rows],
             cursor_col: 0,
             cursor_row: 0,
             scroll_top: 0,
@@ -60,6 +64,21 @@ impl Grid {
         &mut self.cells[idx]
     }
 
+    pub fn row_soft_wrapped(&self, row: usize) -> bool {
+        if row >= self.rows {
+            return false;
+        }
+        self.soft_wrapped[self.row_map[row]]
+    }
+
+    pub fn set_row_soft_wrapped(&mut self, row: usize, wrapped: bool) {
+        if row >= self.rows {
+            return;
+        }
+        let idx = self.row_map[row];
+        self.soft_wrapped[idx] = wrapped;
+    }
+
     /// Returns a slice of per-row dirty flags. `true` means the row changed since last `clear_dirty()`.
     pub fn dirty_rows(&self) -> &[bool] {
         &self.dirty
@@ -75,21 +94,218 @@ impl Grid {
         self.dirty.fill(true);
     }
 
-    pub fn resize(&mut self, cols: usize, rows: usize) {
-        let old_cols = self.cols;
-        let mut new_cells = vec![Cell::default(); cols * rows];
-        for row in 0..rows.min(self.rows) {
-            for col in 0..cols.min(self.cols) {
-                new_cells[row * cols + col] = *self.cell(col, row);
+    fn trim_trailing_spaces_len(cells: &[Cell]) -> usize {
+        let mut end = cells.len();
+        while end > 0 && cells[end - 1].c == ' ' {
+            end -= 1;
+        }
+        end
+    }
+
+    fn reflow_visible_rows(
+        old_cells: &[Cell],
+        old_row_map: &[usize],
+        old_soft_wrapped: &[bool],
+        old_cols: usize,
+        old_rows: usize,
+        new_cols: usize,
+        new_rows: usize,
+        old_cursor_row: usize,
+        old_cursor_col: usize,
+        had_pending_wrap: bool,
+    ) -> (Vec<Cell>, Vec<bool>, usize, usize, bool) {
+        let mut new_cells = vec![Cell::default(); new_cols * new_rows];
+        let mut new_soft_wrapped = vec![false; new_rows];
+        if old_cols == 0 || old_rows == 0 || new_cols == 0 || new_rows == 0 {
+            return (new_cells, new_soft_wrapped, 0, 0, false);
+        }
+
+        let mut visual_rows = Vec::with_capacity(old_rows);
+        let mut visual_wraps = Vec::with_capacity(old_rows);
+        for row in 0..old_rows {
+            let physical = old_row_map[row];
+            let src = physical * old_cols;
+            visual_rows.push(old_cells[src..src + old_cols].to_vec());
+            visual_wraps.push(old_soft_wrapped[physical]);
+        }
+
+        let mut logical_lines: Vec<Vec<Cell>> = Vec::new();
+        let mut current: Vec<Cell> = Vec::new();
+        let mut line_idx = 0usize;
+        let mut cursor_line_idx = 0usize;
+        let mut cursor_offset = 0usize;
+        for row in 0..old_rows {
+            if row == old_cursor_row {
+                cursor_line_idx = line_idx;
+                cursor_offset = current.len() + old_cursor_col + usize::from(had_pending_wrap);
+            }
+            current.extend_from_slice(&visual_rows[row]);
+            let has_next = row + 1 < old_rows;
+            let is_wrapped = has_next && visual_wraps[row];
+            if !is_wrapped {
+                logical_lines.push(std::mem::take(&mut current));
+                line_idx += 1;
             }
         }
+        if !current.is_empty() {
+            logical_lines.push(current);
+        }
+        if logical_lines.is_empty() {
+            logical_lines.push(Vec::new());
+        }
+
+        let mut virtual_rows: Vec<Vec<Cell>> = Vec::new();
+        let mut virtual_wraps: Vec<bool> = Vec::new();
+        let mut cursor_virtual_row = 0usize;
+        let mut cursor_virtual_col = 0usize;
+        let mut cursor_pending_wrap = false;
+
+        for (idx, line) in logical_lines.iter().enumerate() {
+            let line_start = virtual_rows.len();
+            let mut line_len = Grid::trim_trailing_spaces_len(line);
+            if idx == cursor_line_idx {
+                line_len = line_len.max(cursor_offset.min(line.len()));
+            }
+            if line_len == 0 {
+                virtual_rows.push(vec![Cell::default(); new_cols]);
+                virtual_wraps.push(false);
+            } else {
+                let mut offset = 0usize;
+                while offset < line_len {
+                    let take = (line_len - offset).min(new_cols);
+                    let mut row_cells = vec![Cell::default(); new_cols];
+                    row_cells[..take].copy_from_slice(&line[offset..offset + take]);
+                    virtual_rows.push(row_cells);
+                    virtual_wraps.push(offset + take < line_len);
+                    offset += take;
+                }
+            }
+
+            if idx != cursor_line_idx {
+                continue;
+            }
+            let cursor_pos = cursor_offset.min(line_len);
+            let mut row_in_line = cursor_pos / new_cols;
+            let mut col_in_line = cursor_pos % new_cols;
+            cursor_pending_wrap = false;
+            if had_pending_wrap && cursor_pos > 0 && col_in_line == 0 {
+                row_in_line = row_in_line.saturating_sub(1);
+                col_in_line = new_cols - 1;
+                cursor_pending_wrap = true;
+            }
+            cursor_virtual_row = line_start + row_in_line;
+            cursor_virtual_col = col_in_line.min(new_cols - 1);
+        }
+
+        if virtual_rows.is_empty() {
+            virtual_rows.push(vec![Cell::default(); new_cols]);
+            virtual_wraps.push(false);
+        }
+        if cursor_virtual_row >= virtual_rows.len() {
+            cursor_virtual_row = virtual_rows.len() - 1;
+            cursor_virtual_col = cursor_virtual_col.min(new_cols - 1);
+            cursor_pending_wrap = false;
+        }
+
+        // Keep as much history as possible while ensuring the cursor stays visible.
+        let mut window_start = cursor_virtual_row
+            .saturating_add(1)
+            .saturating_sub(new_rows);
+        if window_start + new_rows > virtual_rows.len() {
+            window_start = virtual_rows.len().saturating_sub(new_rows);
+        }
+
+        for dst_row in 0..new_rows {
+            let src_row = window_start + dst_row;
+            if src_row >= virtual_rows.len() {
+                break;
+            }
+            let dst = dst_row * new_cols;
+            new_cells[dst..dst + new_cols].copy_from_slice(&virtual_rows[src_row]);
+            new_soft_wrapped[dst_row] = virtual_wraps[src_row];
+        }
+
+        let mut new_cursor_row = cursor_virtual_row.saturating_sub(window_start);
+        if new_cursor_row >= new_rows {
+            new_cursor_row = new_rows - 1;
+            cursor_pending_wrap = false;
+        }
+        let new_cursor_col = cursor_virtual_col.min(new_cols - 1);
+        (
+            new_cells,
+            new_soft_wrapped,
+            new_cursor_col,
+            new_cursor_row,
+            cursor_pending_wrap,
+        )
+    }
+
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        let old_cols = self.cols;
+        let old_rows = self.rows;
+        let old_cursor_col = self.cursor_col;
+        let old_cursor_row = self.cursor_row;
+        let had_pending_wrap = self.pending_wrap;
+        let old_cells = self.cells.clone();
+        let old_row_map = self.row_map.clone();
+        let old_soft_wrapped = self.soft_wrapped.clone();
+        let (new_cells, new_soft_wrapped, new_cursor_col, new_cursor_row, new_pending_wrap) =
+            if cols != old_cols {
+                Grid::reflow_visible_rows(
+                    &old_cells,
+                    &old_row_map,
+                    &old_soft_wrapped,
+                    old_cols,
+                    old_rows,
+                    cols,
+                    rows,
+                    old_cursor_row,
+                    old_cursor_col,
+                    had_pending_wrap,
+                )
+            } else {
+                let mut cells = vec![Cell::default(); cols * rows];
+                let mut soft_wrapped = vec![false; rows];
+                let copy_cols = old_cols.min(cols);
+                let copy_rows = rows.min(old_rows);
+                let mut window_start = old_cursor_row
+                    .saturating_add(1)
+                    .saturating_sub(copy_rows);
+                if window_start + copy_rows > old_rows {
+                    window_start = old_rows.saturating_sub(copy_rows);
+                }
+                for row in 0..copy_rows {
+                    let src_row = window_start + row;
+                    let old_physical = old_row_map[src_row];
+                    let src = old_physical * old_cols;
+                    let dst = row * cols;
+                    cells[dst..dst + copy_cols].copy_from_slice(&old_cells[src..src + copy_cols]);
+                    soft_wrapped[row] = old_soft_wrapped[old_physical];
+                }
+                let mut cursor_col = old_cursor_col.min(cols.saturating_sub(1));
+                let cursor_row = old_cursor_row
+                    .saturating_sub(window_start)
+                    .min(rows.saturating_sub(1));
+                let mut pending_wrap = had_pending_wrap;
+                if had_pending_wrap {
+                    let logical_next_col = old_cursor_col.saturating_add(1);
+                    if logical_next_col < cols {
+                        cursor_col = logical_next_col;
+                        pending_wrap = false;
+                    }
+                }
+                (cells, soft_wrapped, cursor_col, cursor_row, pending_wrap)
+            };
+
         self.cols = cols;
         self.rows = rows;
         self.scroll_bottom = rows.saturating_sub(1);
         self.cells = new_cells;
         self.row_map = (0..rows).collect();
-        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
-        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        self.soft_wrapped = new_soft_wrapped;
+        self.cursor_col = new_cursor_col;
+        self.cursor_row = new_cursor_row;
+        self.pending_wrap = new_pending_wrap;
         self.dirty = vec![true; rows];
         // Migrate scrollback to the new column width.
         // Row-only resizes leave the buffer intact; col changes rewrite it.
@@ -137,9 +353,11 @@ impl Grid {
 
         self.row_map[top..=bottom].rotate_right(count);
         for row in top..(top + count) {
-            let start = self.row_map[row] * self.cols;
+            let physical = self.row_map[row];
+            let start = physical * self.cols;
             let end = start + self.cols;
             self.cells[start..end].fill(Cell::default());
+            self.soft_wrapped[physical] = false;
         }
         // Mark affected region dirty.
         for row in top..=bottom {
@@ -188,9 +406,11 @@ impl Grid {
         self.row_map[top..=bottom].rotate_left(count);
         let clear_start_row = bottom + 1 - count;
         for row in clear_start_row..=bottom {
-            let start = self.row_map[row] * self.cols;
+            let physical = self.row_map[row];
+            let start = physical * self.cols;
             let end = start + self.cols;
             self.cells[start..end].fill(Cell::default());
+            self.soft_wrapped[physical] = false;
         }
         // Mark affected region dirty.
         for row in top..=bottom {
@@ -210,11 +430,15 @@ impl Grid {
         for col in from_col..=end {
             self.cells[row_start + col] = Cell::default();
         }
+        if end + 1 == self.cols {
+            self.soft_wrapped[self.row_map[row]] = false;
+        }
         self.dirty[row] = true;
     }
 
     pub fn clear_screen(&mut self) {
         self.cells.fill(Cell::default());
+        self.soft_wrapped.fill(false);
         self.cursor_col = 0;
         self.cursor_row = 0;
         self.mark_all_dirty();
@@ -222,6 +446,7 @@ impl Grid {
 
     pub fn erase_all(&mut self) {
         self.cells.fill(Cell::default());
+        self.soft_wrapped.fill(false);
         self.mark_all_dirty();
     }
 
