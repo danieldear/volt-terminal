@@ -1,5 +1,5 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use vte::Parser;
@@ -85,7 +85,9 @@ impl Pty {
             let mut buf = [0u8; 64 * 1024];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                     // Receiver gone means the parse thread ended; stop draining.
                     Ok(n) => {
                         if buf_tx.send(buf[..n].to_vec()).is_err() {

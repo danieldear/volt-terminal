@@ -840,8 +840,6 @@ impl MainState {
             match std::process::Command::new("pbpaste").output() {
                 Ok(output) => {
                     if output.status.success() {
-                        // Never let pasted bytes terminate bracketed-paste mode early.
-                        let data = strip_bracketed_paste_end(&output.stdout);
                         let bracketed = self
                             .tabs
                             .get(self.active_tab)
@@ -849,13 +847,15 @@ impl MainState {
                             .map(|p| p.bracketed_paste_mode())
                             .unwrap_or(false);
                         if bracketed {
+                            // Never let pasted bytes terminate bracketed-paste mode early.
+                            let data = strip_bracketed_paste_end(&output.stdout);
                             let mut wrapped = Vec::with_capacity(data.len() + 12);
                             wrapped.extend_from_slice(b"\x1b[200~");
                             wrapped.extend_from_slice(&data);
                             wrapped.extend_from_slice(b"\x1b[201~");
                             self.send_pty_input(&wrapped);
                         } else {
-                            self.send_pty_input(&data);
+                            self.send_pty_input(&output.stdout);
                         }
                     } else {
                         eprintln!("volt-ui: pbpaste exited with {}", output.status);
