@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing v* tag to build and publish, for example v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux x86_64
+            package: linux
+          - os: macos-latest
+            label: macOS app
+            package: macos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux deps
+        if: matrix.package == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libudev-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxinerama-dev
+
+      - name: Build Linux binary
+        if: matrix.package == 'linux'
+        run: cargo build --release -p volt
+
+      - name: Package Linux binary
+        if: matrix.package == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          safe_tag="${RELEASE_TAG//\//_}"
+          package_dir="Volt-${safe_tag}-linux-${arch}"
+          mkdir -p "dist" "staging/${package_dir}"
+          cp target/release/volt "staging/${package_dir}/volt"
+          cp README.md LICENSE "staging/${package_dir}/"
+          tar -C staging -czf "dist/${package_dir}.tar.gz" "${package_dir}"
+
+      - name: Build macOS app bundle
+        if: matrix.package == 'macos'
+        run: scripts/macos/build_app.sh --release
+
+      - name: Ad-hoc sign and validate macOS app bundle
+        if: matrix.package == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/macos/Volt.app/Contents/MacOS/Volt
+          plutil -lint target/macos/Volt.app/Contents/Info.plist
+          codesign --force --deep --sign - target/macos/Volt.app
+          codesign --verify --deep --strict --verbose=2 target/macos/Volt.app
+
+      - name: Package macOS app bundle
+        if: matrix.package == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          safe_tag="${RELEASE_TAG//\//_}"
+          mkdir -p dist
+          /usr/bin/ditto -c -k --keepParent \
+            target/macos/Volt.app \
+            "dist/Volt-${safe_tag}-macos-${arch}.zip"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.package }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          Automated Volt release for ${RELEASE_TAG}.
+
+          Artifacts:
+          - Linux release binary tarball
+          - macOS Volt.app zip archive, ad-hoc signed for archive integrity
+          - SHA256SUMS.txt
+
+          Note: macOS artifacts are not Developer ID signed or notarized yet.
+          EOF
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" --title "Volt ${RELEASE_TAG}" --notes-file release-notes.md
+          else
+            gh release create "${RELEASE_TAG}" --title "Volt ${RELEASE_TAG}" --notes-file release-notes.md
+          fi
+
+          gh release upload "${RELEASE_TAG}" dist/* --clobber

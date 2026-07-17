@@ -80,8 +80,14 @@ cp "${BIN_PATH}" "${MACOS_DIR}/Volt"
 chmod +x "${MACOS_DIR}/Volt"
 
 ICON_KEY=""
+ICON_SOURCE=""
 if [[ -f "${ROOT_DIR}/assets/Volt.icns" ]]; then
-  cp "${ROOT_DIR}/assets/Volt.icns" "${RESOURCES_DIR}/Volt.icns"
+  ICON_SOURCE="${ROOT_DIR}/assets/Volt.icns"
+elif [[ -f "${ROOT_DIR}/assets/AppIcon.icns" ]]; then
+  ICON_SOURCE="${ROOT_DIR}/assets/AppIcon.icns"
+fi
+if [[ -n "${ICON_SOURCE}" ]]; then
+  cp "${ICON_SOURCE}" "${RESOURCES_DIR}/Volt.icns"
   ICON_KEY=$'  <key>CFBundleIconFile</key>\n  <string>Volt</string>'
 fi
 

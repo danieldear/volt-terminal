@@ -50,6 +50,16 @@ cargo build --release
 ./target/release/volt
 ```
 
+### Release builds
+
+Pushing a `v*` tag runs the release workflow. It builds and uploads:
+
+- a Linux release binary tarball
+- a macOS `Volt.app` zip archive
+- `SHA256SUMS.txt`
+
+The macOS archive is ad-hoc signed for bundle integrity, but not Developer ID signed or notarized yet.
+
 ---
 
 ## Configuration
