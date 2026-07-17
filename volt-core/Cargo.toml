@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-vte = "0.13"
+vte = "0.15"
 portable-pty = "0.8"
 tokio = { workspace = true, features = ["rt", "sync", "io-util"] }
 anyhow = { workspace = true }

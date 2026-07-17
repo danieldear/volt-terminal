@@ -34,7 +34,6 @@ pub struct Cell {
     pub italic: bool,
     pub underline: bool,
     pub reverse: bool,
-    pub dirty: bool,
 }
 
 impl Default for Cell {
@@ -47,7 +46,6 @@ impl Default for Cell {
             italic: false,
             underline: false,
             reverse: false,
-            dirty: true,
         }
     }
 }

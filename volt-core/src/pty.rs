@@ -16,7 +16,15 @@ fn send_event(tx: &mpsc::UnboundedSender<CoreEvent>, event: CoreEvent) {
 /// How many bytes to parse per Mutex<Performer> acquisition.
 /// Smaller = lower latency / less contention with UI reads.
 /// Larger = fewer lock round-trips under heavy throughput.
-const PARSE_LOCK_CHUNK_BYTES: usize = 4096;
+const PARSE_LOCK_CHUNK_BYTES: usize = 16 * 1024;
+
+/// Bounded depth of the drain → parse queue. Kernel PTY reads are often only
+/// a few KB, so the depth must be generous or the drain thread blocks on the
+/// queue (stalling the writing program) whenever the parser is mid-batch.
+const PIPELINE_QUEUE_BUFFERS: usize = 256;
+
+/// Stop coalescing queued buffers into a parse batch beyond this size.
+const COALESCE_LIMIT_BYTES: usize = 1024 * 1024;
 
 pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -67,23 +75,51 @@ impl Pty {
         let performer = Arc::new(Mutex::new(Performer::new(cols as usize, rows as usize)));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-        // Background reader thread — reads PTY output, feeds VTE parser, fires events
+        // Two-stage pipeline: a drain thread empties the kernel PTY buffer as
+        // fast as possible (the PTY itself caps at ~200 MB/s on macOS, and any
+        // time we spend parsing between reads stalls the writing program), and
+        // a parse thread feeds the VTE parser from a bounded queue.
         let mut reader = pair.master.try_clone_reader()?;
+        let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PIPELINE_QUEUE_BUFFERS);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    // Receiver gone means the parse thread ended; stop draining.
+                    Ok(n) => {
+                        if buf_tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
         let performer_clone = Arc::clone(&performer);
         let writer_clone = Arc::clone(&writer);
         let event_tx_clone = event_tx.clone();
         std::thread::spawn(move || {
             let mut parser = Parser::new();
-            let mut buf = [0u8; 64 * 1024];
             'reader_loop: loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
+                match buf_rx.recv() {
+                    Err(_) => break,
+                    Ok(mut data) => {
+                        // Coalesce everything already queued into one batch:
+                        // kernel PTY reads are typically only a few KB, and the
+                        // per-iteration overhead (locking, events, UI wakeup)
+                        // dominates when parsing tiny buffers one at a time.
+                        while data.len() < COALESCE_LIMIT_BYTES {
+                            match buf_rx.try_recv() {
+                                Ok(more) => data.extend_from_slice(&more),
+                                Err(_) => break,
+                            }
+                        }
                         let mut read_events: Vec<CoreEvent> = Vec::new();
                         let mut read_writes: Vec<Vec<u8>> = Vec::new();
                         let mut read_dirty = false;
 
-                        for chunk in buf[..n].chunks(PARSE_LOCK_CHUNK_BYTES) {
+                        for chunk in data.chunks(PARSE_LOCK_CHUNK_BYTES) {
                             let (pending_events, pending_writes, chunk_dirty) = {
                                 let mut p = match performer_clone.lock() {
                                     Ok(performer) => performer,
@@ -96,9 +132,7 @@ impl Pty {
                                         poisoned.into_inner()
                                     }
                                 };
-                                for &b in chunk {
-                                    parser.advance(&mut *p, b);
-                                }
+                                parser.advance(&mut *p, chunk);
                                 let pending_events = if p.pending_events.is_empty() {
                                     None
                                 } else {

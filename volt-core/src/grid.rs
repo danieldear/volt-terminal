@@ -30,6 +30,9 @@ pub struct Grid {
     scrollback_count: usize, // number of rows currently stored
     /// Maximum number of scrollback lines to retain.
     pub scrollback_limit: usize,
+    /// Blank-row template used for fast row clears (memcpy instead of
+    /// per-element fill). Rebuilt lazily when `cols` changes.
+    blank_row: Vec<Cell>,
 }
 
 impl Grid {
@@ -50,6 +53,7 @@ impl Grid {
             scrollback_start: 0,
             scrollback_count: 0,
             scrollback_limit: 10_000,
+            blank_row: Vec::new(),
         }
     }
 
@@ -62,6 +66,16 @@ impl Grid {
         self.dirty[row] = true;
         let idx = self.row_map[row] * self.cols + col;
         &mut self.cells[idx]
+    }
+
+    /// Hot-path single-cell write: one `row_map` lookup covers the cell store,
+    /// the dirty flag, and the soft-wrap clear that `print()` needs per char.
+    #[inline]
+    pub fn put_char(&mut self, col: usize, row: usize, cell: Cell) {
+        let physical = self.row_map[row];
+        self.soft_wrapped[physical] = false;
+        self.dirty[row] = true;
+        self.cells[physical * self.cols + col] = cell;
     }
 
     pub fn row_soft_wrapped(&self, row: usize) -> bool {
@@ -352,15 +366,23 @@ impl Grid {
         self.row_map[top..=bottom].rotate_right(count);
         for row in top..(top + count) {
             let physical = self.row_map[row];
-            let start = physical * self.cols;
-            let end = start + self.cols;
-            self.cells[start..end].fill(Cell::default());
+            self.clear_physical_row(physical);
             self.soft_wrapped[physical] = false;
         }
         // Mark affected region dirty.
-        for row in top..=bottom {
-            self.dirty[row] = true;
+        self.dirty[top..=bottom].fill(true);
+    }
+
+    /// Clear one physical row via memcpy from a blank-row template — measurably
+    /// faster than `fill(Cell::default())`, which stores per element. Hot on
+    /// every scrolled line.
+    #[inline]
+    fn clear_physical_row(&mut self, physical: usize) {
+        if self.blank_row.len() != self.cols {
+            self.blank_row = vec![Cell::default(); self.cols];
         }
+        let start = physical * self.cols;
+        self.cells[start..start + self.cols].copy_from_slice(&self.blank_row);
     }
 
     pub fn scroll_up(&mut self, top: usize, bottom: usize, count: usize) {
@@ -405,15 +427,11 @@ impl Grid {
         let clear_start_row = bottom + 1 - count;
         for row in clear_start_row..=bottom {
             let physical = self.row_map[row];
-            let start = physical * self.cols;
-            let end = start + self.cols;
-            self.cells[start..end].fill(Cell::default());
+            self.clear_physical_row(physical);
             self.soft_wrapped[physical] = false;
         }
         // Mark affected region dirty.
-        for row in top..=bottom {
-            self.dirty[row] = true;
-        }
+        self.dirty[top..=bottom].fill(true);
     }
 
     pub fn clear_line(&mut self, row: usize, from_col: usize, to_col: usize) {
@@ -475,6 +493,32 @@ impl Grid {
     pub fn scrollback_cell(&self, sb_row: usize, col: usize) -> &Cell {
         let physical = (self.scrollback_start + sb_row) % self.scrollback_limit;
         &self.scrollback_buf[physical * self.cols + col]
+    }
+
+    /// Contiguous cell slice of a visual row (physical rows are contiguous).
+    /// Lets renderers copy whole rows via memcpy instead of per-cell access —
+    /// important because the UI blits under the performer lock.
+    pub fn row_cells(&self, row: usize) -> &[Cell] {
+        let start = self.row_map[row] * self.cols;
+        &self.cells[start..start + self.cols]
+    }
+
+    /// Contiguous cell slice of a scrollback row (0-indexed from oldest).
+    pub fn scrollback_row(&self, sb_row: usize) -> &[Cell] {
+        let physical = (self.scrollback_start + sb_row) % self.scrollback_limit;
+        let start = physical * self.cols;
+        &self.scrollback_buf[start..start + self.cols]
+    }
+
+    /// Copy `src` into visual `row` starting at `dst_col`, clipped to the grid.
+    pub fn copy_into_row(&mut self, row: usize, dst_col: usize, src: &[Cell]) {
+        if row >= self.rows || dst_col >= self.cols {
+            return;
+        }
+        let n = src.len().min(self.cols - dst_col);
+        let start = self.row_map[row] * self.cols + dst_col;
+        self.cells[start..start + n].copy_from_slice(&src[..n]);
+        self.dirty[row] = true;
     }
 
     /// Discard all scrollback history (e.g. Cmd+K clear).

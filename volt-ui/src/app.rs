@@ -451,10 +451,10 @@ impl MainState {
         }
         let rows = src.rows.min(dst.rows.saturating_sub(dst_row));
         let cols = src.cols.min(dst.cols.saturating_sub(dst_col));
+        // Row-slice memcpys: this runs while holding the performer lock, so it
+        // must be fast or it stalls the PTY parse thread.
         for row in 0..rows {
-            for col in 0..cols {
-                *dst.cell_mut(dst_col + col, dst_row + row) = *src.cell(col, row);
-            }
+            dst.copy_into_row(dst_row + row, dst_col, &src.row_cells(row)[..cols]);
         }
     }
 
@@ -487,14 +487,10 @@ impl MainState {
             if sb_idx >= sb_len {
                 break;
             }
-            for c in 0..cols {
-                *dst.cell_mut(dst_col + c, dst_row + r) = *src.scrollback_cell(sb_idx, c);
-            }
+            dst.copy_into_row(dst_row + r, dst_col, &src.scrollback_row(sb_idx)[..cols]);
         }
-        for r in 0..grid_rows {
-            for c in 0..cols {
-                *dst.cell_mut(dst_col + c, dst_row + sb_rows + r) = *src.cell(c, r);
-            }
+        for r in 0..grid_rows.min(src.rows) {
+            dst.copy_into_row(dst_row + sb_rows + r, dst_col, &src.row_cells(r)[..cols]);
         }
     }
 

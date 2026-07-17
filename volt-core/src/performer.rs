@@ -114,7 +114,6 @@ impl Performer {
             italic: self.current_italic,
             underline: self.current_underline,
             reverse: self.current_reverse,
-            dirty: true,
         }
     }
 
@@ -240,6 +239,21 @@ fn char_display_width(c: char) -> usize {
 
 impl Perform for Performer {
     fn print(&mut self, c: char) {
+        // Fast path for the overwhelmingly common case: printable ASCII with
+        // no pending wrap, landing strictly inside the row. One row_map lookup
+        // and one damage mark per character.
+        if !self.grid.pending_wrap && (c as u32) >= 0x20 && (c as u32) < 0x7f {
+            let col = self.grid.cursor_col;
+            let row = self.grid.cursor_row;
+            if col + 1 < self.grid.cols && row < self.grid.rows {
+                let cell = self.make_cell(c);
+                self.grid.put_char(col, row, cell);
+                self.grid.cursor_col = col + 1;
+                self.mark_dirty_row(row);
+                return;
+            }
+        }
+
         let old_cursor_row = self.grid.cursor_row;
         let width = char_display_width(c);
         if width == 0 {
@@ -304,7 +318,11 @@ impl Perform for Performer {
         } else {
             self.grid.cursor_col += 2;
         }
-        self.mark_cursor_row_change(old_cursor_row);
+        // The written row is already marked; only mark extra rows if the
+        // cursor moved (wrap/scroll), avoiding a redundant per-char update.
+        if self.grid.cursor_row != old_cursor_row {
+            self.mark_cursor_row_change(old_cursor_row);
+        }
     }
 
     fn execute(&mut self, byte: u8) {
@@ -782,9 +800,7 @@ mod tests {
 
     fn feed(p: &mut Performer, bytes: &[u8]) {
         let mut parser = vte::Parser::new();
-        for &b in bytes {
-            parser.advance(p, b);
-        }
+        parser.advance(p, bytes);
     }
 
     fn collect_logical_lines(p: &Performer) -> Vec<String> {
