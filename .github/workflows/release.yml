@@ -66,7 +66,8 @@ jobs:
         run: |
           set -euo pipefail
           arch="$(uname -m)"
-          package_dir="Volt-${RELEASE_TAG}-linux-${arch}"
+          safe_tag="${RELEASE_TAG//\//_}"
+          package_dir="Volt-${safe_tag}-linux-${arch}"
           mkdir -p "dist" "staging/${package_dir}"
           cp target/release/volt "staging/${package_dir}/volt"
           cp README.md LICENSE "staging/${package_dir}/"
@@ -92,10 +93,11 @@ jobs:
         run: |
           set -euo pipefail
           arch="$(uname -m)"
+          safe_tag="${RELEASE_TAG//\//_}"
           mkdir -p dist
           /usr/bin/ditto -c -k --keepParent \
             target/macos/Volt.app \
-            "dist/Volt-${RELEASE_TAG}-macos-${arch}.zip"
+            "dist/Volt-${safe_tag}-macos-${arch}.zip"
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
