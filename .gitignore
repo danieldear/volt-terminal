@@ -17,3 +17,11 @@ AGENTS.md
 
 # icon build artifacts
 assets/AppIcon.iconset/
+
+# Local agent/tooling metadata
+.mcp.json
+.rules
+CLAUDE.md
+AGENT007*.md
+AGENTS.agent007.generated.md
+/*.patch
