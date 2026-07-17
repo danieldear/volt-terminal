@@ -3,6 +3,9 @@ name = "volt-ui"
 version.workspace = true
 edition.workspace = true
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
 [dependencies]
 winit = "0.30"
 pollster = "0.3"

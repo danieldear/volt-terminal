@@ -15,7 +15,6 @@ use volt_core::grid::Grid;
 const ATLAS_SIZE: u32 = 2048;
 const INITIAL_BG_VERT_CAPACITY: usize = 16_384;
 const INITIAL_GLYPH_VERT_CAPACITY: usize = 32_768;
-const SYMBOL_BASELINE_LINE_HEIGHT: f32 = 1.4;
 const TAB_BAR_LEFT_PAD: f32 = 78.0;
 const TAB_BAR_GAP: f32 = 4.0;
 const TAB_BAR_PLUS_W: f32 = 24.0;
@@ -703,6 +702,26 @@ impl Renderer {
             out
         }
 
+        let primary = shape_for_family(
+            font_system,
+            c,
+            metrics,
+            cell_w,
+            cell_h,
+            resolve_family(fam_name),
+            bold,
+            italic,
+        );
+        let primary_visible = primary.iter().any(|glyph| {
+            swash_cache
+                .get_image_uncached(font_system, glyph.cache_key)
+                .map(|img| img.placement.width > 0 && img.placement.height > 0)
+                .unwrap_or(false)
+        });
+        if primary_visible && !is_private_use_char(c) {
+            return primary;
+        }
+
         if let Some(fallback_family) = symbol_fallback_family {
             if !fallback_family.eq_ignore_ascii_case(fam_name)
                 && (is_private_use_char(c) || is_symbol_fallback_char(c))
@@ -726,31 +745,7 @@ impl Renderer {
                 if fallback_visible {
                     return fallback;
                 }
-            }
-        }
-
-        let primary = shape_for_family(
-            font_system,
-            c,
-            metrics,
-            cell_w,
-            cell_h,
-            resolve_family(fam_name),
-            bold,
-            italic,
-        );
-        let primary_visible = primary.iter().any(|glyph| {
-            swash_cache
-                .get_image_uncached(font_system, glyph.cache_key)
-                .map(|img| img.placement.width > 0 && img.placement.height > 0)
-                .unwrap_or(false)
-        });
-        if primary_visible {
-            return primary;
-        }
-
-        if let Some(fallback_family) = symbol_fallback_family {
-            if !fallback_family.eq_ignore_ascii_case(fam_name) {
+            } else if !fallback_family.eq_ignore_ascii_case(fam_name) {
                 return shape_for_family(
                     font_system,
                     c,
@@ -762,6 +757,10 @@ impl Renderer {
                     italic,
                 );
             }
+        }
+
+        if primary_visible {
+            return primary;
         }
 
         primary
@@ -812,6 +811,7 @@ impl Renderer {
         ]);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_text_with_line_height(
         &mut self,
         glyphs: &mut Vec<GlyphVertex>,
@@ -1018,6 +1018,7 @@ impl Renderer {
 
     // ── main terminal render entry point ────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &mut self,
         grid: &Grid,
@@ -1049,9 +1050,6 @@ impl Renderer {
         let content_top = tab_top_h + alert_h;
         let phys_pad = self.padding * self.scale_factor;
         let metrics = Self::glyph_layout_metrics(self.font_size_phys, self.line_height);
-        let symbol_metrics =
-            Self::glyph_layout_metrics(self.font_size_phys, SYMBOL_BASELINE_LINE_HEIGHT);
-        let symbol_line_height = self.font_size_phys * SYMBOL_BASELINE_LINE_HEIGHT;
         let fam_name = self.font_family.clone();
         // Row-scoped partial redraw is currently unsafe with dynamic line-height / glyph overhang.
         // Force full redraw for correctness.
@@ -1152,16 +1150,10 @@ impl Renderer {
                 }
                 let cache_key = (cell.c, cell.bold, cell.italic);
                 if !self.shape_cache.contains_key(&cache_key) {
-                    let char_metrics =
-                        if is_private_use_char(cell.c) || is_symbol_fallback_char(cell.c) {
-                            symbol_metrics
-                        } else {
-                            metrics
-                        };
                     let glyphs = Self::shape_char(
                         &mut self.font_system,
                         cell.c,
-                        char_metrics,
+                        metrics,
                         cw,
                         ch,
                         &fam_name,
@@ -1208,13 +1200,7 @@ impl Renderer {
                         + gi.glyph_x
                         + region.offset_x as f32
                         + Self::cell_x_offset_for_char(cell.c) * cw;
-                    let symbol_vertical_offset =
-                        if is_private_use_char(cell.c) || is_symbol_fallback_char(cell.c) {
-                            (ch - symbol_line_height) * 0.5
-                        } else {
-                            0.0
-                        };
-                    let gy = cell_top + gi.line_y + symbol_vertical_offset - region.offset_y as f32
+                    let gy = cell_top + gi.line_y - region.offset_y as f32
                         + Self::cell_y_offset_for_char(cell.c, ch);
                     let gx = Self::snap_to_pixel(gx);
                     let gy = Self::snap_to_pixel(gy);

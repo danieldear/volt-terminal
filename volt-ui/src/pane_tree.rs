@@ -56,14 +56,26 @@ impl PaneTree {
         }
     }
 
-    pub fn split(&mut self, target_id: usize, direction: PaneSplitDirection, new_pane: TerminalPane) {
+    pub fn split(
+        &mut self,
+        target_id: usize,
+        direction: PaneSplitDirection,
+        new_pane: TerminalPane,
+    ) {
         let new_pane_id = self.next_id;
         self.next_id += 1;
         let divider_id = self.next_id;
         self.next_id += 1;
         let mut pane_opt = Some(new_pane);
         if let Some(root) = &mut self.root {
-            if split_node(root, target_id, direction, &mut pane_opt, new_pane_id, divider_id) {
+            if split_node(
+                root,
+                target_id,
+                direction,
+                &mut pane_opt,
+                new_pane_id,
+                divider_id,
+            ) {
                 self.active_id = new_pane_id;
             }
         }
@@ -78,7 +90,11 @@ impl PaneTree {
                 let old_root = self.root.take().expect("root is Some");
                 let (new_root, found) = remove_node_bv(old_root, target_id, &mut self.active_id);
                 self.root = Some(new_root);
-                if found { RemoveResult::Removed } else { RemoveResult::NotFound }
+                if found {
+                    RemoveResult::Removed
+                } else {
+                    RemoveResult::NotFound
+                }
             }
         }
     }
@@ -91,6 +107,7 @@ impl PaneTree {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn dividers_with_ids(
         &self,
         cols: usize,
@@ -108,7 +125,24 @@ impl PaneTree {
     ) -> Vec<DividerInfo> {
         let mut out = Vec::new();
         if let Some(root) = &self.root {
-            dividers_node(root, 0, 0, cols, rows, cell_w, cell_h, phys_pad, content_top, phys_right, phys_bottom, scale, hover_id, drag_id, divider_opacity, &mut out);
+            dividers_node(
+                root,
+                0,
+                0,
+                cols,
+                rows,
+                cell_w,
+                cell_h,
+                phys_pad,
+                content_top,
+                phys_right,
+                phys_bottom,
+                scale,
+                hover_id,
+                drag_id,
+                divider_opacity,
+                &mut out,
+            );
         }
         out
     }
@@ -130,11 +164,14 @@ impl PaneTree {
     }
 
     pub fn get_ratio(&self, divider_id: usize) -> Option<f32> {
-        self.root.as_ref().and_then(|r| get_ratio_node(r, divider_id))
+        self.root
+            .as_ref()
+            .and_then(|r| get_ratio_node(r, divider_id))
     }
 
     /// Apply an **absolute** ratio from `start_ratio + total_delta_px / local_span_px`.
     /// Uses local (sub-tree) dimensions, so nested splits are handled correctly.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_ratio_from_drag(
         &mut self,
         divider_id: usize,
@@ -146,7 +183,16 @@ impl PaneTree {
         total_rows: usize,
     ) {
         if let Some(root) = &mut self.root {
-            set_ratio_from_drag_node(root, divider_id, start_ratio, delta_px, cell_w, cell_h, total_cols, total_rows);
+            set_ratio_from_drag_node(
+                root,
+                divider_id,
+                start_ratio,
+                delta_px,
+                cell_w,
+                cell_h,
+                total_cols,
+                total_rows,
+            );
         }
     }
 
@@ -179,39 +225,68 @@ impl PaneTree {
 
 // ── recursive helpers ─────────────────────────────────────────────────────────
 
-fn layout_node(node: &PaneNode, col: usize, row: usize, cols: usize, rows: usize, out: &mut Vec<PaneRect>) {
+fn layout_node(
+    node: &PaneNode,
+    col: usize,
+    row: usize,
+    cols: usize,
+    rows: usize,
+    out: &mut Vec<PaneRect>,
+) {
     match node {
         PaneNode::Leaf { id, .. } => {
-            out.push(PaneRect { id: *id, col, row, cols: cols.max(1), rows: rows.max(1) });
+            out.push(PaneRect {
+                id: *id,
+                col,
+                row,
+                cols: cols.max(1),
+                rows: rows.max(1),
+            });
         }
-        PaneNode::Split { direction, ratio, children, .. } => {
-            match direction {
-                PaneSplitDirection::Vertical => {
-                    let left_cols = left_cols_from_ratio(*ratio, cols);
-                    let right_cols = cols.saturating_sub(left_cols + 1).max(1);
-                    layout_node(&children[0], col, row, left_cols, rows, out);
-                    layout_node(&children[1], col + left_cols + 1, row, right_cols, rows, out);
-                }
-                PaneSplitDirection::Horizontal => {
-                    let top_rows = top_rows_from_ratio(*ratio, rows);
-                    let bot_rows = rows.saturating_sub(top_rows + 1).max(1);
-                    layout_node(&children[0], col, row, cols, top_rows, out);
-                    layout_node(&children[1], col, row + top_rows + 1, cols, bot_rows, out);
-                }
+        PaneNode::Split {
+            direction,
+            ratio,
+            children,
+            ..
+        } => match direction {
+            PaneSplitDirection::Vertical => {
+                let left_cols = left_cols_from_ratio(*ratio, cols);
+                let right_cols = cols.saturating_sub(left_cols + 1).max(1);
+                layout_node(&children[0], col, row, left_cols, rows, out);
+                layout_node(
+                    &children[1],
+                    col + left_cols + 1,
+                    row,
+                    right_cols,
+                    rows,
+                    out,
+                );
             }
-        }
+            PaneSplitDirection::Horizontal => {
+                let top_rows = top_rows_from_ratio(*ratio, rows);
+                let bot_rows = rows.saturating_sub(top_rows + 1).max(1);
+                layout_node(&children[0], col, row, cols, top_rows, out);
+                layout_node(&children[1], col, row + top_rows + 1, cols, bot_rows, out);
+            }
+        },
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dividers_node(
     node: &PaneNode,
-    base_col: usize, base_row: usize,
-    cols: usize, rows: usize,
-    cell_w: f32, cell_h: f32,
-    phys_pad: f32, content_top: f32,
+    base_col: usize,
+    base_row: usize,
+    cols: usize,
+    rows: usize,
+    cell_w: f32,
+    cell_h: f32,
+    phys_pad: f32,
+    content_top: f32,
     // Physical extents for this subtree — used to extend dividers to fill
     // leftover pixels that don't fit in a whole cell.
-    phys_right: f32, phys_bottom: f32,
+    phys_right: f32,
+    phys_bottom: f32,
     scale: f32,
     hover_id: Option<usize>,
     drag_id: Option<usize>,
@@ -220,7 +295,12 @@ fn dividers_node(
 ) {
     match node {
         PaneNode::Leaf { .. } => {}
-        PaneNode::Split { direction, ratio, children, divider_id } => {
+        PaneNode::Split {
+            direction,
+            ratio,
+            children,
+            divider_id,
+        } => {
             let line_w = scale.max(1.0);
             // Colors blend over the terminal background via alpha compositing.
             let color = if drag_id == Some(*divider_id) {
@@ -239,13 +319,53 @@ fn dividers_node(
                     let div_h = phys_bottom - div_y;
                     out.push(DividerInfo {
                         id: *divider_id,
-                        phys: PaneDivider { x: div_x, y: div_y, width: line_w, height: div_h, color },
+                        phys: PaneDivider {
+                            x: div_x,
+                            y: div_y,
+                            width: line_w,
+                            height: div_h,
+                            color,
+                        },
                         direction: PaneSplitDirection::Vertical,
                     });
                     let right_cols = cols.saturating_sub(left_cols + 1).max(1);
                     // Left child's right boundary is the divider line; right child keeps parent's right.
-                    dividers_node(&children[0], base_col, base_row, left_cols, rows, cell_w, cell_h, phys_pad, content_top, div_x, phys_bottom, scale, hover_id, drag_id, divider_opacity, out);
-                    dividers_node(&children[1], base_col + left_cols + 1, base_row, right_cols, rows, cell_w, cell_h, phys_pad, content_top, phys_right, phys_bottom, scale, hover_id, drag_id, divider_opacity, out);
+                    dividers_node(
+                        &children[0],
+                        base_col,
+                        base_row,
+                        left_cols,
+                        rows,
+                        cell_w,
+                        cell_h,
+                        phys_pad,
+                        content_top,
+                        div_x,
+                        phys_bottom,
+                        scale,
+                        hover_id,
+                        drag_id,
+                        divider_opacity,
+                        out,
+                    );
+                    dividers_node(
+                        &children[1],
+                        base_col + left_cols + 1,
+                        base_row,
+                        right_cols,
+                        rows,
+                        cell_w,
+                        cell_h,
+                        phys_pad,
+                        content_top,
+                        phys_right,
+                        phys_bottom,
+                        scale,
+                        hover_id,
+                        drag_id,
+                        divider_opacity,
+                        out,
+                    );
                 }
                 PaneSplitDirection::Horizontal => {
                     let top_rows = top_rows_from_ratio(*ratio, rows);
@@ -255,13 +375,53 @@ fn dividers_node(
                     let div_w = phys_right - div_x;
                     out.push(DividerInfo {
                         id: *divider_id,
-                        phys: PaneDivider { x: div_x, y: div_y, width: div_w, height: line_w, color },
+                        phys: PaneDivider {
+                            x: div_x,
+                            y: div_y,
+                            width: div_w,
+                            height: line_w,
+                            color,
+                        },
                         direction: PaneSplitDirection::Horizontal,
                     });
                     let bot_rows = rows.saturating_sub(top_rows + 1).max(1);
                     // Top child's bottom boundary is the divider line; bottom child keeps parent's bottom.
-                    dividers_node(&children[0], base_col, base_row, cols, top_rows, cell_w, cell_h, phys_pad, content_top, phys_right, div_y, scale, hover_id, drag_id, divider_opacity, out);
-                    dividers_node(&children[1], base_col, base_row + top_rows + 1, cols, bot_rows, cell_w, cell_h, phys_pad, content_top, phys_right, phys_bottom, scale, hover_id, drag_id, divider_opacity, out);
+                    dividers_node(
+                        &children[0],
+                        base_col,
+                        base_row,
+                        cols,
+                        top_rows,
+                        cell_w,
+                        cell_h,
+                        phys_pad,
+                        content_top,
+                        phys_right,
+                        div_y,
+                        scale,
+                        hover_id,
+                        drag_id,
+                        divider_opacity,
+                        out,
+                    );
+                    dividers_node(
+                        &children[1],
+                        base_col,
+                        base_row + top_rows + 1,
+                        cols,
+                        bot_rows,
+                        cell_w,
+                        cell_h,
+                        phys_pad,
+                        content_top,
+                        phys_right,
+                        phys_bottom,
+                        scale,
+                        hover_id,
+                        drag_id,
+                        divider_opacity,
+                        out,
+                    );
                 }
             }
         }
@@ -270,7 +430,13 @@ fn dividers_node(
 
 fn find_leaf_node(node: &PaneNode, id: usize) -> Option<&TerminalPane> {
     match node {
-        PaneNode::Leaf { pane, id: leaf_id } => if *leaf_id == id { Some(pane) } else { None },
+        PaneNode::Leaf { pane, id: leaf_id } => {
+            if *leaf_id == id {
+                Some(pane)
+            } else {
+                None
+            }
+        }
         PaneNode::Split { children, .. } => {
             find_leaf_node(&children[0], id).or_else(|| find_leaf_node(&children[1], id))
         }
@@ -279,7 +445,13 @@ fn find_leaf_node(node: &PaneNode, id: usize) -> Option<&TerminalPane> {
 
 fn find_leaf_mut_node(node: &mut PaneNode, id: usize) -> Option<&mut TerminalPane> {
     match node {
-        PaneNode::Leaf { pane, id: leaf_id } => if *leaf_id == id { Some(pane) } else { None },
+        PaneNode::Leaf { pane, id: leaf_id } => {
+            if *leaf_id == id {
+                Some(pane)
+            } else {
+                None
+            }
+        }
         PaneNode::Split { children, .. } => {
             let [left, right] = children.as_mut();
             find_leaf_mut_node(left, id).or_else(|| find_leaf_mut_node(right, id))
@@ -308,14 +480,22 @@ fn split_node(
 ) -> bool {
     match node {
         PaneNode::Leaf { id, .. } if *id == target_id => {
-            let pane = new_pane.take().expect("split_node: pane consumed prematurely");
+            let pane = new_pane
+                .take()
+                .expect("split_node: pane consumed prematurely");
             // SAFETY: we immediately overwrite `node` before the old value can be observed
             // again; the old Leaf is moved into the new Split's children array.
             let old_leaf = unsafe { std::ptr::read(node) };
             let new_split = PaneNode::Split {
                 direction,
                 ratio: 0.5,
-                children: Box::new([old_leaf, PaneNode::Leaf { pane, id: new_pane_id }]),
+                children: Box::new([
+                    old_leaf,
+                    PaneNode::Leaf {
+                        pane,
+                        id: new_pane_id,
+                    },
+                ]),
                 divider_id,
             };
             unsafe { std::ptr::write(node, new_split) };
@@ -324,10 +504,24 @@ fn split_node(
         PaneNode::Leaf { .. } => false,
         PaneNode::Split { children, .. } => {
             let [left, right] = children.as_mut();
-            if split_node(left, target_id, direction, new_pane, new_pane_id, divider_id) {
+            if split_node(
+                left,
+                target_id,
+                direction,
+                new_pane,
+                new_pane_id,
+                divider_id,
+            ) {
                 return true;
             }
-            split_node(right, target_id, direction, new_pane, new_pane_id, divider_id)
+            split_node(
+                right,
+                target_id,
+                direction,
+                new_pane,
+                new_pane_id,
+                divider_id,
+            )
         }
     }
 }
@@ -338,7 +532,12 @@ fn remove_node_bv(node: PaneNode, target_id: usize, active_id: &mut usize) -> (P
     match node {
         // A bare Leaf at this call level means the public API's guard missed it — treat as NotFound.
         PaneNode::Leaf { .. } => (node, false),
-        PaneNode::Split { direction, ratio, children, divider_id } => {
+        PaneNode::Split {
+            direction,
+            ratio,
+            children,
+            divider_id,
+        } => {
             let [left, right] = *children;
 
             let left_is_target = matches!(&left, PaneNode::Leaf { id, .. } if *id == target_id);
@@ -349,7 +548,9 @@ fn remove_node_bv(node: PaneNode, target_id: usize, active_id: &mut usize) -> (P
                 if *active_id == target_id {
                     let mut ids = Vec::new();
                     collect_leaf_ids(&right, &mut ids);
-                    if let Some(&id) = ids.first() { *active_id = id; }
+                    if let Some(&id) = ids.first() {
+                        *active_id = id;
+                    }
                 }
                 return (right, true);
             }
@@ -357,7 +558,9 @@ fn remove_node_bv(node: PaneNode, target_id: usize, active_id: &mut usize) -> (P
                 if *active_id == target_id {
                     let mut ids = Vec::new();
                     collect_leaf_ids(&left, &mut ids);
-                    if let Some(&id) = ids.first() { *active_id = id; }
+                    if let Some(&id) = ids.first() {
+                        *active_id = id;
+                    }
                 }
                 return (left, true);
             }
@@ -365,17 +568,27 @@ fn remove_node_bv(node: PaneNode, target_id: usize, active_id: &mut usize) -> (P
             // Try left subtree first.
             let (new_left, found_left) = remove_node_bv(left, target_id, active_id);
             if found_left {
-                return (PaneNode::Split {
-                    direction, ratio, divider_id,
-                    children: Box::new([new_left, right]),
-                }, true);
+                return (
+                    PaneNode::Split {
+                        direction,
+                        ratio,
+                        divider_id,
+                        children: Box::new([new_left, right]),
+                    },
+                    true,
+                );
             }
             // Try right subtree.
             let (new_right, found_right) = remove_node_bv(right, target_id, active_id);
-            (PaneNode::Split {
-                direction, ratio, divider_id,
-                children: Box::new([new_left, new_right]),
-            }, found_right)
+            (
+                PaneNode::Split {
+                    direction,
+                    ratio,
+                    divider_id,
+                    children: Box::new([new_left, new_right]),
+                },
+                found_right,
+            )
         }
     }
 }
@@ -383,16 +596,23 @@ fn remove_node_bv(node: PaneNode, target_id: usize, active_id: &mut usize) -> (P
 fn get_ratio_node(node: &PaneNode, target: usize) -> Option<f32> {
     match node {
         PaneNode::Leaf { .. } => None,
-        PaneNode::Split { divider_id, ratio, children, .. } => {
-            if *divider_id == target { return Some(*ratio); }
-            get_ratio_node(&children[0], target)
-                .or_else(|| get_ratio_node(&children[1], target))
+        PaneNode::Split {
+            divider_id,
+            ratio,
+            children,
+            ..
+        } => {
+            if *divider_id == target {
+                return Some(*ratio);
+            }
+            get_ratio_node(&children[0], target).or_else(|| get_ratio_node(&children[1], target))
         }
     }
 }
 
 /// Set ratio absolutely: `new_ratio = (start_ratio + delta_px / local_span_px).clamp(0.1, 0.9)`.
 /// Recurses with local sub-rect dimensions so nested splits are handled correctly.
+#[allow(clippy::too_many_arguments)]
 fn set_ratio_from_drag_node(
     node: &mut PaneNode,
     target_divider_id: usize,
@@ -405,25 +625,35 @@ fn set_ratio_from_drag_node(
 ) -> bool {
     match node {
         PaneNode::Leaf { .. } => false,
-        PaneNode::Split { divider_id, direction, ratio, children } => {
+        PaneNode::Split {
+            divider_id,
+            direction,
+            ratio,
+            children,
+        } => {
             if *divider_id == target_divider_id {
                 // Determine usable span (total cells minus the 1-cell divider).
                 let usable = match direction {
-                    PaneSplitDirection::Vertical   => cols.saturating_sub(1),
+                    PaneSplitDirection::Vertical => cols.saturating_sub(1),
                     PaneSplitDirection::Horizontal => rows.saturating_sub(1),
                 };
                 // Both children must get ≥ 1 cell — need at least 2 usable.
-                if usable < 2 { return true; }
-                let span_px = usable as f32 * match direction {
-                    PaneSplitDirection::Vertical   => cell_w,
-                    PaneSplitDirection::Horizontal => cell_h,
-                };
+                if usable < 2 {
+                    return true;
+                }
+                let span_px = usable as f32
+                    * match direction {
+                        PaneSplitDirection::Vertical => cell_w,
+                        PaneSplitDirection::Horizontal => cell_h,
+                    };
                 if span_px > 0.0 {
                     // Cell-aware bounds: left ≥ 1 cell, right ≥ 1 cell.
                     let min_ratio = 1.0 / usable as f32;
                     let max_ratio = (usable - 1) as f32 / usable as f32;
                     *ratio = (start_ratio + delta_px / span_px).clamp(min_ratio, max_ratio);
-                    if ratio.is_nan() { *ratio = 0.5_f32.clamp(min_ratio, max_ratio); }
+                    if ratio.is_nan() {
+                        *ratio = 0.5_f32.clamp(min_ratio, max_ratio);
+                    }
                 }
                 return true;
             }
@@ -438,8 +668,25 @@ fn set_ratio_from_drag_node(
                 }
             };
             let [left, right] = children.as_mut();
-            set_ratio_from_drag_node(left,  target_divider_id, start_ratio, delta_px, cell_w, cell_h, lc, lr)
-                || set_ratio_from_drag_node(right, target_divider_id, start_ratio, delta_px, cell_w, cell_h, rc, rr)
+            set_ratio_from_drag_node(
+                left,
+                target_divider_id,
+                start_ratio,
+                delta_px,
+                cell_w,
+                cell_h,
+                lc,
+                lr,
+            ) || set_ratio_from_drag_node(
+                right,
+                target_divider_id,
+                start_ratio,
+                delta_px,
+                cell_w,
+                cell_h,
+                rc,
+                rr,
+            )
         }
     }
 }
@@ -459,7 +706,9 @@ fn for_each_leaf_mut_node(node: &mut PaneNode, f: &mut impl FnMut(usize, &mut Te
 
 fn left_cols_from_ratio(ratio: f32, cols: usize) -> usize {
     let usable = cols.saturating_sub(1);
-    if usable < 2 { return 1; }
+    if usable < 2 {
+        return 1;
+    }
     let min_ratio = 1.0 / usable as f32;
     let max_ratio = (usable - 1) as f32 / usable as f32;
     let lc = (usable as f32 * ratio.clamp(min_ratio, max_ratio)).round() as usize;
@@ -468,11 +717,11 @@ fn left_cols_from_ratio(ratio: f32, cols: usize) -> usize {
 
 fn top_rows_from_ratio(ratio: f32, rows: usize) -> usize {
     let usable = rows.saturating_sub(1);
-    if usable < 2 { return 1; }
+    if usable < 2 {
+        return 1;
+    }
     let min_ratio = 1.0 / usable as f32;
     let max_ratio = (usable - 1) as f32 / usable as f32;
     let tr = (usable as f32 * ratio.clamp(min_ratio, max_ratio)).round() as usize;
     tr.max(1).min(usable - 1)
 }
-
-
