@@ -91,13 +91,8 @@ impl Pty {
                                         // Another thread panicked; recover the guard
                                         // and report via the event channel instead of
                                         // panicking or going fully silent.
-                                        let msg = format!(
-                                            "performer mutex poisoned: {poisoned}"
-                                        );
-                                        send_event(
-                                            &event_tx_clone,
-                                            CoreEvent::PtyError(msg),
-                                        );
+                                        let msg = format!("performer mutex poisoned: {poisoned}");
+                                        send_event(&event_tx_clone, CoreEvent::PtyError(msg));
                                         poisoned.into_inner()
                                     }
                                 };

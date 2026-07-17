@@ -20,11 +20,17 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: MessageRole::User, content: content.into() }
+        Self {
+            role: MessageRole::User,
+            content: content.into(),
+        }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: MessageRole::Assistant, content: content.into() }
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+        }
     }
 }
 
@@ -77,7 +83,11 @@ impl ChatPanel {
 
     /// Returns the panel width to subtract from the terminal viewport, or 0 if hidden.
     pub fn terminal_width_reduction(&self) -> f32 {
-        if self.visible { self.width } else { 0.0 }
+        if self.visible {
+            self.width
+        } else {
+            0.0
+        }
     }
 
     /// Append a character to the input buffer when the panel is focused.
