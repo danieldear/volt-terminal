@@ -40,6 +40,8 @@ pub enum VoltEvent {
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+/// Maximum delay between clicks for double/triple-click detection.
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(450);
 
 #[derive(Debug, Clone, Copy)]
 struct DividerDrag {
@@ -99,6 +101,13 @@ struct MainState {
     divider_hover_id: Option<usize>,
     /// AI Chat Panel sidebar state.
     chat_panel: ChatPanel,
+    /// Last left-click for double/triple-click detection: (time, pane, col, row).
+    last_click: Option<(Instant, usize, usize, usize)>,
+    /// Consecutive clicks at the same cell: 1 = cell, 2 = word, 3 = line.
+    click_count: u8,
+    #[cfg(target_os = "macos")]
+    /// Last title handed to the native window, so idle ticks skip `set_title`.
+    last_native_title: String,
 }
 
 impl MainState {
@@ -173,13 +182,21 @@ impl MainState {
     }
 
     #[cfg(target_os = "macos")]
-    fn sync_native_window_title(&self) {
+    fn set_window_title_cached(&mut self, title: &str) {
+        if self.last_native_title != title {
+            self.last_native_title = title.to_string();
+            self.window.set_title(title);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_native_window_title(&mut self) {
         let title = self
             .tabs
             .get(self.active_tab)
             .map(|t| t.display_title(self.active_tab + 1))
             .unwrap_or_else(|| "~".to_string());
-        self.window.set_title(&title);
+        self.set_window_title_cached(&title);
     }
 
     fn active_pane_mut(&mut self) -> &mut TerminalPane {
@@ -659,6 +676,78 @@ impl MainState {
         }
     }
 
+    /// Cell at a displayed (viewport) position, accounting for the pane's
+    /// scrollback view offset — mirrors `blit_grid_with_scrollback`.
+    fn displayed_cell<'a>(
+        grid: &'a Grid,
+        offset: usize,
+        col: usize,
+        row: usize,
+    ) -> Option<&'a volt_core::cell::Cell> {
+        if col >= grid.cols || row >= grid.rows {
+            return None;
+        }
+        let sb_rows = offset.min(grid.rows);
+        if row < sb_rows {
+            let sb_len = grid.scrollback_len();
+            let idx = sb_len.saturating_sub(offset) + row;
+            if idx >= sb_len {
+                return None;
+            }
+            Some(grid.scrollback_cell(idx, col))
+        } else {
+            Some(grid.cell(col, row - sb_rows))
+        }
+    }
+
+    /// Expand a double-click into a word selection on the displayed row.
+    fn word_selection(&self, pane_id: usize, col: usize, row: usize) -> Option<Selection> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let pane = tab.tree.find_leaf(pane_id)?;
+        let performer = pane.performer.lock().ok()?;
+        let grid = &performer.grid;
+        let offset = pane.scroll_view_offset.min(grid.scrollback_len());
+        let class = char_select_class(Self::displayed_cell(grid, offset, col, row)?.c);
+        let mut start = col;
+        while start > 0 {
+            match Self::displayed_cell(grid, offset, start - 1, row) {
+                Some(cell) if char_select_class(cell.c) == class => start -= 1,
+                _ => break,
+            }
+        }
+        let mut end = col;
+        while end + 1 < grid.cols {
+            match Self::displayed_cell(grid, offset, end + 1, row) {
+                Some(cell) if char_select_class(cell.c) == class => end += 1,
+                _ => break,
+            }
+        }
+        Some(Selection {
+            pane_id,
+            mode: SelectionMode::Linear,
+            start_col: start,
+            start_row: row,
+            end_col: end,
+            end_row: row,
+        })
+    }
+
+    /// Expand a triple-click into a whole-row selection.
+    fn line_selection(&self, pane_id: usize, row: usize) -> Option<Selection> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let pane = tab.tree.find_leaf(pane_id)?;
+        let performer = pane.performer.lock().ok()?;
+        let cols = performer.grid.cols;
+        Some(Selection {
+            pane_id,
+            mode: SelectionMode::Linear,
+            start_col: 0,
+            start_row: row,
+            end_col: cols.saturating_sub(1),
+            end_row: row,
+        })
+    }
+
     fn selected_text(&self) -> Option<String> {
         let sel = self.selection?.normalized();
         let tab = self.tabs.get(self.active_tab)?;
@@ -668,6 +757,7 @@ impl MainState {
         if sel.start_row >= grid.rows || sel.end_row >= grid.rows {
             return None;
         }
+        let offset = pane.scroll_view_offset.min(grid.scrollback_len());
         let mut out = String::new();
         for row in sel.start_row..=sel.end_row {
             let (start_col, end_col) = match sel.mode {
@@ -694,7 +784,7 @@ impl MainState {
             }
             let mut line = String::new();
             for col in start_col..=end_col {
-                line.push(grid.cell(col, row).c);
+                line.push(Self::displayed_cell(grid, offset, col, row).map_or(' ', |cell| cell.c));
             }
             if matches!(sel.mode, SelectionMode::Block) {
                 out.push_str(&line);
@@ -736,14 +826,39 @@ impl MainState {
         true
     }
 
+    /// Write user input to the active pane's PTY, returning the view to live
+    /// output and restarting the cursor blink cycle.
+    fn send_pty_input(&mut self, bytes: &[u8]) {
+        self.bump_cursor_blink();
+        let pane = self.active_pane_mut();
+        pane.scroll_view_offset = 0;
+        if let Err(err) = pane.pty.write(bytes) {
+            eprintln!("volt-ui: failed to write PTY input: {err}");
+        }
+    }
+
     fn paste_clipboard(&mut self) {
         #[cfg(target_os = "macos")]
         {
             match std::process::Command::new("pbpaste").output() {
                 Ok(output) => {
                     if output.status.success() {
-                        if let Err(err) = self.active_pane_mut().pty.write(&output.stdout) {
-                            eprintln!("volt-ui: failed to write pasted clipboard to PTY: {err}");
+                        // Never let pasted bytes terminate bracketed-paste mode early.
+                        let data = strip_bracketed_paste_end(&output.stdout);
+                        let bracketed = self
+                            .tabs
+                            .get(self.active_tab)
+                            .and_then(|t| t.active_pane().performer.lock().ok())
+                            .map(|p| p.bracketed_paste_mode())
+                            .unwrap_or(false);
+                        if bracketed {
+                            let mut wrapped = Vec::with_capacity(data.len() + 12);
+                            wrapped.extend_from_slice(b"\x1b[200~");
+                            wrapped.extend_from_slice(&data);
+                            wrapped.extend_from_slice(b"\x1b[201~");
+                            self.send_pty_input(&wrapped);
+                        } else {
+                            self.send_pty_input(&data);
                         }
                     } else {
                         eprintln!("volt-ui: pbpaste exited with {}", output.status);
@@ -906,15 +1021,18 @@ impl MainState {
         }
 
         // If the active pane has mouse reporting enabled, forward the wheel
-        // event to the PTY (e.g. vim, less).
-        if let Some((_mode, sgr)) = self.active_mouse_reporting() {
-            let steps = amount.abs().ceil().max(1.0) as usize;
-            let base = if amount > 0.0 { 64u8 } else { 65u8 };
-            let cb = base.saturating_add(self.mouse_modifier_bits());
-            for _ in 0..steps {
-                self.write_mouse_report(cb, col, row, false, sgr);
+        // event to the PTY (e.g. vim, less). Shift bypasses so the user can
+        // always reach the local scrollback view.
+        if !self.shift_down() {
+            if let Some((_mode, sgr)) = self.active_mouse_reporting() {
+                let steps = amount.abs().ceil().max(1.0) as usize;
+                let base = if amount > 0.0 { 64u8 } else { 65u8 };
+                let cb = base.saturating_add(self.mouse_modifier_bits());
+                for _ in 0..steps {
+                    self.write_mouse_report(cb, col, row, false, sgr);
+                }
+                return true;
             }
-            return true;
         }
 
         // No mouse reporting — scroll the scrollback view instead.
@@ -926,12 +1044,19 @@ impl MainState {
             .ok()
             .map(|p| p.grid.scrollback_len())
             .unwrap_or(0);
+        let old_offset = pane.scroll_view_offset;
         if amount > 0.0 {
             // Scroll up: reveal older lines.
             pane.scroll_view_offset = (pane.scroll_view_offset + steps).min(scrollback_len);
         } else {
             // Scroll down: return toward live output.
             pane.scroll_view_offset = pane.scroll_view_offset.saturating_sub(steps);
+        }
+        let new_offset = pane.scroll_view_offset;
+        if new_offset != old_offset && self.selection.is_some() {
+            // The view shifted under the selection; its coordinates no longer
+            // match what is displayed, so drop it.
+            self.selection = None;
         }
         true
     }
@@ -1048,7 +1173,7 @@ impl App {
             }
         };
 
-        let state = MainState {
+        let mut state = MainState {
             id,
             window,
             renderer,
@@ -1083,6 +1208,10 @@ impl App {
             divider_drag: None,
             divider_hover_id: None,
             chat_panel: ChatPanel::new(),
+            last_click: None,
+            click_count: 0,
+            #[cfg(target_os = "macos")]
+            last_native_title: String::new(),
         };
         state
             .window
@@ -1324,7 +1453,9 @@ impl ApplicationHandler<VoltEvent> for App {
                     let cell = state.pane_cell_from_mouse(state.mouse_pos.0, state.mouse_pos.1);
                     if let Some((pane_id, col, row)) = cell {
                         if pane_id == state.active_tab().tree.active_id {
-                            if state.last_reported_mouse_cell != Some((col, row)) {
+                            if !state.shift_down()
+                                && state.last_reported_mouse_cell != Some((col, row))
+                            {
                                 let _ = state.report_mouse_motion(col, row);
                                 state.last_reported_mouse_cell = Some((col, row));
                             }
@@ -1403,7 +1534,10 @@ impl ApplicationHandler<VoltEvent> for App {
 
                 if let Some((pane_id, col, row)) = state.pane_cell_from_mouse(mx, my) {
                     state.active_tab_mut().tree.active_id = pane_id;
-                    if state.report_mouse_button(button, btn_state, col, row) {
+                    // Shift bypasses app mouse reporting so selection still works
+                    // inside TUIs (standard xterm behaviour).
+                    if !state.shift_down() && state.report_mouse_button(button, btn_state, col, row)
+                    {
                         return;
                     }
                 }
@@ -1412,7 +1546,25 @@ impl ApplicationHandler<VoltEvent> for App {
                     if btn_state == ElementState::Pressed {
                         if let Some((pane_id, col, row)) = state.pane_cell_from_mouse(mx, my) {
                             state.active_tab_mut().tree.active_id = pane_id;
-                            state.selection = Some(Selection {
+                            let now = Instant::now();
+                            let same_spot = state.last_click.is_some_and(|(t, p, c, r)| {
+                                now.duration_since(t) < MULTI_CLICK_INTERVAL
+                                    && p == pane_id
+                                    && c == col
+                                    && r == row
+                            });
+                            state.click_count = if same_spot {
+                                (state.click_count % 3) + 1
+                            } else {
+                                1
+                            };
+                            state.last_click = Some((now, pane_id, col, row));
+                            let expanded = match state.click_count {
+                                2 => state.word_selection(pane_id, col, row),
+                                3 => state.line_selection(pane_id, row),
+                                _ => None,
+                            };
+                            state.selection = Some(expanded.unwrap_or(Selection {
                                 pane_id,
                                 mode: if state.modifiers.alt_key() {
                                     SelectionMode::Block
@@ -1423,8 +1575,10 @@ impl ApplicationHandler<VoltEvent> for App {
                                 start_row: row,
                                 end_col: col,
                                 end_row: row,
-                            });
-                            state.is_drag_selecting = true;
+                            }));
+                            // Word/line selections stay fixed; only single clicks
+                            // start a drag so trackpad jitter can't collapse them.
+                            state.is_drag_selecting = state.click_count == 1;
                             state.begin_redraw();
                         }
                     } else {
@@ -1535,9 +1689,6 @@ impl ApplicationHandler<VoltEvent> for App {
                 if key_state != ElementState::Pressed {
                     return;
                 }
-                // Any key press returns the view to live output.
-                state.active_pane_mut().scroll_view_offset = 0;
-                state.bump_cursor_blink();
 
                 let ctrl = state.ctrl_down();
                 let super_key = state.super_down();
@@ -1701,12 +1852,11 @@ impl ApplicationHandler<VoltEvent> for App {
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyC) => {
-                            if !state.copy_selection() {
-                                if let Err(err) = state.active_pane_mut().pty.write(&[0x03]) {
-                                    eprintln!("volt-ui: failed to send Ctrl+C to PTY: {err}");
-                                }
+                            // Copy only — never fall back to SIGINT; a missed
+                            // selection must not interrupt a running process.
+                            if state.copy_selection() {
+                                state.begin_redraw();
                             }
-                            state.begin_redraw();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyV) => {
@@ -1714,48 +1864,103 @@ impl ApplicationHandler<VoltEvent> for App {
                             state.begin_redraw();
                             return;
                         }
-                        PhysicalKey::Code(KeyCode::Digit1) => {
-                            state.switch_tab(0);
+                        PhysicalKey::Code(KeyCode::KeyQ) => {
+                            event_loop.exit();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyN) => {
+                            #[cfg(target_os = "macos")]
+                            {
+                                if let Some(proxy) = self.proxy.as_ref() {
+                                    let _ = proxy.send_event(VoltEvent::CreateNewWindow);
+                                }
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                state.new_tab();
+                                state.begin_redraw();
+                            }
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyK) => {
+                            // Clear screen and scrollback, then ask the shell to
+                            // repaint its prompt (form feed).
+                            {
+                                let pane = state.active_pane_mut();
+                                pane.scroll_view_offset = 0;
+                                match pane.performer.lock() {
+                                    Ok(mut p) => {
+                                        p.grid.clear_scrollback();
+                                        p.grid.clear_screen();
+                                    }
+                                    Err(err) => eprintln!(
+                                        "volt-ui: failed to lock performer for clear: {err}"
+                                    ),
+                                }
+                            }
+                            state.selection = None;
+                            state.send_pty_input(&[0x0c]);
                             state.begin_redraw();
                             return;
                         }
-                        PhysicalKey::Code(KeyCode::Digit2) => {
-                            state.switch_tab(1);
+                        PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                            // macOS line-start convention → readline beginning-of-line.
+                            state.send_pty_input(&[0x01]);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowRight) => {
+                            // macOS line-end convention → readline end-of-line.
+                            state.send_pty_input(&[0x05]);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Backspace) => {
+                            // macOS delete-to-line-start → readline unix-line-discard.
+                            state.send_pty_input(&[0x15]);
+                            return;
+                        }
+                        PhysicalKey::Code(
+                            code @ (KeyCode::Digit1
+                            | KeyCode::Digit2
+                            | KeyCode::Digit3
+                            | KeyCode::Digit4
+                            | KeyCode::Digit5
+                            | KeyCode::Digit6
+                            | KeyCode::Digit7
+                            | KeyCode::Digit8
+                            | KeyCode::Digit9),
+                        ) => {
+                            let idx = match code {
+                                KeyCode::Digit1 => 0,
+                                KeyCode::Digit2 => 1,
+                                KeyCode::Digit3 => 2,
+                                KeyCode::Digit4 => 3,
+                                KeyCode::Digit5 => 4,
+                                KeyCode::Digit6 => 5,
+                                KeyCode::Digit7 => 6,
+                                KeyCode::Digit8 => 7,
+                                _ => 8,
+                            };
+                            state.switch_tab(idx);
                             state.begin_redraw();
                             return;
                         }
-                        PhysicalKey::Code(KeyCode::Digit3) => {
-                            state.switch_tab(2);
-                            state.begin_redraw();
+                        _ => {}
+                    }
+                    // Swallow any unhandled Cmd combination — without this the
+                    // text fallthrough below types the bare letter into the shell.
+                    return;
+                }
+
+                if ctrl && shift {
+                    match physical_key {
+                        PhysicalKey::Code(KeyCode::KeyC) => {
+                            if state.copy_selection() {
+                                state.begin_redraw();
+                            }
                             return;
                         }
-                        PhysicalKey::Code(KeyCode::Digit4) => {
-                            state.switch_tab(3);
-                            state.begin_redraw();
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::Digit5) => {
-                            state.switch_tab(4);
-                            state.begin_redraw();
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::Digit6) => {
-                            state.switch_tab(5);
-                            state.begin_redraw();
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::Digit7) => {
-                            state.switch_tab(6);
-                            state.begin_redraw();
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::Digit8) => {
-                            state.switch_tab(7);
-                            state.begin_redraw();
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::Digit9) => {
-                            state.switch_tab(8);
+                        PhysicalKey::Code(KeyCode::KeyV) => {
+                            state.paste_clipboard();
                             state.begin_redraw();
                             return;
                         }
@@ -1814,9 +2019,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     ) {
                         state.active_pane_mut().running = true;
                     }
-                    if let Err(err) = state.active_pane_mut().pty.write(&bytes) {
-                        eprintln!("volt-ui: failed to write PTY input: {err}");
-                    }
+                    state.send_pty_input(&bytes);
                     return;
                 }
 
@@ -1828,25 +2031,19 @@ impl ApplicationHandler<VoltEvent> for App {
                                 bytes.push(0x1b);
                             }
                             bytes.push(b);
-                            if let Err(err) = state.active_pane_mut().pty.write(&bytes) {
-                                eprintln!("volt-ui: failed to write PTY control input: {err}");
-                            }
+                            state.send_pty_input(&bytes);
                             return;
                         }
                     }
                 }
 
                 if let Some(text) = text {
-                    if let Err(err) = state.active_pane_mut().pty.write(text.as_str().as_bytes()) {
-                        eprintln!("volt-ui: failed to write PTY text input: {err}");
-                    }
+                    state.send_pty_input(text.as_str().as_bytes());
                     return;
                 }
 
                 if let Some(fallback_text) = logical_key.to_text() {
-                    if let Err(err) = state.active_pane_mut().pty.write(fallback_text.as_bytes()) {
-                        eprintln!("volt-ui: failed to write PTY fallback input: {err}");
-                    }
+                    state.send_pty_input(fallback_text.as_bytes());
                 }
             }
 
@@ -1950,7 +2147,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         .collect();
                     #[cfg(target_os = "macos")]
                     if let Some(active_title) = tab_titles.get(state.active_tab) {
-                        state.window.set_title(active_title);
+                        state.set_window_title_cached(active_title);
                     }
 
                     let Some((render_grid, render_cursor_visible)) =
@@ -1960,7 +2157,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         return;
                     };
                     let damage_rows = state.take_render_damage_rows();
-                    let mut dividers: Vec<volt_renderer::PaneDivider> = state
+                    let dividers: Vec<volt_renderer::PaneDivider> = state
                         .active_tab_dividers()
                         .into_iter()
                         .map(|d| d.phys)
@@ -2152,6 +2349,35 @@ impl ApplicationHandler<VoltEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
+}
+
+/// Character class used for double-click word selection: 0 = whitespace,
+/// 1 = word characters (incl. common path/URL chars), 2 = other punctuation.
+fn char_select_class(c: char) -> u8 {
+    if c == ' ' {
+        0
+    } else if c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | ':' | '@' | '+') {
+        1
+    } else {
+        2
+    }
+}
+
+/// Remove any embedded bracketed-paste terminator so pasted content cannot
+/// break out of the ESC[200~ … ESC[201~ envelope.
+fn strip_bracketed_paste_end(data: &[u8]) -> Vec<u8> {
+    const END: &[u8] = b"\x1b[201~";
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i..].starts_with(END) {
+            i += END.len();
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn xterm_modifier_param(shift: bool, alt: bool, ctrl: bool) -> Option<u8> {
