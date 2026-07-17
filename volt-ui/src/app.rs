@@ -817,6 +817,8 @@ impl MainState {
                 Err(err) => eprintln!("volt-ui: failed to launch pbcopy: {err}"),
             }
         }
+        #[cfg(not(target_os = "macos"))]
+        let _ = text;
         self.selection = None;
         true
     }
@@ -1168,6 +1170,7 @@ impl App {
             }
         };
 
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut state = MainState {
             id,
             window,
@@ -1283,7 +1286,7 @@ impl ApplicationHandler<VoltEvent> for App {
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: VoltEvent) {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: VoltEvent) {
         match event {
             VoltEvent::PtyData => {
                 self.pty_wake_pending.store(false, Ordering::Release);
@@ -1301,7 +1304,7 @@ impl ApplicationHandler<VoltEvent> for App {
             }
             #[cfg(target_os = "macos")]
             VoltEvent::CreateNewWindow => {
-                let _ = self.create_main_window(event_loop, None);
+                let _ = self.create_main_window(_event_loop, None);
             }
         }
     }
@@ -2050,41 +2053,40 @@ impl ApplicationHandler<VoltEvent> for App {
 
                 for (i, tab) in state.tabs.iter_mut().enumerate() {
                     let mut pty_errors: Vec<String> = Vec::new();
-                    tab.tree.for_each_leaf_mut(&mut |pane_id, pane| loop {
-                        let Some(ev) = pane.event_rx.try_recv().ok() else {
-                            break;
-                        };
-                        match ev {
-                            CoreEvent::GridUpdated { damaged_rows } => {
-                                if i == active {
-                                    if let Some((start, end)) = damaged_rows {
-                                        pending_partial_damage =
-                                            Some(match pending_partial_damage {
-                                                Some((cur_start, cur_end)) => {
-                                                    (cur_start.min(start), cur_end.max(end))
-                                                }
-                                                None => (start, end),
-                                            });
-                                    } else {
-                                        needs_full_redraw = true;
+                    tab.tree.for_each_leaf_mut(&mut |pane_id, pane| {
+                        while let Ok(ev) = pane.event_rx.try_recv() {
+                            match ev {
+                                CoreEvent::GridUpdated { damaged_rows } => {
+                                    if i == active {
+                                        if let Some((start, end)) = damaged_rows {
+                                            pending_partial_damage =
+                                                Some(match pending_partial_damage {
+                                                    Some((cur_start, cur_end)) => {
+                                                        (cur_start.min(start), cur_end.max(end))
+                                                    }
+                                                    None => (start, end),
+                                                });
+                                        } else {
+                                            needs_full_redraw = true;
+                                        }
                                     }
                                 }
-                            }
-                            CoreEvent::CwdChanged(path) => {
-                                pane.cwd = Some(path);
-                            }
-                            CoreEvent::TitleChanged(t) => {
-                                pane.title = t;
-                            }
-                            CoreEvent::CommandFinished { .. } => {
-                                pane.running = false;
-                            }
-                            CoreEvent::PtyError(msg) => {
-                                if i == active {
-                                    pty_errors.push(msg);
+                                CoreEvent::CwdChanged(path) => {
+                                    pane.cwd = Some(path);
                                 }
+                                CoreEvent::TitleChanged(t) => {
+                                    pane.title = t;
+                                }
+                                CoreEvent::CommandFinished { .. } => {
+                                    pane.running = false;
+                                }
+                                CoreEvent::PtyError(msg) => {
+                                    if i == active {
+                                        pty_errors.push(msg);
+                                    }
+                                }
+                                CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                             }
-                            CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                         }
                     });
                     // Process PtyErrors after the borrow on tab.tree is released.
@@ -2222,50 +2224,49 @@ impl ApplicationHandler<VoltEvent> for App {
             if !state.redraw_pending {
                 for (i, tab) in state.tabs.iter_mut().enumerate() {
                     let mut pty_errors: Vec<String> = Vec::new();
-                    tab.tree.for_each_leaf_mut(&mut |pane_id, pane| loop {
-                        let Some(ev) = pane.event_rx.try_recv().ok() else {
-                            break;
-                        };
-                        match ev {
-                            CoreEvent::GridUpdated { damaged_rows } => {
-                                if i == active {
-                                    needs_redraw = true;
-                                    if let Some((start, end)) = damaged_rows {
-                                        pending_partial_damage =
-                                            Some(match pending_partial_damage {
-                                                Some((cur_start, cur_end)) => {
-                                                    (cur_start.min(start), cur_end.max(end))
-                                                }
-                                                None => (start, end),
-                                            });
-                                    } else {
+                    tab.tree.for_each_leaf_mut(&mut |pane_id, pane| {
+                        while let Ok(ev) = pane.event_rx.try_recv() {
+                            match ev {
+                                CoreEvent::GridUpdated { damaged_rows } => {
+                                    if i == active {
+                                        needs_redraw = true;
+                                        if let Some((start, end)) = damaged_rows {
+                                            pending_partial_damage =
+                                                Some(match pending_partial_damage {
+                                                    Some((cur_start, cur_end)) => {
+                                                        (cur_start.min(start), cur_end.max(end))
+                                                    }
+                                                    None => (start, end),
+                                                });
+                                        } else {
+                                            needs_full_redraw = true;
+                                        }
+                                    }
+                                }
+                                CoreEvent::CwdChanged(path) => {
+                                    pane.cwd = Some(path);
+                                    if i == active || show_tab_chrome {
+                                        needs_redraw = true;
                                         needs_full_redraw = true;
                                     }
                                 }
-                            }
-                            CoreEvent::CwdChanged(path) => {
-                                pane.cwd = Some(path);
-                                if i == active || show_tab_chrome {
-                                    needs_redraw = true;
-                                    needs_full_redraw = true;
+                                CoreEvent::TitleChanged(t) => {
+                                    pane.title = t;
+                                    if i == active || show_tab_chrome {
+                                        needs_redraw = true;
+                                        needs_full_redraw = true;
+                                    }
                                 }
-                            }
-                            CoreEvent::TitleChanged(t) => {
-                                pane.title = t;
-                                if i == active || show_tab_chrome {
-                                    needs_redraw = true;
-                                    needs_full_redraw = true;
+                                CoreEvent::CommandFinished { .. } => {
+                                    pane.running = false;
                                 }
-                            }
-                            CoreEvent::CommandFinished { .. } => {
-                                pane.running = false;
-                            }
-                            CoreEvent::PtyError(msg) => {
-                                if i == active {
-                                    pty_errors.push(msg);
+                                CoreEvent::PtyError(msg) => {
+                                    if i == active {
+                                        pty_errors.push(msg);
+                                    }
                                 }
+                                CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                             }
-                            CoreEvent::PtyClosed => closed_panes.push((i, pane_id)),
                         }
                     });
                     // Process PtyErrors after the borrow on tab.tree is released.
@@ -2358,6 +2359,7 @@ fn char_select_class(c: char) -> u8 {
 
 /// Remove any embedded bracketed-paste terminator so pasted content cannot
 /// break out of the ESC[200~ … ESC[201~ envelope.
+#[cfg(target_os = "macos")]
 fn strip_bracketed_paste_end(data: &[u8]) -> Vec<u8> {
     const END: &[u8] = b"\x1b[201~";
     let mut out = Vec::with_capacity(data.len());
