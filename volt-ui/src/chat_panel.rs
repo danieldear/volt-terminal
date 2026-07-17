@@ -74,11 +74,7 @@ impl ChatPanel {
     /// Toggle visibility; clears input focus when hiding.
     pub fn toggle(&mut self) {
         self.visible = !self.visible;
-        if !self.visible {
-            self.focused = false;
-        } else {
-            self.focused = true;
-        }
+        self.focused = self.visible;
     }
 
     /// Returns the panel width to subtract from the terminal viewport, or 0 if hidden.

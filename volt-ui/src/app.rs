@@ -417,10 +417,10 @@ impl MainState {
                 // Immediately resize all surviving panes so PTYs know their new geometry.
                 self.resize_all_tabs_to_current_grid();
                 // Invalidate any selection that pointed at the removed pane.
-                if self.selection.map_or(false, |s| {
+                if self.selection.is_some_and(|s| {
                     self.tabs
                         .get(tab_idx)
-                        .map_or(true, |t| t.tree.find_leaf(s.pane_id).is_none())
+                        .is_none_or(|t| t.tree.find_leaf(s.pane_id).is_none())
                 }) {
                     self.selection = None;
                 }
@@ -519,15 +519,14 @@ impl MainState {
                     &mut out, grid, rect.col, rect.row, rect.rows, offset,
                 );
             }
-            if rect.id == active_id {
-                if offset == 0 {
-                    active_cursor_visible = performer.cursor_visible;
-                    out.cursor_col =
-                        (rect.col + grid.cursor_col).min(rect.col + rect.cols.saturating_sub(1));
-                    out.cursor_row =
-                        (rect.row + grid.cursor_row).min(rect.row + rect.rows.saturating_sub(1));
-                }
-                // When scrolled back, hide the cursor — the user is viewing history.
+            // Only show the active cursor in the live view; when scrolled back,
+            // hide it because the user is viewing history.
+            if rect.id == active_id && offset == 0 {
+                active_cursor_visible = performer.cursor_visible;
+                out.cursor_col =
+                    (rect.col + grid.cursor_col).min(rect.col + rect.cols.saturating_sub(1));
+                out.cursor_row =
+                    (rect.row + grid.cursor_row).min(rect.row + rect.rows.saturating_sub(1));
             }
         }
 
@@ -674,12 +673,12 @@ impl MainState {
 
     /// Cell at a displayed (viewport) position, accounting for the pane's
     /// scrollback view offset — mirrors `blit_grid_with_scrollback`.
-    fn displayed_cell<'a>(
-        grid: &'a Grid,
+    fn displayed_cell(
+        grid: &Grid,
         offset: usize,
         col: usize,
         row: usize,
-    ) -> Option<&'a volt_core::cell::Cell> {
+    ) -> Option<&volt_core::cell::Cell> {
         if col >= grid.cols || row >= grid.rows {
             return None;
         }
@@ -1486,13 +1485,11 @@ impl ApplicationHandler<VoltEvent> for App {
                 }
 
                 // Divider drag: release
-                if btn_state == ElementState::Released {
-                    if state.divider_drag.take().is_some() {
-                        state.resize_all_tabs_to_current_grid();
-                        state.window.set_cursor(winit::window::CursorIcon::Default);
-                        state.begin_redraw();
-                        return;
-                    }
+                if btn_state == ElementState::Released && state.divider_drag.take().is_some() {
+                    state.resize_all_tabs_to_current_grid();
+                    state.window.set_cursor(winit::window::CursorIcon::Default);
+                    state.begin_redraw();
+                    return;
                 }
 
                 // Divider drag: press

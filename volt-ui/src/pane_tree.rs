@@ -107,6 +107,7 @@ impl PaneTree {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn dividers_with_ids(
         &self,
         cols: usize,
@@ -170,6 +171,7 @@ impl PaneTree {
 
     /// Apply an **absolute** ratio from `start_ratio + total_delta_px / local_span_px`.
     /// Uses local (sub-tree) dimensions, so nested splits are handled correctly.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_ratio_from_drag(
         &mut self,
         divider_id: usize,
@@ -270,6 +272,7 @@ fn layout_node(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dividers_node(
     node: &PaneNode,
     base_col: usize,
@@ -609,6 +612,7 @@ fn get_ratio_node(node: &PaneNode, target: usize) -> Option<f32> {
 
 /// Set ratio absolutely: `new_ratio = (start_ratio + delta_px / local_span_px).clamp(0.1, 0.9)`.
 /// Recurses with local sub-rect dimensions so nested splits are handled correctly.
+#[allow(clippy::too_many_arguments)]
 fn set_ratio_from_drag_node(
     node: &mut PaneNode,
     target_divider_id: usize,

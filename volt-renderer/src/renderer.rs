@@ -811,6 +811,7 @@ impl Renderer {
         ]);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_text_with_line_height(
         &mut self,
         glyphs: &mut Vec<GlyphVertex>,
@@ -1017,6 +1018,7 @@ impl Renderer {
 
     // ── main terminal render entry point ────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &mut self,
         grid: &Grid,

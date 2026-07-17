@@ -35,6 +35,25 @@ pub struct Grid {
     blank_row: Vec<Cell>,
 }
 
+struct ReflowSource<'a> {
+    cells: &'a [Cell],
+    row_map: &'a [usize],
+    soft_wrapped: &'a [bool],
+    cols: usize,
+    rows: usize,
+}
+
+struct ReflowTarget {
+    cols: usize,
+    rows: usize,
+}
+
+struct CursorSnapshot {
+    row: usize,
+    col: usize,
+    had_pending_wrap: bool,
+}
+
 impl Grid {
     pub fn new(cols: usize, rows: usize) -> Self {
         Self {
@@ -117,30 +136,22 @@ impl Grid {
     }
 
     fn reflow_visible_rows(
-        old_cells: &[Cell],
-        old_row_map: &[usize],
-        old_soft_wrapped: &[bool],
-        old_cols: usize,
-        old_rows: usize,
-        new_cols: usize,
-        new_rows: usize,
-        old_cursor_row: usize,
-        old_cursor_col: usize,
-        had_pending_wrap: bool,
+        source: ReflowSource<'_>,
+        target: ReflowTarget,
+        cursor: CursorSnapshot,
     ) -> (Vec<Cell>, Vec<bool>, usize, usize, bool) {
-        let mut new_cells = vec![Cell::default(); new_cols * new_rows];
-        let mut new_soft_wrapped = vec![false; new_rows];
-        if old_cols == 0 || old_rows == 0 || new_cols == 0 || new_rows == 0 {
+        let mut new_cells = vec![Cell::default(); target.cols * target.rows];
+        let mut new_soft_wrapped = vec![false; target.rows];
+        if source.cols == 0 || source.rows == 0 || target.cols == 0 || target.rows == 0 {
             return (new_cells, new_soft_wrapped, 0, 0, false);
         }
 
-        let mut visual_rows = Vec::with_capacity(old_rows);
-        let mut visual_wraps = Vec::with_capacity(old_rows);
-        for row in 0..old_rows {
-            let physical = old_row_map[row];
-            let src = physical * old_cols;
-            visual_rows.push(old_cells[src..src + old_cols].to_vec());
-            visual_wraps.push(old_soft_wrapped[physical]);
+        let mut visual_rows = Vec::with_capacity(source.rows);
+        let mut visual_wraps = Vec::with_capacity(source.rows);
+        for &physical in source.row_map.iter().take(source.rows) {
+            let src = physical * source.cols;
+            visual_rows.push(source.cells[src..src + source.cols].to_vec());
+            visual_wraps.push(source.soft_wrapped[physical]);
         }
 
         let mut logical_lines: Vec<Vec<Cell>> = Vec::new();
@@ -148,14 +159,16 @@ impl Grid {
         let mut line_idx = 0usize;
         let mut cursor_line_idx = 0usize;
         let mut cursor_offset = 0usize;
-        for row in 0..old_rows {
-            if row == old_cursor_row {
+        for (row, (row_cells, &row_wraps)) in
+            visual_rows.iter().zip(visual_wraps.iter()).enumerate()
+        {
+            if row == cursor.row {
                 cursor_line_idx = line_idx;
-                cursor_offset = current.len() + old_cursor_col + usize::from(had_pending_wrap);
+                cursor_offset = current.len() + cursor.col + usize::from(cursor.had_pending_wrap);
             }
-            current.extend_from_slice(&visual_rows[row]);
-            let has_next = row + 1 < old_rows;
-            let is_wrapped = has_next && visual_wraps[row];
+            current.extend_from_slice(row_cells);
+            let has_next = row + 1 < source.rows;
+            let is_wrapped = has_next && row_wraps;
             if !is_wrapped {
                 logical_lines.push(std::mem::take(&mut current));
                 line_idx += 1;
@@ -181,13 +194,13 @@ impl Grid {
                 line_len = line_len.max(cursor_offset.min(line.len()));
             }
             if line_len == 0 {
-                virtual_rows.push(vec![Cell::default(); new_cols]);
+                virtual_rows.push(vec![Cell::default(); target.cols]);
                 virtual_wraps.push(false);
             } else {
                 let mut offset = 0usize;
                 while offset < line_len {
-                    let take = (line_len - offset).min(new_cols);
-                    let mut row_cells = vec![Cell::default(); new_cols];
+                    let take = (line_len - offset).min(target.cols);
+                    let mut row_cells = vec![Cell::default(); target.cols];
                     row_cells[..take].copy_from_slice(&line[offset..offset + take]);
                     virtual_rows.push(row_cells);
                     virtual_wraps.push(offset + take < line_len);
@@ -199,52 +212,54 @@ impl Grid {
                 continue;
             }
             let cursor_pos = cursor_offset.min(line_len);
-            let mut row_in_line = cursor_pos / new_cols;
-            let mut col_in_line = cursor_pos % new_cols;
+            let mut row_in_line = cursor_pos / target.cols;
+            let mut col_in_line = cursor_pos % target.cols;
             cursor_pending_wrap = false;
-            if had_pending_wrap && cursor_pos > 0 && col_in_line == 0 {
+            if cursor.had_pending_wrap && cursor_pos > 0 && col_in_line == 0 {
                 row_in_line = row_in_line.saturating_sub(1);
-                col_in_line = new_cols - 1;
+                col_in_line = target.cols - 1;
                 cursor_pending_wrap = true;
             }
             cursor_virtual_row = line_start + row_in_line;
-            cursor_virtual_col = col_in_line.min(new_cols - 1);
+            cursor_virtual_col = col_in_line.min(target.cols - 1);
         }
 
         if virtual_rows.is_empty() {
-            virtual_rows.push(vec![Cell::default(); new_cols]);
+            virtual_rows.push(vec![Cell::default(); target.cols]);
             virtual_wraps.push(false);
         }
         if cursor_virtual_row >= virtual_rows.len() {
             cursor_virtual_row = virtual_rows.len() - 1;
-            cursor_virtual_col = cursor_virtual_col.min(new_cols - 1);
+            cursor_virtual_col = cursor_virtual_col.min(target.cols - 1);
             cursor_pending_wrap = false;
         }
 
         // Keep as much history as possible while ensuring the cursor stays visible.
         let mut window_start = cursor_virtual_row
             .saturating_add(1)
-            .saturating_sub(new_rows);
-        if window_start + new_rows > virtual_rows.len() {
-            window_start = virtual_rows.len().saturating_sub(new_rows);
+            .saturating_sub(target.rows);
+        if window_start + target.rows > virtual_rows.len() {
+            window_start = virtual_rows.len().saturating_sub(target.rows);
         }
 
-        for dst_row in 0..new_rows {
-            let src_row = window_start + dst_row;
-            if src_row >= virtual_rows.len() {
-                break;
-            }
-            let dst = dst_row * new_cols;
-            new_cells[dst..dst + new_cols].copy_from_slice(&virtual_rows[src_row]);
-            new_soft_wrapped[dst_row] = virtual_wraps[src_row];
+        for (dst_row, (row_cells, &wrapped)) in virtual_rows
+            .iter()
+            .zip(virtual_wraps.iter())
+            .skip(window_start)
+            .take(target.rows)
+            .enumerate()
+        {
+            let dst = dst_row * target.cols;
+            new_cells[dst..dst + target.cols].copy_from_slice(row_cells);
+            new_soft_wrapped[dst_row] = wrapped;
         }
 
         let mut new_cursor_row = cursor_virtual_row.saturating_sub(window_start);
-        if new_cursor_row >= new_rows {
-            new_cursor_row = new_rows - 1;
+        if new_cursor_row >= target.rows {
+            new_cursor_row = target.rows - 1;
             cursor_pending_wrap = false;
         }
-        let new_cursor_col = cursor_virtual_col.min(new_cols - 1);
+        let new_cursor_col = cursor_virtual_col.min(target.cols - 1);
         (
             new_cells,
             new_soft_wrapped,
@@ -266,16 +281,19 @@ impl Grid {
         let (new_cells, new_soft_wrapped, new_cursor_col, new_cursor_row, new_pending_wrap) =
             if cols != old_cols {
                 Grid::reflow_visible_rows(
-                    &old_cells,
-                    &old_row_map,
-                    &old_soft_wrapped,
-                    old_cols,
-                    old_rows,
-                    cols,
-                    rows,
-                    old_cursor_row,
-                    old_cursor_col,
-                    had_pending_wrap,
+                    ReflowSource {
+                        cells: &old_cells,
+                        row_map: &old_row_map,
+                        soft_wrapped: &old_soft_wrapped,
+                        cols: old_cols,
+                        rows: old_rows,
+                    },
+                    ReflowTarget { cols, rows },
+                    CursorSnapshot {
+                        row: old_cursor_row,
+                        col: old_cursor_col,
+                        had_pending_wrap,
+                    },
                 )
             } else {
                 let mut cells = vec![Cell::default(); cols * rows];
@@ -286,13 +304,13 @@ impl Grid {
                 if window_start + copy_rows > old_rows {
                     window_start = old_rows.saturating_sub(copy_rows);
                 }
-                for row in 0..copy_rows {
+                for (row, wrapped_slot) in soft_wrapped.iter_mut().take(copy_rows).enumerate() {
                     let src_row = window_start + row;
                     let old_physical = old_row_map[src_row];
                     let src = old_physical * old_cols;
                     let dst = row * cols;
                     cells[dst..dst + copy_cols].copy_from_slice(&old_cells[src..src + copy_cols]);
-                    soft_wrapped[row] = old_soft_wrapped[old_physical];
+                    *wrapped_slot = old_soft_wrapped[old_physical];
                 }
                 let mut cursor_col = old_cursor_col.min(cols.saturating_sub(1));
                 let cursor_row = old_cursor_row
