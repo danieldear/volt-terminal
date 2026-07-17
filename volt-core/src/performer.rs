@@ -37,6 +37,7 @@ pub struct Performer {
     mouse_tracking: MouseTrackingMode,
     mouse_sgr: bool,
     application_cursor_keys: bool,
+    bracketed_paste: bool,
 }
 
 impl Performer {
@@ -61,6 +62,7 @@ impl Performer {
             mouse_tracking: MouseTrackingMode::Off,
             mouse_sgr: false,
             application_cursor_keys: false,
+            bracketed_paste: false,
         }
     }
 
@@ -91,6 +93,12 @@ impl Performer {
 
     pub fn application_cursor_keys_mode(&self) -> bool {
         self.application_cursor_keys
+    }
+
+    /// Whether the application requested bracketed paste (DECSET 2004).
+    /// When enabled, pasted text must be wrapped in ESC[200~ … ESC[201~.
+    pub fn bracketed_paste_mode(&self) -> bool {
+        self.bracketed_paste
     }
 
     pub fn take_damage_rows(&mut self) -> Option<(usize, usize)> {
@@ -235,6 +243,23 @@ impl Perform for Performer {
         let old_cursor_row = self.grid.cursor_row;
         let width = char_display_width(c);
         if width == 0 {
+            // Combining mark: merge with the preceding cell when a precomposed
+            // form exists (e.g. e + U+0301 → é). Marks with no precomposed form
+            // are dropped, as the grid stores one char per cell.
+            let (col, row) = if self.grid.pending_wrap {
+                (self.grid.cursor_col, self.grid.cursor_row)
+            } else if self.grid.cursor_col > 0 {
+                (self.grid.cursor_col - 1, self.grid.cursor_row)
+            } else {
+                return;
+            };
+            if col < self.grid.cols && row < self.grid.rows {
+                let base = self.grid.cell(col, row).c;
+                if let Some(composed) = unicode_normalization::char::compose(base, c) {
+                    self.grid.cell_mut(col, row).c = composed;
+                    self.mark_dirty_row(row);
+                }
+            }
             return;
         }
 
@@ -514,6 +539,17 @@ impl Perform for Performer {
                 self.grid.scroll_down(top, bot, n);
                 self.mark_dirty_range(top, bot);
             }
+            'c' => {
+                // DA — device attributes. Programs (vim, tmux, …) send this and
+                // wait for a reply; staying silent stalls them on a timeout.
+                if intermediates.contains(&b'>') {
+                    // Secondary DA: terminal type ; firmware version ; ROM cartridge.
+                    self.pending_writes.push(b"\x1b[>1;10;0c".to_vec());
+                } else if !private && Self::param(params, 0) == 0 {
+                    // Primary DA: identify as a VT102-compatible terminal.
+                    self.pending_writes.push(b"\x1b[?6c".to_vec());
+                }
+            }
             'n' => {
                 // DSR — device status report
                 if Self::param(params, 0) == 6 {
@@ -563,6 +599,7 @@ impl Perform for Performer {
                 1002 => self.mouse_tracking = MouseTrackingMode::ButtonEvent,
                 1003 => self.mouse_tracking = MouseTrackingMode::AnyMotion,
                 1006 => self.mouse_sgr = true,
+                2004 => self.bracketed_paste = true,
                 _ => {}
             },
             'l' if private => match Self::param(params, 0) {
@@ -577,6 +614,7 @@ impl Perform for Performer {
                 }
                 1000 | 1002 | 1003 => self.mouse_tracking = MouseTrackingMode::Off,
                 1006 => self.mouse_sgr = false,
+                2004 => self.bracketed_paste = false,
                 _ => {}
             },
             'm' => {
@@ -1006,11 +1044,9 @@ mod tests {
         p.resize(24, 6);
 
         let logical_lines = collect_logical_lines(&p);
-        assert!(
-            logical_lines
-                .iter()
-                .any(|line| line.contains("Federated Learning.key"))
-        );
+        assert!(logical_lines
+            .iter()
+            .any(|line| line.contains("Federated Learning.key")));
         assert!(logical_lines.iter().any(|line| line.starts_with("$")));
     }
 
@@ -1026,11 +1062,9 @@ mod tests {
 
         let logical_lines = collect_logical_lines(&p);
 
-        assert!(
-            logical_lines
-                .iter()
-                .any(|line| line.contains("Federated Learning.key"))
-        );
+        assert!(logical_lines
+            .iter()
+            .any(|line| line.contains("Federated Learning.key")));
     }
 
     #[test]
@@ -1086,5 +1120,49 @@ mod tests {
         let mut p = Performer::new(10, 2);
         feed(&mut p, "e\u{0301}".as_bytes());
         assert_eq!(p.grid.cursor_col, 1);
+    }
+
+    #[test]
+    fn test_combining_mark_composes_with_preceding_cell() {
+        let mut p = Performer::new(10, 2);
+        feed(&mut p, "e\u{0301}".as_bytes());
+        assert_eq!(p.grid.cell(0, 0).c, 'é');
+    }
+
+    #[test]
+    fn test_combining_mark_composes_at_pending_wrap_column() {
+        let mut p = Performer::new(3, 2);
+        feed(&mut p, "abe".as_bytes());
+        assert!(p.grid.pending_wrap);
+        feed(&mut p, "\u{0301}".as_bytes());
+        assert_eq!(p.grid.cell(2, 0).c, 'é');
+        assert!(p.grid.pending_wrap);
+    }
+
+    #[test]
+    fn test_bracketed_paste_mode_toggle() {
+        let mut p = Performer::new(80, 24);
+        assert!(!p.bracketed_paste_mode());
+        feed(&mut p, b"\x1b[?2004h");
+        assert!(p.bracketed_paste_mode());
+        feed(&mut p, b"\x1b[?2004l");
+        assert!(!p.bracketed_paste_mode());
+    }
+
+    #[test]
+    fn test_primary_device_attributes_reply() {
+        let mut p = Performer::new(80, 24);
+        feed(&mut p, b"\x1b[c");
+        assert_eq!(p.pending_writes, vec![b"\x1b[?6c".to_vec()]);
+        p.pending_writes.clear();
+        feed(&mut p, b"\x1b[0c");
+        assert_eq!(p.pending_writes, vec![b"\x1b[?6c".to_vec()]);
+    }
+
+    #[test]
+    fn test_secondary_device_attributes_reply() {
+        let mut p = Performer::new(80, 24);
+        feed(&mut p, b"\x1b[>c");
+        assert_eq!(p.pending_writes, vec![b"\x1b[>1;10;0c".to_vec()]);
     }
 }
