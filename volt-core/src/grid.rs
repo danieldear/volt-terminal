@@ -75,6 +75,8 @@ struct CursorSnapshot {
 
 impl Grid {
     pub fn new(cols: usize, rows: usize) -> Self {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         Self {
             cols,
             rows,
@@ -633,6 +635,14 @@ impl Grid {
         self.dirty = vec![true; rows];
     }
 
+    /// DL deletes rows rather than scrolling terminal output into history.
+    pub(crate) fn delete_lines(&mut self, top: usize, bottom: usize, count: usize) {
+        let history_enabled = self.history_enabled;
+        self.history_enabled = false;
+        self.scroll_up(top, bottom, count);
+        self.history_enabled = history_enabled;
+    }
+
     pub fn scroll_down(&mut self, top: usize, bottom: usize, count: usize) {
         if self.cols == 0
             || self.rows == 0
@@ -852,6 +862,31 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_unicode_overwrite_reclaims_intern_pool() {
+        let mut grid = Grid::new(3, 2);
+        grid.set_scrollback_limit(4);
+        for n in 0..20_000 {
+            grid.set_grapheme(
+                0,
+                0,
+                &format!("x{}", char::from_u32(0x300 + n % 10000).unwrap()),
+                1,
+            );
+            if n % 17 == 0 {
+                grid.scroll_up(0, 1, 1);
+            }
+            assert!(
+                grid.graphemes.len() <= 1026 + 2 * (grid.cells.len() + grid.scrollback_buf.len())
+            );
+        }
+        grid.compact_graphemes();
+        assert!(grid.graphemes.len() <= grid.cells.len() + grid.scrollback_buf.len());
+        for row in 0..grid.rows {
+            assert!(!grid.row_text(grid.row_cells(row)).contains('\u{fffd}'));
+        }
+    }
 
     #[test]
     fn grapheme_width_changes_repair_partners() {

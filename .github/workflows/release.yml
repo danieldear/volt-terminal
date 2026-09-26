@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,6 +23,7 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -34,13 +35,13 @@ jobs:
             label: macOS app
             package: macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install Linux deps
         if: matrix.package == 'linux'
@@ -85,15 +86,17 @@ jobs:
         if: matrix.package == 'macos'
         run: scripts/macos/build_app.sh --release
 
-      - name: Ad-hoc sign and validate macOS app bundle
+      - name: Sign and optionally notarize macOS app
         if: matrix.package == 'macos'
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -x target/macos/Volt.app/Contents/MacOS/Volt
-          plutil -lint target/macos/Volt.app/Contents/Info.plist
-          codesign --force --deep --sign - target/macos/Volt.app
-          codesign --verify --deep --strict --verbose=2 target/macos/Volt.app
+        env:
+          MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE || 'adhoc' }}
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: scripts/macos/ci_sign_app.sh target/macos/Volt.app
 
       - name: Package macOS app bundle
         if: matrix.package == 'macos'
@@ -108,23 +111,25 @@ jobs:
             "dist/Volt-${safe_tag}-macos-${arch}.zip"
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.package }}
           path: dist/*
           if-no-files-found: error
 
   publish:
+    permissions:
+      contents: write
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
@@ -142,15 +147,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          case "$(cat dist/macos-signing-status.txt)" in
+            notarized) signing_note="macOS artifact is Developer ID signed, notarized, and stapled." ;;
+            adhoc) signing_note="macOS artifact is ad-hoc signed, NOT Developer ID signed or notarized." ;;
+            *) echo "Invalid signing status" >&2; exit 1 ;;
+          esac
           cat > release-notes.md <<EOF
           Automated Volt release for ${RELEASE_TAG}.
 
           Artifacts:
           - Linux release binary tarball
-          - macOS Volt.app zip archive, ad-hoc signed for archive integrity
+          - macOS Volt.app zip archive
           - SHA256SUMS.txt
 
-          Note: macOS artifacts are not Developer ID signed or notarized yet.
+          ${signing_note}
           EOF
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then

@@ -6,10 +6,13 @@ rust-version.workspace = true
 
 [dependencies]
 vte = "0.15"
-portable-pty = "0.8"
+portable-pty = "0.9"
 tokio = { workspace = true, features = ["rt", "sync", "io-util"] }
 anyhow = { workspace = true }
 volt-config = { path = "../volt-config" }
 unicode-width = "0.2"
 unicode-normalization = "0.1"
 unicode-segmentation = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

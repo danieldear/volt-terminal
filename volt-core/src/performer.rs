@@ -16,12 +16,23 @@ pub enum MouseTrackingMode {
     AnyMotion,
 }
 
+#[derive(Clone, Copy, Default)]
+struct SavedCursor {
+    col: usize,
+    row: usize,
+    attrs: Cell,
+    origin: bool,
+    pending_wrap: bool,
+}
+
 pub struct Performer {
     pub grid: Grid,
     use_alt_screen: bool,
     alt_grid: Grid,
-    saved_cursor_col: usize,
-    saved_cursor_row: usize,
+    saved_cursors: [SavedCursor; 2],
+    main_return: SavedCursor,
+    origin_mode: bool,
+    autowrap: bool,
     current_fg: CellColor,
     current_bg: CellColor,
     current_bold: bool,
@@ -47,8 +58,10 @@ impl Performer {
             grid: Grid::new(cols, rows),
             use_alt_screen: false,
             alt_grid: Grid::new_alt(cols, rows),
-            saved_cursor_col: 0,
-            saved_cursor_row: 0,
+            saved_cursors: [SavedCursor::default(); 2],
+            main_return: SavedCursor::default(),
+            origin_mode: false,
+            autowrap: true,
             current_fg: CellColor::Default,
             current_bg: CellColor::Default,
             current_bold: false,
@@ -72,8 +85,9 @@ impl Performer {
         self.grid.resize(cols, rows);
         self.alt_grid.resize(cols, rows);
         if self.use_alt_screen {
-            self.saved_cursor_col = self.alt_grid.cursor_col;
-            self.saved_cursor_row = self.alt_grid.cursor_row;
+            self.main_return.col = self.alt_grid.cursor_col;
+            self.main_return.row = self.alt_grid.cursor_row;
+            self.main_return.pending_wrap = self.alt_grid.pending_wrap;
         }
     }
 
@@ -143,7 +157,11 @@ impl Performer {
             return false;
         }
         let intrinsic_width = UnicodeWidthStr::width(text.as_str()).clamp(1, 2);
-        let width = intrinsic_width.min(self.grid.cols);
+        let width = intrinsic_width.min(if self.autowrap {
+            self.grid.cols
+        } else {
+            self.grid.cols - col
+        });
         let old_width = previous.width();
         let mut target_col = col;
         let mut target_row = row;
@@ -271,8 +289,10 @@ impl Performer {
         self.grid.scrollback_limit = scrollback_limit;
         self.alt_grid = Grid::new_alt(cols, rows);
         self.alt_grid.scrollback_limit = scrollback_limit;
-        self.saved_cursor_col = 0;
-        self.saved_cursor_row = 0;
+        self.saved_cursors = [SavedCursor::default(); 2];
+        self.main_return = SavedCursor::default();
+        self.origin_mode = false;
+        self.autowrap = true;
         self.reset_attrs();
         self.cursor_visible = true;
         self.pending_writes.clear();
@@ -283,18 +303,97 @@ impl Performer {
         self.mark_dirty_all();
     }
 
+    fn cursor_snapshot(&self) -> SavedCursor {
+        SavedCursor {
+            col: self.grid.cursor_col,
+            row: self.grid.cursor_row,
+            attrs: self.make_cell(' '),
+            origin: self.origin_mode,
+            pending_wrap: self.grid.pending_wrap,
+        }
+    }
+
+    fn restore_snapshot(&mut self, saved: SavedCursor) {
+        self.origin_mode = saved.origin;
+        self.grid.cursor_col = saved.col.min(self.grid.cols - 1);
+        self.grid.cursor_row = saved.row.min(self.grid.rows - 1);
+        if self.origin_mode {
+            self.grid.cursor_row = self
+                .grid
+                .cursor_row
+                .clamp(self.grid.scroll_top, self.grid.scroll_bottom);
+        }
+        self.grid.pending_wrap = saved.pending_wrap && self.grid.cursor_col + 1 == self.grid.cols;
+        self.current_fg = saved.attrs.fg;
+        self.current_bg = saved.attrs.bg;
+        self.current_bold = saved.attrs.bold;
+        self.current_italic = saved.attrs.italic;
+        self.current_underline = saved.attrs.underline;
+        self.current_reverse = saved.attrs.reverse;
+        self.grid.set_erase_background(self.current_bg);
+    }
+
+    fn home_cursor(&mut self) {
+        self.grid.cursor_col = 0;
+        self.grid.cursor_row = if self.origin_mode {
+            self.grid.scroll_top
+        } else {
+            0
+        };
+        self.grid.pending_wrap = false;
+    }
+
+    fn set_private_mode(&mut self, mode: u16, enabled: bool) {
+        match mode {
+            1 => self.application_cursor_keys = enabled,
+            6 => {
+                self.origin_mode = enabled;
+                self.home_cursor();
+                self.mark_dirty_all();
+            }
+            7 => {
+                self.autowrap = enabled;
+                self.grid.pending_wrap = false;
+            }
+            25 => {
+                self.cursor_visible = enabled;
+                self.mark_dirty_row(self.grid.cursor_row);
+            }
+            1049 => {
+                if enabled {
+                    self.enter_alt_screen();
+                } else {
+                    self.exit_alt_screen();
+                }
+                self.mark_dirty_all();
+            }
+            1000 | 1002 | 1003 => {
+                self.mouse_tracking = if !enabled {
+                    MouseTrackingMode::Off
+                } else {
+                    match mode {
+                        1000 => MouseTrackingMode::X10,
+                        1002 => MouseTrackingMode::ButtonEvent,
+                        _ => MouseTrackingMode::AnyMotion,
+                    }
+                }
+            }
+            1006 => self.mouse_sgr = enabled,
+            2004 => self.bracketed_paste = enabled,
+            _ => {}
+        }
+    }
+
     fn enter_alt_screen(&mut self) {
         if !self.use_alt_screen {
-            self.saved_cursor_col = self.grid.cursor_col;
-            self.saved_cursor_row = self.grid.cursor_row;
+            self.main_return = self.cursor_snapshot();
             let cols = self.grid.cols;
             let rows = self.grid.rows;
             self.alt_grid.resize(cols, rows);
             std::mem::swap(&mut self.grid, &mut self.alt_grid);
             self.grid.set_erase_background(self.current_bg);
             self.grid.erase_all();
-            self.grid.cursor_col = 0;
-            self.grid.cursor_row = 0;
+            self.home_cursor();
             self.use_alt_screen = true;
         }
     }
@@ -302,8 +401,7 @@ impl Performer {
     fn exit_alt_screen(&mut self) {
         if self.use_alt_screen {
             std::mem::swap(&mut self.grid, &mut self.alt_grid);
-            self.grid.cursor_col = self.saved_cursor_col.min(self.grid.cols.saturating_sub(1));
-            self.grid.cursor_row = self.saved_cursor_row.min(self.grid.rows.saturating_sub(1));
+            self.restore_snapshot(self.main_return);
             self.grid.set_erase_background(self.current_bg);
             self.use_alt_screen = false;
         }
@@ -375,13 +473,13 @@ impl Perform for Performer {
             return;
         }
         let intrinsic_width = char_display_width(c);
-        let width = intrinsic_width.min(self.grid.cols);
+        let mut width = intrinsic_width.min(self.grid.cols);
         if width == 0 {
             return;
         }
 
         // Deferred wrap: fire the pending wrap before placing the new character.
-        if self.grid.pending_wrap {
+        if self.grid.pending_wrap && self.autowrap {
             self.grid.pending_wrap = false;
             self.grid.set_row_soft_wrapped(self.grid.cursor_row, true);
             self.grid.cursor_col = 0;
@@ -392,7 +490,7 @@ impl Perform for Performer {
             }
         }
 
-        if width == 2 && self.grid.cursor_col + 1 >= self.grid.cols {
+        if width == 2 && self.grid.cursor_col + 1 >= self.grid.cols && self.autowrap {
             let col = self.grid.cursor_col;
             let row = self.grid.cursor_row;
             self.grid.put_char(col, row, Cell::wrap_spacer());
@@ -407,6 +505,7 @@ impl Perform for Performer {
 
         let col = self.grid.cursor_col;
         let row = self.grid.cursor_row;
+        width = width.min(self.grid.cols - col);
         if col < self.grid.cols && row < self.grid.rows {
             let mut cell = self.make_cell(c);
             cell.set_wide(width == 2);
@@ -432,8 +531,10 @@ impl Perform for Performer {
 
     fn execute(&mut self, byte: u8) {
         let old_cursor_row = self.grid.cursor_row;
-        // Any C0 control character clears the pending-wrap state.
-        self.grid.pending_wrap = false;
+        // Only cursor controls cancel deferred wrap; BEL/NUL must not.
+        if matches!(byte, 0x08..=0x0d) {
+            self.grid.pending_wrap = false;
+        }
         match byte {
             0x08 => {
                 // BS
@@ -471,30 +572,51 @@ impl Perform for Performer {
         &mut self,
         params: &vte::Params,
         intermediates: &[u8],
-        _ignore: bool,
+        ignore: bool,
         action: char,
     ) {
-        let private = intermediates.contains(&b'?');
+        if ignore {
+            return;
+        }
+        let private = intermediates == b"?";
+        // Never execute unsupported private/intermediate sequences as their
+        // ordinary CSI counterpart (e.g. DECSCA is not SGR).
+        if !(intermediates.is_empty()
+            || private && matches!(action, 'h' | 'l' | 'n')
+            || intermediates == b">" && action == 'c')
+        {
+            return;
+        }
         let old_cursor_row = self.grid.cursor_row;
         // Cursor-moving sequences clear pending wrap (same as xterm behaviour).
         match action {
-            'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'f' | 'J' | 'K' | 'r' | 's' | 'u' => {
-                self.grid.pending_wrap = false
-            }
+            'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | '`' | 'H' | 'f' | 'J' | 'K' | 'r' | 'u'
+            | 'd' | 'X' | 'P' | '@' | 'L' | 'M' => self.grid.pending_wrap = false,
             _ => {}
         }
         match action {
             'A' => {
                 // cursor up
                 let n = Self::param(params, 0).max(1) as usize;
-                self.grid.cursor_row = self.grid.cursor_row.saturating_sub(n);
+                self.grid.cursor_row = self.grid.cursor_row.saturating_sub(n).max(
+                    if self.grid.cursor_row >= self.grid.scroll_top {
+                        self.grid.scroll_top
+                    } else {
+                        0
+                    },
+                );
                 self.mark_cursor_row_change(old_cursor_row);
             }
             'B' => {
                 // cursor down
                 let n = Self::param(params, 0).max(1) as usize;
-                self.grid.cursor_row =
-                    (self.grid.cursor_row + n).min(self.grid.rows.saturating_sub(1));
+                self.grid.cursor_row = (self.grid.cursor_row + n).min(
+                    if self.grid.cursor_row <= self.grid.scroll_bottom {
+                        self.grid.scroll_bottom
+                    } else {
+                        self.grid.rows - 1
+                    },
+                );
                 self.mark_cursor_row_change(old_cursor_row);
             }
             'C' => {
@@ -513,29 +635,53 @@ impl Perform for Performer {
             'E' => {
                 // cursor next line
                 let n = Self::param(params, 0).max(1) as usize;
-                self.grid.cursor_row =
-                    (self.grid.cursor_row + n).min(self.grid.rows.saturating_sub(1));
+                self.grid.cursor_row = (self.grid.cursor_row + n).min(
+                    if self.grid.cursor_row <= self.grid.scroll_bottom {
+                        self.grid.scroll_bottom
+                    } else {
+                        self.grid.rows - 1
+                    },
+                );
                 self.grid.cursor_col = 0;
                 self.mark_cursor_row_change(old_cursor_row);
             }
             'F' => {
                 // cursor prev line
                 let n = Self::param(params, 0).max(1) as usize;
-                self.grid.cursor_row = self.grid.cursor_row.saturating_sub(n);
+                self.grid.cursor_row = self.grid.cursor_row.saturating_sub(n).max(
+                    if self.grid.cursor_row >= self.grid.scroll_top {
+                        self.grid.scroll_top
+                    } else {
+                        0
+                    },
+                );
                 self.grid.cursor_col = 0;
                 self.mark_cursor_row_change(old_cursor_row);
             }
-            'G' => {
+            'G' | '`' => {
                 // cursor horizontal absolute
                 let col = Self::param(params, 0).saturating_sub(1) as usize;
                 self.grid.cursor_col = col.min(self.grid.cols.saturating_sub(1));
+                self.mark_cursor_row_change(old_cursor_row);
+            }
+            'd' => {
+                let row = Self::param(params, 0).saturating_sub(1) as usize;
+                self.grid.cursor_row = if self.origin_mode {
+                    (row + self.grid.scroll_top).min(self.grid.scroll_bottom)
+                } else {
+                    row.min(self.grid.rows - 1)
+                };
                 self.mark_cursor_row_change(old_cursor_row);
             }
             'H' | 'f' => {
                 // cursor position (1-based)
                 let row = Self::param(params, 0).saturating_sub(1) as usize;
                 let col = Self::param(params, 1).saturating_sub(1) as usize;
-                self.grid.cursor_row = row.min(self.grid.rows.saturating_sub(1));
+                self.grid.cursor_row = if self.origin_mode {
+                    (row + self.grid.scroll_top).min(self.grid.scroll_bottom)
+                } else {
+                    row.min(self.grid.rows - 1)
+                };
                 self.grid.cursor_col = col.min(self.grid.cols.saturating_sub(1));
                 self.mark_cursor_row_change(old_cursor_row);
             }
@@ -560,7 +706,11 @@ impl Perform for Performer {
                     self.grid.clear_line(row, 0, col);
                     self.mark_dirty_range(0, row);
                 }
-                2 | 3 => {
+                3 => {
+                    self.grid.clear_scrollback();
+                    self.mark_dirty_all();
+                }
+                2 => {
                     self.grid.erase_all();
                     self.mark_dirty_all();
                 }
@@ -592,6 +742,9 @@ impl Perform for Performer {
                 let n = Self::param(params, 0).max(1) as usize;
                 let row = self.grid.cursor_row;
                 let bottom = self.grid.scroll_bottom;
+                if row < self.grid.scroll_top || row > bottom {
+                    return;
+                }
                 self.grid.scroll_down(row, bottom, n);
                 self.mark_dirty_range(row, bottom);
             }
@@ -600,7 +753,10 @@ impl Perform for Performer {
                 let n = Self::param(params, 0).max(1) as usize;
                 let row = self.grid.cursor_row;
                 let bottom = self.grid.scroll_bottom;
-                self.grid.scroll_up(row, bottom, n);
+                if row < self.grid.scroll_top || row > bottom {
+                    return;
+                }
+                self.grid.delete_lines(row, bottom, n);
                 self.mark_dirty_range(row, bottom);
             }
             'P' => {
@@ -683,69 +839,42 @@ impl Perform for Performer {
                     self.pending_writes.push(b"\x1b[0n".to_vec());
                 } else if !private && Self::param(params, 0) == 6 {
                     // CPR: respond with ESC[row;colR (1-based)
-                    let row = self.grid.cursor_row + 1;
+                    let row = self.grid.cursor_row + 1
+                        - if self.origin_mode {
+                            self.grid.scroll_top
+                        } else {
+                            0
+                        };
                     let col = self.grid.cursor_col + 1;
                     self.pending_writes
                         .push(format!("\x1b[{};{}R", row, col).into_bytes());
                 }
             }
             'r' => {
-                // set scroll region (1-based)
-                let top = Self::param(params, 0).saturating_sub(1) as usize;
-                let bot = (Self::param(params, 1) as usize)
-                    .saturating_sub(1)
-                    .min(self.grid.rows.saturating_sub(1));
-                if top < bot {
+                let top = Self::param(params, 0).max(1) as usize - 1;
+                let bottom = Self::param(params, 1) as usize;
+                let bottom = if bottom == 0 { self.grid.rows } else { bottom } - 1;
+                if top < bottom && bottom < self.grid.rows {
                     self.grid.scroll_top = top;
-                    self.grid.scroll_bottom = bot;
+                    self.grid.scroll_bottom = bottom;
+                    self.home_cursor();
+                    self.mark_cursor_row_change(old_cursor_row);
                 }
-                self.grid.cursor_col = 0;
-                self.grid.cursor_row = 0;
-                self.mark_cursor_row_change(old_cursor_row);
             }
             's' => {
                 // save cursor position (ANSI)
-                self.saved_cursor_col = self.grid.cursor_col;
-                self.saved_cursor_row = self.grid.cursor_row;
+                self.saved_cursors[self.use_alt_screen as usize] = self.cursor_snapshot();
             }
             'u' => {
                 // restore cursor position (ANSI)
-                self.grid.cursor_col = self.saved_cursor_col.min(self.grid.cols.saturating_sub(1));
-                self.grid.cursor_row = self.saved_cursor_row.min(self.grid.rows.saturating_sub(1));
+                self.restore_snapshot(self.saved_cursors[self.use_alt_screen as usize]);
                 self.mark_cursor_row_change(old_cursor_row);
             }
-            'h' if private => match Self::param(params, 0) {
-                1 => self.application_cursor_keys = true,
-                1049 => {
-                    self.enter_alt_screen();
-                    self.mark_dirty_all();
+            'h' | 'l' if private => {
+                for param in params.iter() {
+                    self.set_private_mode(param.first().copied().unwrap_or(0), action == 'h');
                 }
-                25 => {
-                    self.cursor_visible = true;
-                    self.mark_dirty_row(self.grid.cursor_row);
-                }
-                1000 => self.mouse_tracking = MouseTrackingMode::X10,
-                1002 => self.mouse_tracking = MouseTrackingMode::ButtonEvent,
-                1003 => self.mouse_tracking = MouseTrackingMode::AnyMotion,
-                1006 => self.mouse_sgr = true,
-                2004 => self.bracketed_paste = true,
-                _ => {}
-            },
-            'l' if private => match Self::param(params, 0) {
-                1 => self.application_cursor_keys = false,
-                1049 => {
-                    self.exit_alt_screen();
-                    self.mark_dirty_all();
-                }
-                25 => {
-                    self.cursor_visible = false;
-                    self.mark_dirty_row(self.grid.cursor_row);
-                }
-                1000 | 1002 | 1003 => self.mouse_tracking = MouseTrackingMode::Off,
-                1006 => self.mouse_sgr = false,
-                2004 => self.bracketed_paste = false,
-                _ => {}
-            },
+            }
             'm' => {
                 // SGR
                 let mut iter = params.iter().peekable();
@@ -781,10 +910,12 @@ impl Perform for Performer {
                                     self.current_bg = CellColor::Indexed(idx);
                                 }
                             } else if subparams.len() >= 5 && subparams[1] == 2 {
+                                // ISO colon syntax includes an optional colour-space slot.
+                                let offset = if subparams.len() >= 6 { 3 } else { 2 };
                                 let c = Color::rgb(
-                                    subparams[2] as u8,
-                                    subparams[3] as u8,
-                                    subparams[4] as u8,
+                                    subparams[offset].min(255) as u8,
+                                    subparams[offset + 1].min(255) as u8,
+                                    subparams[offset + 2].min(255) as u8,
                                 );
                                 if is_fg {
                                     self.current_fg = CellColor::Rgb(c);
@@ -874,22 +1005,29 @@ impl Perform for Performer {
         }
     }
 
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        if ignore || !intermediates.is_empty() {
+            return;
+        }
         let old_cursor_row = self.grid.cursor_row;
         match byte {
             b'7' => {
                 // DEC save cursor
-                self.saved_cursor_col = self.grid.cursor_col;
-                self.saved_cursor_row = self.grid.cursor_row;
+                self.saved_cursors[self.use_alt_screen as usize] = self.cursor_snapshot();
             }
             b'8' => {
                 // DEC restore cursor
                 self.grid.pending_wrap = false;
-                self.grid.cursor_col = self.saved_cursor_col.min(self.grid.cols.saturating_sub(1));
-                self.grid.cursor_row = self.saved_cursor_row.min(self.grid.rows.saturating_sub(1));
+                self.restore_snapshot(self.saved_cursors[self.use_alt_screen as usize]);
                 self.mark_cursor_row_change(old_cursor_row);
             }
+            b'D' => self.execute(b'\n'),
+            b'E' => {
+                self.execute(b'\r');
+                self.execute(b'\n');
+            }
             b'M' => {
+                self.grid.pending_wrap = false;
                 // reverse index
                 if self.grid.cursor_row == self.grid.scroll_top {
                     let top = self.grid.scroll_top;

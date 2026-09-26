@@ -1,5 +1,11 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{ErrorKind, Read};
+#[cfg(unix)]
+use std::os::{
+    fd::{AsRawFd, FromRawFd},
+    unix::net::UnixStream,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use vte::Parser;
@@ -30,7 +36,10 @@ pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     pub event_tx: mpsc::UnboundedSender<CoreEvent>,
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    stopped: Arc<AtomicBool>,
+    #[cfg(unix)]
+    shutdown: UnixStream,
 }
 
 impl Pty {
@@ -49,6 +58,8 @@ impl Pty {
         Arc<Mutex<Performer>>,
         mpsc::UnboundedReceiver<CoreEvent>,
     )> {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -69,7 +80,6 @@ impl Pty {
         if std::env::var("LANG").is_err() {
             cmd.env("LANG", "en_US.UTF-8");
         }
-        let child = pair.slave.spawn_command(cmd)?;
 
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let performer = Arc::new(Mutex::new(Performer::new(cols as usize, rows as usize)));
@@ -79,11 +89,61 @@ impl Pty {
         // fast as possible (the PTY itself caps at ~200 MB/s on macOS, and any
         // time we spend parsing between reads stalls the writing program), and
         // a parse thread feeds the VTE parser from a bounded queue.
+        #[cfg(not(unix))]
         let mut reader = pair.master.try_clone_reader()?;
+        #[cfg(unix)]
+        let (shutdown, shutdown_rx) = UnixStream::pair()?;
+        #[cfg(unix)]
+        let mut reader = {
+            let fd = pair
+                .master
+                .as_raw_fd()
+                .ok_or_else(|| anyhow::anyhow!("PTY missing Unix fd"))?;
+            // Own a duplicate: poll must never observe a dropped/reused master fd.
+            let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            unsafe { std::fs::File::from_raw_fd(fd) }
+        };
+        // Complete fallible fd setup before starting the child.
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let reader_stopped = Arc::clone(&stopped);
         let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PIPELINE_QUEUE_BUFFERS);
         std::thread::spawn(move || {
             let mut buf = [0u8; 64 * 1024];
             loop {
+                if reader_stopped.load(Ordering::Relaxed) {
+                    break;
+                }
+                #[cfg(unix)]
+                {
+                    let mut fds = [
+                        libc::pollfd {
+                            fd: reader.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: shutdown_rx.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // Sleep until output OR pane closure; no periodic idle wakeups.
+                    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+                    if result < 0 {
+                        if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                            continue;
+                        }
+                        break;
+                    }
+                    if fds[1].revents != 0 {
+                        break;
+                    }
+                }
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Err(err) if err.kind() == ErrorKind::Interrupted => continue,
@@ -101,12 +161,16 @@ impl Pty {
         let performer_clone = Arc::clone(&performer);
         let writer_clone = Arc::clone(&writer);
         let event_tx_clone = event_tx.clone();
+        let parser_stopped = Arc::clone(&stopped);
         std::thread::spawn(move || {
             let mut parser = Parser::new();
             'reader_loop: loop {
                 match buf_rx.recv() {
                     Err(_) => break,
                     Ok(mut data) => {
+                        if parser_stopped.load(Ordering::Relaxed) {
+                            break;
+                        }
                         // Coalesce everything already queued into one batch:
                         // kernel PTY reads are typically only a few KB, and the
                         // per-iteration overhead (locking, events, UI wakeup)
@@ -122,6 +186,9 @@ impl Pty {
                         let mut read_dirty = false;
 
                         for chunk in data.chunks(PARSE_LOCK_CHUNK_BYTES) {
+                            if parser_stopped.load(Ordering::Relaxed) {
+                                break 'reader_loop;
+                            }
                             let (pending_events, pending_writes, chunk_dirty) = {
                                 let mut p = match performer_clone.lock() {
                                     Ok(performer) => performer,
@@ -216,7 +283,10 @@ impl Pty {
                 master: pair.master,
                 writer,
                 event_tx,
-                _child: child,
+                child: Some(child),
+                stopped,
+                #[cfg(unix)]
+                shutdown,
             },
             performer,
             event_rx,
@@ -238,8 +308,8 @@ impl Pty {
     /// Resize the PTY
     pub fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
         self.master.resize(PtySize {
-            rows,
-            cols,
+            rows: rows.max(1),
+            cols: cols.max(1),
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -247,9 +317,118 @@ impl Pty {
     }
 }
 
-#[cfg(test)]
+impl Drop for Pty {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            let _ = self.shutdown.write_all(&[1]);
+        }
+        if let Some(mut child) = self.child.take() {
+            // Do not wait on the UI thread. Keep the child unreaped until after
+            // signalling, so its PID cannot be reused for an unrelated process.
+            std::thread::spawn(move || {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                let _ = child.kill(); // SIGHUP on Unix, matching terminal closure.
+                for _ in 0..20 {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                #[cfg(unix)]
+                if let Some(pid) = child.process_id() {
+                    // Escalate only the owned, still-unreaped child, not arbitrary
+                    // descendants or process groups which may outlive the pane.
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_terminates_hup_ignoring_child_and_releases_pipeline() {
+        let (pty, performer, mut rx) = Pty::spawn(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "trap '' HUP; printf ready; while :; do :; done".into(),
+            ],
+            10,
+            2,
+            || {},
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while performer.lock().unwrap().grid.cell(0, 0).c() != 'r' {
+            assert!(std::time::Instant::now() < deadline, "child not ready");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let pid = pty.child.as_ref().unwrap().process_id().unwrap() as libc::pid_t;
+        let start = std::time::Instant::now();
+        drop(pty);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "UI blocked in drop"
+        );
+        let mut closed = false;
+        while std::time::Instant::now() < deadline {
+            while let Ok(event) = rx.try_recv() {
+                closed |= matches!(event, CoreEvent::PtyClosed);
+            }
+            // ESRCH includes reaping: a zombie would still be addressable.
+            let gone = unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if gone && closed && Arc::strong_count(&performer) == 1 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("PTY child/pipeline survived drop");
+    }
+
+    #[test]
+    fn repeated_output_exit_drains_tail_and_releases_workers() {
+        for _ in 0..12 {
+            let args = vec!["-c".into(), "read start; i=0; while [ $i -lt 2000 ]; do printf 'row %s 日本語\\n' \"$i\"; i=$((i+1)); done; printf 'FINAL-MARKER'".into()];
+            let (mut pty, performer, mut rx) = Pty::spawn("/bin/sh", &args, 40, 5, || {}).unwrap();
+            performer.lock().unwrap().set_scrollback_limit(64);
+            pty.write(b"start\n").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if matches!(rx.try_recv(), Ok(CoreEvent::PtyClosed)) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "PTY did not close");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            {
+                let p = performer.lock().unwrap();
+                assert_eq!(p.grid.scrollback_len(), 64);
+                assert!((0..p.grid.rows).any(|r| p
+                    .grid
+                    .row_text(p.grid.row_cells(r))
+                    .contains("FINAL-MARKER")));
+            }
+            drop(pty);
+            while Arc::strong_count(&performer) != 1 {
+                assert!(std::time::Instant::now() < deadline, "worker leaked");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
 
     #[test]
     fn test_pty_spawn_and_write() {

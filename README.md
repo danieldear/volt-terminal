@@ -67,7 +67,10 @@ Pushing a `v*` tag runs the release workflow. It builds and uploads:
 - a macOS `Volt.app` zip archive
 - `SHA256SUMS.txt`
 
-The macOS archive is ad-hoc signed for bundle integrity, but not Developer ID signed or notarized yet.
+By default the macOS archive is ad-hoc signed. The release workflow also supports
+credential-gated Developer ID signing and notarization; see [distribution setup](docs/distribution.md).
+Release notes and `macos-signing-status.txt` identify the actual mode. Existing
+v0.1.2 downloads remain ad-hoc signed.
 
 ---
 
@@ -157,6 +160,14 @@ volt-renderer/  # wgpu/Metal GPU renderer, glyph atlas, pipeline
 volt-ui/        # macOS window, event loop, tab/pane management
 volt-config/    # config parsing, themes
 ```
+
+---
+
+## Validation
+
+- [Terminal hardening plan and results](docs/terminal-hardening-plan.md)
+- [Rendering validation](docs/rendering-validation.md)
+- [Performance experiments and measurement limits](docs/performance-experiments.md)
 
 ---
 
