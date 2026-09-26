@@ -2,11 +2,14 @@
 name = "volt-ui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [dependencies]
+unicode-segmentation = "1"
+unicode-width = "0.2"
 winit = "0.30"
 pollster = "0.3"
 tokio = { workspace = true, features = ["rt", "sync"] }
@@ -15,6 +18,8 @@ volt-renderer = { path = "../volt-renderer" }
 volt-config = { path = "../volt-config" }
 dirs = "5"
 anyhow = { workspace = true }
+raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
+muda = "0.17"

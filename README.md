@@ -6,22 +6,31 @@
 
 <br/>
 
-> ⚠️ **Early development.** Volt is functional and daily-driver ready on macOS, but APIs and config formats may change before v1.0.
+> ⚠️ **Early development.** Volt is functional on macOS, but it has not been validated as a daily driver; APIs and config formats may change before v1.0.
 
 ---
 
 ## Features
 
 - **GPU-accelerated rendering** — Metal-backed via `wgpu`, smooth at any size
-- **VTE-compliant** — Full ANSI/xterm escape sequence support via the `vte` crate
-- **Tabs + pane splits** — `Cmd+T` new tab, `Cmd+D` vertical split, `Cmd+Shift+D` horizontal split
-- **Full mouse support** — click, scroll, drag selection
+- **VTE-based parsing** — common ANSI/xterm sequences; advanced DCS and some OSC features remain unsupported
+- **Tabs + pane splits** — split right/left/up/down, drag-resizable dividers
+- **Full mouse support** — click, scroll, drag selection, double-click word / triple-click line select
+- **Native macOS menu bar** — File/Edit/View/Window menus and a dynamic Services submenu; keyboard shortcuts are handled by Volt, not menu-item accelerators
+- **Native right-click context menu** — Copy/Paste, split in any direction, reset terminal, read-only toggle, rename tab/terminal
+- **In-terminal Find** (`Cmd+F`) — search scrollback + visible output, jump between matches (navigation is capped at 100,000 matches)
 - **Alternate screen buffer** — vim, htop, etc. work correctly
-- **Live config reload** — edit `volt.toml`, press `Cmd+Shift+R`
+- **Config reload** — edit `config.toml`, press `Cmd+Shift+R`
 - **Built-in themes** — Catppuccin, Tokyo Night, Gruvbox, Nord, Dracula
 - **Nerd Font support** — powerline / icon glyphs with automatic fallback
 - **macOS CVDisplayLink** — tear-free rendering locked to display refresh rate
 - **Transparent + blur** — compositor effects on macOS
+
+Ask Siri and live spell-check suggestions, which macOS appends automatically
+to real `NSTextView` context menus, aren't reproduced in the right-click
+menu — Volt's terminal grid is custom GPU-rendered, not an `NSTextView`, so
+the OS never offers them here. Everything else in a native context menu,
+including the dynamic Services submenu, is genuine.
 
 ---
 
@@ -39,12 +48,12 @@
 
 ### Prerequisites
 
-- Rust 1.75+ (`rustup update stable`)
+- Rust 1.87+ (`rustup update stable`)
 - macOS: Xcode Command Line Tools (`xcode-select --install`)
 - Linux: `libudev-dev` and a Wayland/X11 compositor
 
 ```bash
-git clone https://github.com/your-username/volt-terminal.git
+git clone https://github.com/danieldear/volt-terminal.git
 cd volt-terminal
 cargo build --release
 ./target/release/volt
@@ -64,8 +73,10 @@ The macOS archive is ad-hoc signed for bundle integrity, but not Developer ID si
 
 ## Configuration
 
-Volt reads `~/.config/volt/volt.toml` (created automatically on first launch).  
-Press **`Cmd+,`** to open it in your default editor. Press **`Cmd+Shift+R`** to reload without restarting.
+Volt reads `~/.config/volt/config.toml`. Press **`Cmd+,`** (or Volt ▸
+Settings…) to open it in your default editor — the file is written with
+fully-commented defaults the first time you do this. Press **`Cmd+Shift+R`**
+(or Volt ▸ Reload Settings) to reload without restarting.
 
 ```toml
 # Volt Terminal — Configuration
@@ -93,19 +104,47 @@ cursor_blink = true
 
 ## Keyboard shortcuts
 
+Volt handles the shortcuts below directly. The menu bar exposes common
+commands, but not every shortcut or its key-equivalent hint.
+
 | Shortcut | Action |
 |----------|--------|
+| `Cmd+N` | New window |
 | `Cmd+T` | New tab |
-| `Cmd+W` | Close tab |
-| `Cmd+D` | Split pane vertically |
-| `Cmd+Shift+D` | Split pane horizontally |
+| `Cmd+Shift+W` | Close window |
+| `Cmd+W` | Close tab / pane |
+| `Cmd+D` | Split pane vertically (right) |
+| `Cmd+Shift+D` | Split pane horizontally (down) |
 | `Cmd+Tab` / `Ctrl+Tab` | Next tab |
 | `Cmd+Shift+Tab` | Previous tab |
+| `Cmd+Shift+[` / `Cmd+Shift+]` | Previous / next tab |
 | `Cmd+1`…`9` | Switch to tab N |
-| `Cmd+C` | Copy selection |
-| `Cmd+V` | Paste |
+| `Cmd+Alt+Arrow` / `Ctrl+Alt+Arrow` | Move focus between panes |
+| `Cmd+C` / `Ctrl+Shift+C` | Copy selection |
+| `Cmd+V` / `Ctrl+Shift+V` | Paste |
+| `Cmd+F` | Find in terminal |
+| `Cmd+=` / `Cmd+-` | Increase / decrease font size |
+| `Cmd+Shift+A` | Toggle AI chat panel prototype (model transport is not wired up) |
+| `Ctrl+Cmd+F` | Toggle full screen |
+| `Cmd+K` | Clear screen and scrollback |
 | `Cmd+,` | Open config in editor |
 | `Cmd+Shift+R` | Reload config |
+| `Cmd+Q` | Quit |
+
+Double-clicking empty tab-bar chrome (not a tab) maximizes/restores the
+window, matching Finder/Safari.
+
+### Right-click context menu
+
+Right-click a pane for Copy/Paste, Split Right/Left/Down/Up,
+Reset Terminal (full VT reset — clears scrollback, alt-screen, and all
+attributes), Toggle Terminal Inspector (a small debug overlay: grid size,
+cursor position, scrollback length), Terminal Read-only (blocks keyboard/
+mouse input to that pane until toggled off — shown with a badge while
+active), and Change Tab Title…/Change Terminal Title… (overrides the
+OSC-reported title until cleared). When a terminal app has enabled mouse
+reporting, ordinary right-click goes to that app; use **Shift+right-click**
+for Volt's context menu.
 
 ---
 

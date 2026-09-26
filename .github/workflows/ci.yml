@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   pull_request:
@@ -46,7 +48,7 @@ jobs:
             libx11-dev \
             libxcursor-dev \
             libxinerama-dev
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
     name: Tests
@@ -70,5 +72,18 @@ jobs:
             libxi-dev \
             libx11-dev \
             libxcursor-dev \
-            libxinerama-dev
-      - run: cargo test --workspace
+            libxinerama-dev \
+            fonts-dejavu-core \
+            mesa-vulkan-drivers
+      - run: cargo test --locked --workspace
+      - name: Offscreen GPU renderer regressions (Mesa software Vulkan)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          XDG_RUNTIME_DIR: /tmp
+        run: cargo run --locked -p volt-renderer --example rendercheck -- target/rendercheck --fixtures-only
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.os == 'ubuntu-latest'
+        with:
+          name: rendering-fixtures-linux
+          path: target/rendercheck
+          if-no-files-found: warn

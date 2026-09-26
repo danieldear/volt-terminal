@@ -2,8 +2,8 @@
 //!
 //! The panel renders on the right side of the window (320px default width).
 //! When visible, the terminal viewport width is reduced accordingly.
-//! Messages and the current input buffer are stored here; the actual HTTP calls
-//! are dispatched via `tokio::spawn` and results returned through the app event loop.
+//! Messages and the current input buffer are stored here. This is currently
+//! UI state only; no model transport or request dispatch is wired up.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRole {

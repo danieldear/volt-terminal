@@ -36,10 +36,90 @@ const TAB_BAR_BUTTON_PADDING: f32 = 5.0;
 #[derive(Clone)]
 struct CachedGlyph {
     cache_key: CacheKey,
-    /// Horizontal advance from the Buffer layout run (physical pixels).
-    glyph_x: f32,
+    /// Shaped physical position, including the font's glyph offsets.
+    glyph_x: i32,
+    glyph_y: i32,
     /// Baseline y within the cell (physical pixels).
     line_y: f32,
+}
+
+/// Match cosmic-text's Buffer::draw placement: the shaped physical offsets
+/// must be applied in addition to the bitmap's bearing. Using LayoutGlyph::x
+/// alone loses x_offset/y_offset, which varies between fonts and glyphs.
+fn glyph_bitmap_origin(
+    physical_x: i32,
+    physical_y: i32,
+    line_y: f32,
+    bitmap_left: i32,
+    bitmap_top: i32,
+) -> (f32, f32) {
+    (
+        (physical_x + bitmap_left) as f32,
+        line_y + (physical_y - bitmap_top) as f32,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_glyph_quad(
+    out: &mut Vec<GlyphVertex>,
+    sw: f32,
+    sh: f32,
+    x: f32,
+    y: f32,
+    region: crate::atlas::AtlasRegion,
+    color: [f32; 4],
+) {
+    let color = if region.is_color {
+        [1.0, 1.0, 1.0, color[3]]
+    } else {
+        color
+    };
+    let x0 = x / sw * 2.0 - 1.0;
+    let x1 = (x + region.width as f32) / sw * 2.0 - 1.0;
+    let y0 = 1.0 - y / sh * 2.0;
+    let y1 = 1.0 - (y + region.height as f32) / sh * 2.0;
+    let [u0, v0, u1, v1] = [region.u0, region.v0, region.u1, region.v1];
+    out.extend_from_slice(&[
+        GlyphVertex {
+            pos: [x0, y0],
+            uv: [u0, v0],
+            color,
+        },
+        GlyphVertex {
+            pos: [x1, y0],
+            uv: [u1, v0],
+            color,
+        },
+        GlyphVertex {
+            pos: [x0, y1],
+            uv: [u0, v1],
+            color,
+        },
+        GlyphVertex {
+            pos: [x1, y0],
+            uv: [u1, v0],
+            color,
+        },
+        GlyphVertex {
+            pos: [x1, y1],
+            uv: [u1, v1],
+            color,
+        },
+        GlyphVertex {
+            pos: [x0, y1],
+            uv: [u0, v1],
+            color,
+        },
+    ]);
+}
+
+fn underline_top(cell_top: f32, baseline: f32, thickness: f32, cell_height: f32) -> f32 {
+    // Keep the underline tied to the font baseline rather than the bottom of
+    // the cell, which can be far away when line_height is increased.
+    cell_top
+        + (baseline + thickness)
+            .round()
+            .clamp(0.0, (cell_height - thickness).max(0.0))
 }
 
 fn resolve_family(name: &str) -> Family<'_> {
@@ -178,8 +258,65 @@ pub struct PaneDivider {
     pub color: [f32; 4],
 }
 
+/// The Find / Change Tab Title / Change Terminal Title text-entry overlay.
+/// volt-renderer has no knowledge of `volt-ui`'s `TextPrompt` type, so the
+/// caller flattens it into this small POD struct each frame.
+pub struct PromptOverlay<'a> {
+    pub title: &'a str,
+    pub text: &'a str,
+    /// Char index of the input cursor within `text`.
+    pub cursor: usize,
+    /// Total live search matches, or 0 outside Find mode.
+    pub match_count: usize,
+    pub matches_truncated: bool,
+    /// 0-based index of the current match within `match_count`.
+    pub current_match: usize,
+}
+
+/// "Toggle Terminal Inspector" debug overlay contents.
+pub struct InspectorInfo {
+    pub cols: usize,
+    pub rows: usize,
+    pub cursor_col: usize,
+    pub cursor_row: usize,
+    pub scrollback_len: usize,
+}
+
+type CellRange = Option<((usize, usize), (usize, usize))>;
+#[derive(Clone, Copy, PartialEq, Default)]
+struct RowKey {
+    cursor: Option<usize>,
+    selection: CellRange,
+    block: bool,
+    search: CellRange,
+}
+#[derive(Default)]
+struct CachedRow {
+    valid: bool,
+    cells: Vec<volt_core::cell::Cell>,
+    extended: Vec<(usize, String)>,
+    key: RowKey,
+    backgrounds: Vec<BgVertex>,
+    glyphs: Vec<GlyphVertex>,
+}
+impl CachedRow {
+    fn matches(&self, grid: &Grid, row: usize, key: RowKey) -> bool {
+        self.key == key
+            && self.cells == grid.row_cells(row)
+            && self
+                .extended
+                .iter()
+                .all(|(col, text)| grid.extended_text(grid.cell(*col, row)) == Some(text.as_str()))
+    }
+}
+
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
+    row_cache: Vec<CachedRow>,
+    cache_context: Option<([f32; 8], Theme, CursorStyle)>,
+    row_cache_enabled: bool,
+    pub last_frame_reused_rows: usize,
+    surface: Option<wgpu::Surface<'static>>,
+    offscreen: Option<wgpu::Texture>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -197,6 +334,7 @@ pub struct Renderer {
     pub custom_tab_bar: bool,
     pub scale_factor: f32,
     font_size_phys: f32,
+    font_baseline: f32,
     pub background_opacity: f32,
     pub cursor_style: CursorStyle,
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
@@ -209,6 +347,7 @@ pub struct Renderer {
     /// Per-character shape cache: avoids re-shaping the same glyph every frame.
     /// Keyed by (char, bold, italic); cleared when font family/size/scale changes.
     shape_cache: HashMap<(char, bool, bool), Vec<CachedGlyph>>,
+    extended_shape_cache: HashMap<(String, bool, bool), Vec<CachedGlyph>>,
     symbol_font_family: Option<String>,
     top_alert: Option<String>,
     bg_vertex_buffer: wgpu::Buffer,
@@ -292,6 +431,57 @@ impl Renderer {
         cursor_style: CursorStyle,
     ) -> Result<Self> {
         let size = window.inner_size();
+        Self::new_target(
+            Some(window),
+            size,
+            font_size,
+            scale_factor,
+            font_family,
+            padding,
+            line_height,
+            background_opacity,
+            cursor_style,
+        )
+        .await
+    }
+
+    /// Real GPU renderer without a window/compositor, for pixel regressions and
+    /// submission/completion benchmarks. Not input-to-photon timing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_offscreen(
+        width: u32,
+        height: u32,
+        font_size: f32,
+        scale_factor: f32,
+        font_family: &str,
+        line_height: f32,
+    ) -> Result<Self> {
+        Self::new_target(
+            None,
+            winit::dpi::PhysicalSize::new(width, height),
+            font_size,
+            scale_factor,
+            font_family,
+            8.0,
+            line_height,
+            1.0,
+            CursorStyle::Block,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn new_target(
+        window: Option<Arc<winit::window::Window>>,
+        size: winit::dpi::PhysicalSize<u32>,
+        font_size: f32,
+        scale_factor: f32,
+        font_family: &str,
+        padding: f32,
+        line_height: f32,
+        background_opacity: f32,
+        cursor_style: CursorStyle,
+    ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         let backends = wgpu::Backends::METAL;
         #[cfg(not(target_os = "macos"))]
@@ -307,13 +497,14 @@ impl Renderer {
             backend_options: Default::default(),
             display: None,
         });
-        let surface = instance
-            .create_surface(window.clone())
+        let surface = window
+            .map(|window| instance.create_surface(window))
+            .transpose()
             .context("failed to create wgpu surface")?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
+                compatible_surface: surface.as_ref(),
                 force_fallback_adapter: false,
             })
             .await
@@ -323,7 +514,15 @@ impl Renderer {
             .await
             .context("failed to request wgpu device")?;
 
-        let caps = surface.get_capabilities(&adapter);
+        let caps = surface
+            .as_ref()
+            .map(|surface| surface.get_capabilities(&adapter))
+            .unwrap_or(wgpu::SurfaceCapabilities {
+                formats: vec![wgpu::TextureFormat::Rgba8Unorm],
+                present_modes: vec![wgpu::PresentMode::Fifo],
+                alpha_modes: vec![wgpu::CompositeAlphaMode::Opaque],
+                usages: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            });
         let surface_format = caps
             .formats
             .iter()
@@ -364,7 +563,14 @@ impl Renderer {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        surface.configure(&device, &config);
+        if let Some(surface) = surface.as_ref() {
+            surface.configure(&device, &config);
+        }
+        let offscreen = if surface.is_none() {
+            Some(Self::offscreen_texture(&device, &config))
+        } else {
+            None
+        };
 
         let bg_vertex_buffer =
             Self::create_vertex_buffer::<BgVertex>(&device, "bg_verts", INITIAL_BG_VERT_CAPACITY);
@@ -384,7 +590,7 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -454,6 +660,11 @@ impl Renderer {
         );
         measure_buf.shape_until_scroll(&mut font_system, false);
 
+        let font_baseline = measure_buf
+            .layout_runs()
+            .next()
+            .map(|r| r.line_y)
+            .unwrap_or(font_size_phys);
         let cell_width = measure_buf
             .layout_runs()
             .next()
@@ -464,7 +675,12 @@ impl Renderer {
         let tab_bar_height = (38.0 * scale_factor).round();
 
         Ok(Self {
+            row_cache: Vec::new(),
+            cache_context: None,
+            row_cache_enabled: true,
+            last_frame_reused_rows: 0,
             surface,
+            offscreen,
             device,
             queue,
             config,
@@ -481,6 +697,7 @@ impl Renderer {
             custom_tab_bar: true,
             scale_factor,
             font_size_phys,
+            font_baseline,
             background_opacity: background_opacity.clamp(0.0, 1.0),
             cursor_style,
             opaque_alpha_mode,
@@ -489,6 +706,7 @@ impl Renderer {
             padding,
             line_height,
             shape_cache: HashMap::new(),
+            extended_shape_cache: HashMap::new(),
             symbol_font_family,
             top_alert: None,
             bg_vertex_buffer,
@@ -500,13 +718,103 @@ impl Renderer {
         })
     }
 
+    fn offscreen_texture(
+        device: &wgpu::Device,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("volt-rendercheck"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    pub fn wait_for_gpu(&self) -> Result<()> {
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
+        Ok(())
+    }
+
+    /// Read RGBA pixels from an offscreen frame. Includes a GPU wait; never used
+    /// by the interactive render path.
+    pub fn read_offscreen_rgba(&self) -> Result<Vec<u8>> {
+        let texture = self
+            .offscreen
+            .as_ref()
+            .context("not an offscreen renderer")?;
+        let stride = (self.config.width * 4).div_ceil(256) * 256;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("volt-rendercheck-readback"),
+            size: stride as u64 * self.config.height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(self.config.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        self.wait_for_gpu()?;
+        rx.recv()??;
+        let mapped = buffer.slice(..).get_mapped_range();
+        let mut pixels = Vec::with_capacity((self.config.width * self.config.height * 4) as usize);
+        for row in mapped.chunks(stride as usize) {
+            pixels.extend_from_slice(&row[..(self.config.width * 4) as usize]);
+        }
+        drop(mapped);
+        buffer.unmap();
+        Ok(pixels)
+    }
+
+    pub fn set_row_cache_enabled(&mut self, enabled: bool) {
+        self.row_cache_enabled = enabled;
+        self.row_cache.clear();
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
         self.config.width = width;
         self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
+        if self.offscreen.is_some() {
+            self.offscreen = Some(Self::offscreen_texture(&self.device, &self.config));
+        }
+        if let Some(surface) = self.surface.as_ref() {
+            surface.configure(&self.device, &self.config);
+        }
     }
 
     pub fn set_background_opacity(&mut self, opacity: f32) {
@@ -518,7 +826,9 @@ impl Renderer {
         };
         if self.config.alpha_mode != desired_alpha_mode {
             self.config.alpha_mode = desired_alpha_mode;
-            self.surface.configure(&self.device, &self.config);
+            if let Some(surface) = self.surface.as_ref() {
+                surface.configure(&self.device, &self.config);
+            }
         }
     }
 
@@ -554,6 +864,11 @@ impl Renderer {
             Shaping::Advanced,
         );
         measure_buf.shape_until_scroll(&mut self.font_system, false);
+        self.font_baseline = measure_buf
+            .layout_runs()
+            .next()
+            .map(|r| r.line_y)
+            .unwrap_or(self.font_size_phys);
         self.cell_width = measure_buf
             .layout_runs()
             .next()
@@ -564,6 +879,8 @@ impl Renderer {
         self.tab_bar_height = (38.0 * scale_factor).round();
         self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
         self.shape_cache.clear();
+        self.extended_shape_cache.clear();
+        self.row_cache.clear();
     }
 
     fn tab_bar_height_for_tab_count(&self, _tab_count: usize) -> f32 {
@@ -670,9 +987,37 @@ impl Renderer {
         bold: bool,
         italic: bool,
     ) -> Vec<CachedGlyph> {
+        Self::shape_text(
+            font_system,
+            &c.to_string(),
+            metrics,
+            cell_w,
+            cell_h,
+            fam_name,
+            symbol_fallback_family,
+            swash_cache,
+            bold,
+            italic,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn shape_text(
+        font_system: &mut FontSystem,
+        text: &str,
+        metrics: Metrics,
+        cell_w: f32,
+        cell_h: f32,
+        fam_name: &str,
+        symbol_fallback_family: Option<&str>,
+        swash_cache: &mut SwashCache,
+        bold: bool,
+        italic: bool,
+    ) -> Vec<CachedGlyph> {
+        let c = text.chars().next().unwrap_or(' ');
         fn shape_for_family(
             font_system: &mut FontSystem,
-            c: char,
+            text: &str,
             metrics: Metrics,
             cell_w: f32,
             cell_h: f32,
@@ -686,7 +1031,7 @@ impl Renderer {
                 .style(if italic { Style::Italic } else { Style::Normal });
             let mut buf = Buffer::new(font_system, metrics);
             buf.set_size(font_system, cell_w * 2.0, cell_h * 2.0);
-            buf.set_text(font_system, &c.to_string(), attrs, Shaping::Advanced);
+            buf.set_text(font_system, text, attrs, Shaping::Advanced);
             buf.shape_until_scroll(font_system, false);
             let mut out = Vec::new();
             for run in buf.layout_runs() {
@@ -694,7 +1039,8 @@ impl Renderer {
                     let physical = g.physical((0.0, 0.0), 1.0);
                     out.push(CachedGlyph {
                         cache_key: physical.cache_key,
-                        glyph_x: g.x,
+                        glyph_x: physical.x,
+                        glyph_y: physical.y,
                         line_y: run.line_y,
                     });
                 }
@@ -704,7 +1050,7 @@ impl Renderer {
 
         let primary = shape_for_family(
             font_system,
-            c,
+            text,
             metrics,
             cell_w,
             cell_h,
@@ -728,7 +1074,7 @@ impl Renderer {
             {
                 let fallback = shape_for_family(
                     font_system,
-                    c,
+                    text,
                     metrics,
                     cell_w,
                     cell_h,
@@ -748,7 +1094,7 @@ impl Renderer {
             } else if !fallback_family.eq_ignore_ascii_case(fam_name) {
                 return shape_for_family(
                     font_system,
-                    c,
+                    text,
                     metrics,
                     cell_w,
                     cell_h,
@@ -767,6 +1113,14 @@ impl Renderer {
     }
 
     // ── drawing helpers ──────────────────────────────────────────────────────
+
+    /// Cheap width estimate for overlay layout (cursor position, right-aligned
+    /// counters). Not a real shape pass — assumes a roughly monospace advance
+    /// of `0.6 * font_size` per character, which is what these UI fonts render
+    /// close enough to for positioning text that isn't part of the cell grid.
+    fn approx_text_width(text: &str, font_size_phys: f32) -> f32 {
+        text.chars().count() as f32 * font_size_phys * 0.6
+    }
 
     fn draw_rect(
         &self,
@@ -847,8 +1201,20 @@ impl Renderer {
                 ) else {
                     continue;
                 };
-                let gx = px + glyph.x + region.offset_x as f32;
-                let gy = py + run.line_y - region.offset_y as f32;
+                let color = if region.is_color {
+                    [1.0, 1.0, 1.0, color[3]]
+                } else {
+                    color
+                };
+                let (local_x, local_y) = glyph_bitmap_origin(
+                    physical.x,
+                    physical.y,
+                    run.line_y,
+                    region.offset_x,
+                    region.offset_y,
+                );
+                let gx = px + local_x;
+                let gy = py + local_y;
                 let gx = Self::snap_to_pixel(gx);
                 let gy = Self::snap_to_pixel(gy);
                 let gw = region.width as f32;
@@ -920,29 +1286,31 @@ impl Renderer {
     fn submit_frame(
         &mut self,
         view: wgpu::TextureView,
-        output: wgpu::SurfaceTexture,
+        output: Option<wgpu::SurfaceTexture>,
         bg_verts: &[BgVertex],
         glyph_verts: &[GlyphVertex],
         clear: [f64; 4],
         partial_redraw: bool,
     ) {
-        if self.atlas.dirty {
+        if let Some((x, y, width, height)) = self.atlas.take_dirty_rect() {
+            let start = ((y * self.atlas.width + x) * 4) as usize;
+            let end = start + (((height - 1) * self.atlas.width + width) * 4) as usize;
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.atlas_texture,
                     mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
-                &self.atlas.data,
+                &self.atlas.data[start..end],
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(self.atlas.width),
+                    bytes_per_row: Some(self.atlas.width * 4),
                     rows_per_image: Some(self.atlas.height),
                 },
                 wgpu::Extent3d {
-                    width: self.atlas.width,
-                    height: self.atlas.height,
+                    width,
+                    height,
                     depth_or_array_layers: 1,
                 },
             );
@@ -1013,7 +1381,9 @@ impl Renderer {
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        if let Some(output) = output {
+            output.present();
+        }
     }
 
     // ── main terminal render entry point ────────────────────────────────────
@@ -1029,17 +1399,40 @@ impl Renderer {
         selection_block: bool,
         _damage_rows: Option<(usize, usize)>,
         dividers: &[PaneDivider],
+        search_match: Option<((usize, usize), (usize, usize))>,
+        prompt: Option<PromptOverlay<'_>>,
+        inspector: Option<InspectorInfo>,
+        read_only: bool,
     ) {
-        let output = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(o)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(o) => o,
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
-                return;
+        if self.atlas.full {
+            self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
+            self.row_cache.clear();
+        }
+        if self.extended_shape_cache.len() > 4096 {
+            self.extended_shape_cache.clear();
+        }
+        if self.shape_cache.len() > 65_536 {
+            self.shape_cache.clear();
+        }
+        let output = if let Some(surface) = self.surface.as_ref() {
+            match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(o)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(o) => Some(o),
+                wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                    surface.configure(&self.device, &self.config);
+                    return;
+                }
+                _ => return,
             }
-            _ => return,
+        } else {
+            None
         };
-        let view = output.texture.create_view(&Default::default());
+        let texture = output
+            .as_ref()
+            .map(|o| &o.texture)
+            .or(self.offscreen.as_ref())
+            .expect("render target");
+        let view = texture.create_view(&Default::default());
 
         let sw = self.config.width as f32;
         let sh = self.config.height as f32;
@@ -1051,8 +1444,9 @@ impl Renderer {
         let phys_pad = self.padding * self.scale_factor;
         let metrics = Self::glyph_layout_metrics(self.font_size_phys, self.line_height);
         let fam_name = self.font_family.clone();
-        // Row-scoped partial redraw is currently unsafe with dynamic line-height / glyph overhang.
-        // Force full redraw for correctness.
+        // Reuse unchanged CPU row geometry, but always clear/repaint the GPU
+        // target. Swapchain images do NOT promise last-frame contents, and
+        // full repaint preserves glyph overhang/transparency without ghosts.
         let partial_redraw = false;
         let full_redraw = true;
         let (row_start, row_end_exclusive) = (0, grid.rows);
@@ -1062,8 +1456,12 @@ impl Renderer {
         bg_verts.clear();
         glyph_verts.clear();
 
-        let cursor_col = grid.cursor_col;
-        let cursor_row = grid.cursor_row;
+        let cursor_row = grid.cursor_row.min(grid.rows.saturating_sub(1));
+        let mut cursor_col = grid.cursor_col.min(grid.cols.saturating_sub(1));
+        if cursor_col > 0 && grid.cell(cursor_col, cursor_row).is_continuation() {
+            cursor_col -= 1;
+        }
+        let cursor_width = grid.cell(cursor_col, cursor_row).width().max(1);
         let selection_bg = theme.selection_bg.to_f32();
         let selection_fg = theme.selection_fg.to_f32();
         let cursor_bg = theme.cursor.to_f32();
@@ -1084,6 +1482,17 @@ impl Renderer {
                     && (row < end_row || (row == end_row && col <= end_col))
             }
         };
+        // Search-match highlight: a fixed amber, independent of the active
+        // theme, so it reads clearly against any color scheme. Matches are
+        // always single-row (Find operates on flattened row text).
+        const MATCH_BG: [f32; 4] = [0.85, 0.62, 0.09, 0.9];
+        const MATCH_FG: [f32; 4] = [0.05, 0.03, 0.0, 1.0];
+        let in_match = |col: usize, row: usize| -> bool {
+            let Some(((start_col, m_row), (end_col, _))) = search_match else {
+                return false;
+            };
+            row == m_row && col >= start_col && col <= end_col
+        };
 
         if partial_redraw && row_start < row_end_exclusive {
             let mut base_bg = theme.background.to_f32();
@@ -1095,64 +1504,224 @@ impl Renderer {
             }
         }
 
+        let context = [
+            sw,
+            sh,
+            cw,
+            ch,
+            phys_pad,
+            content_top,
+            self.scale_factor,
+            self.background_opacity,
+        ];
+        if self
+            .cache_context
+            .as_ref()
+            .is_none_or(|(old, old_theme, style)| {
+                *old != context || old_theme != theme || *style != cursor_style
+            })
+        {
+            self.row_cache.clear();
+            self.cache_context = Some((context, theme.clone(), cursor_style));
+        }
+        self.row_cache.resize_with(grid.rows, CachedRow::default);
+        let row_keys: Vec<RowKey> = (0..grid.rows)
+            .map(|row| RowKey {
+                cursor: if cursor_visible && row == cursor_row {
+                    Some(cursor_col)
+                } else {
+                    None
+                },
+                selection,
+                block: selection_block,
+                search: search_match,
+            })
+            .collect();
+        let row_matches: Vec<bool> = (0..grid.rows)
+            .map(|row| self.row_cache[row].matches(grid, row, row_keys[row]))
+            .collect();
+        // Under full-screen churn, caching large vertex arrays adds work with
+        // no reuse. Keep only compact source snapshots until output settles.
+        let cache_geometry = self.row_cache_enabled
+            && row_matches.iter().filter(|&&same| same).count() * 4 >= grid.rows;
+        let reuse_rows: Vec<bool> = row_matches
+            .iter()
+            .enumerate()
+            .map(|(row, &same)| self.row_cache_enabled && same && self.row_cache[row].valid)
+            .collect();
+
+        self.last_frame_reused_rows = reuse_rows.iter().filter(|&&reuse| reuse).count();
+
         // ── terminal background quads ────────────────────────────────────────
-        for row in row_start..row_end_exclusive {
+        for (row, &reuse) in reuse_rows
+            .iter()
+            .enumerate()
+            .take(row_end_exclusive)
+            .skip(row_start)
+        {
+            if reuse {
+                bg_verts.extend_from_slice(&self.row_cache[row].backgrounds);
+                continue;
+            }
+            let first_vertex = bg_verts.len();
             for col in 0..grid.cols {
                 let cell = grid.cell(col, row);
-                let is_cursor = cursor_visible && col == cursor_col && row == cursor_row;
+                let is_cursor = cursor_visible
+                    && col >= cursor_col
+                    && col < cursor_col + cursor_width
+                    && row == cursor_row;
                 let is_selected = in_selection(col, row);
+                let is_match = in_match(col, row);
                 let resolved_bg = if cell.reverse {
                     cell.fg.resolve_fg(theme).to_f32()
                 } else {
                     cell.bg.resolve_bg(theme).to_f32()
                 };
                 let has_custom_bg = !matches!(cell.bg, CellColor::Default) || cell.reverse;
-                if !is_cursor && !is_selected && !has_custom_bg {
+                if !is_cursor && !is_selected && !is_match && !has_custom_bg && !cell.underline {
                     continue;
                 }
-                let color = if is_cursor {
-                    match cursor_style {
-                        CursorStyle::Block => cursor_bg,
-                        CursorStyle::Underline => resolved_bg,
-                        CursorStyle::Beam => resolved_bg,
-                    }
+                let is_block_cursor = is_cursor && cursor_style == CursorStyle::Block;
+                let color = if is_block_cursor {
+                    cursor_bg
+                } else if is_match {
+                    MATCH_BG
                 } else if is_selected {
                     selection_bg
                 } else {
                     resolved_bg
                 };
-                let px = phys_pad + col as f32 * cw;
-                let py = content_top + phys_pad + row as f32 * ch;
+                let px = (phys_pad + col as f32 * cw).round();
+                let py = (content_top + phys_pad + row as f32 * ch).round();
+                let cw = (phys_pad + (col + 1) as f32 * cw).round() - px;
+                let ch = (content_top + phys_pad + (row + 1) as f32 * ch).round() - py;
+                // Non-block cursors only add a stroke over the normal cell.
+                // Filling a default cell with resolved_bg would replace the
+                // transparent clear with alpha=1 and create a dark rectangle.
+                if is_block_cursor || is_selected || is_match || has_custom_bg {
+                    self.draw_rect(&mut bg_verts, px, py, cw, ch, color);
+                }
                 if is_cursor {
                     match cursor_style {
-                        CursorStyle::Block => self.draw_rect(&mut bg_verts, px, py, cw, ch, color),
+                        CursorStyle::Block => {}
                         CursorStyle::Underline => {
                             let h = (1.5 * self.scale_factor).max(2.0).min(ch);
                             self.draw_rect(&mut bg_verts, px, py + ch - h, cw, h, cursor_bg);
                         }
                         CursorStyle::Beam => {
                             let w = (1.2 * self.scale_factor).max(1.5).min(cw);
-                            self.draw_rect(&mut bg_verts, px, py, w, ch, cursor_bg);
+                            if col == cursor_col {
+                                self.draw_rect(&mut bg_verts, px, py, w, ch, cursor_bg);
+                            }
                         }
                     }
-                } else {
-                    self.draw_rect(&mut bg_verts, px, py, cw, ch, color);
                 }
+                if cell.underline {
+                    let thickness = self.scale_factor.round().max(1.0).min(ch);
+                    let fg = if is_cursor && cursor_style == CursorStyle::Block {
+                        cursor_text
+                    } else if is_match {
+                        MATCH_FG
+                    } else if is_selected {
+                        selection_fg
+                    } else if cell.reverse {
+                        cell.bg.resolve_bg(theme).to_f32()
+                    } else {
+                        cell.fg.resolve_fg(theme).to_f32()
+                    };
+                    self.draw_rect(
+                        &mut bg_verts,
+                        px,
+                        underline_top(py, self.font_baseline, thickness, ch),
+                        cw,
+                        thickness,
+                        fg,
+                    );
+                }
+            }
+            let cached = &mut self.row_cache[row];
+            cached.backgrounds.clear();
+            if cache_geometry {
+                cached
+                    .backgrounds
+                    .extend_from_slice(&bg_verts[first_vertex..]);
             }
         }
 
         // ── terminal glyph quads ─────────────────────────────────────────────
-        for row in row_start..row_end_exclusive {
+        for (row, &reuse) in reuse_rows
+            .iter()
+            .enumerate()
+            .take(row_end_exclusive)
+            .skip(row_start)
+        {
+            if reuse {
+                glyph_verts.extend_from_slice(&self.row_cache[row].glyphs);
+                continue;
+            }
+            let first_vertex = glyph_verts.len();
             for col in 0..grid.cols {
                 let cell = grid.cell(col, row);
-                if cell.c == ' ' {
+                let extended = grid.extended_text(cell);
+                let c = grid.cell_char(cell);
+                if cell.is_continuation() || (c == ' ' && extended.is_none()) {
                     continue;
                 }
-                let cache_key = (cell.c, cell.bold, cell.italic);
-                if !self.shape_cache.contains_key(&cache_key) {
+                let cell_top = content_top + phys_pad + row as f32 * ch;
+                let is_cursor = cursor_visible
+                    && col >= cursor_col
+                    && col < cursor_col + cursor_width
+                    && row == cursor_row;
+                let is_selected = in_selection(col, row);
+                let is_match = in_match(col, row);
+                let resolved_fg = if cell.reverse {
+                    cell.bg.resolve_bg(theme).to_f32()
+                } else {
+                    cell.fg.resolve_fg(theme).to_f32()
+                };
+                let color = if is_cursor && cursor_style == CursorStyle::Block {
+                    cursor_text
+                } else if is_match {
+                    MATCH_FG
+                } else if is_selected {
+                    selection_fg
+                } else {
+                    resolved_fg
+                };
+
+                if extended.is_none() && crate::symbols::is_cell_symbol(c) {
+                    let x = (phys_pad + col as f32 * cw).round();
+                    let y = cell_top.round();
+                    let width = ((phys_pad + (col + 1) as f32 * cw).round() - x).max(1.0) as u32;
+                    let height = ((content_top + phys_pad + (row + 1) as f32 * ch).round() - y)
+                        .max(1.0) as u32;
+                    if let Some(region) = self.atlas.get_cell_symbol(c, width, height) {
+                        append_glyph_quad(&mut glyph_verts, sw, sh, x, y, region, color);
+                    }
+                    continue;
+                }
+                let cache_key = (c, cell.bold, cell.italic);
+                let extended_key = extended.map(|text| (text.to_string(), cell.bold, cell.italic));
+                if let Some(key) = extended_key.as_ref() {
+                    if !self.extended_shape_cache.contains_key(key) {
+                        let glyphs = Self::shape_text(
+                            &mut self.font_system,
+                            &key.0,
+                            metrics,
+                            cw,
+                            ch,
+                            &fam_name,
+                            self.symbol_font_family.as_deref(),
+                            &mut self.swash_cache,
+                            cell.bold,
+                            cell.italic,
+                        );
+                        self.extended_shape_cache.insert(key.clone(), glyphs);
+                    }
+                } else if !self.shape_cache.contains_key(&cache_key) {
                     let glyphs = Self::shape_char(
                         &mut self.font_system,
-                        cell.c,
+                        c,
                         metrics,
                         cw,
                         ch,
@@ -1165,23 +1734,11 @@ impl Renderer {
                     self.shape_cache.insert(cache_key, glyphs);
                 }
 
-                let cell_top = content_top + phys_pad + row as f32 * ch;
-                let is_cursor = cursor_visible && col == cursor_col && row == cursor_row;
-                let is_selected = in_selection(col, row);
-                let resolved_fg = if cell.reverse {
-                    cell.bg.resolve_bg(theme).to_f32()
-                } else {
-                    cell.fg.resolve_fg(theme).to_f32()
-                };
-                let color = if is_cursor && cursor_style == CursorStyle::Block {
-                    cursor_text
-                } else if is_selected {
-                    selection_fg
-                } else {
-                    resolved_fg
-                };
-
-                let glyph_infos = match self.shape_cache.get(&cache_key) {
+                let glyph_infos = match extended_key
+                    .as_ref()
+                    .and_then(|key| self.extended_shape_cache.get(key))
+                    .or_else(|| self.shape_cache.get(&cache_key))
+                {
                     Some(v) => v,
                     None => continue,
                 };
@@ -1195,58 +1752,42 @@ impl Renderer {
                         continue;
                     };
 
+                    let (local_x, local_y) = glyph_bitmap_origin(
+                        gi.glyph_x,
+                        gi.glyph_y,
+                        gi.line_y,
+                        region.offset_x,
+                        region.offset_y,
+                    );
                     let gx = phys_pad
                         + col as f32 * cw
-                        + gi.glyph_x
-                        + region.offset_x as f32
-                        + Self::cell_x_offset_for_char(cell.c) * cw;
-                    let gy = cell_top + gi.line_y - region.offset_y as f32
-                        + Self::cell_y_offset_for_char(cell.c, ch);
+                        + local_x
+                        + Self::cell_x_offset_for_char(cell.c()) * cw;
+                    let gy = cell_top + local_y + Self::cell_y_offset_for_char(cell.c(), ch);
                     let gx = Self::snap_to_pixel(gx);
                     let gy = Self::snap_to_pixel(gy);
-                    let gw = region.width as f32;
-                    let gh = region.height as f32;
-
-                    let x0 = (gx / sw) * 2.0 - 1.0;
-                    let x1 = ((gx + gw) / sw) * 2.0 - 1.0;
-                    let y0 = 1.0 - (gy / sh) * 2.0;
-                    let y1 = 1.0 - ((gy + gh) / sh) * 2.0;
-                    let [u0, v0, u1, v1] = [region.u0, region.v0, region.u1, region.v1];
-
-                    glyph_verts.extend_from_slice(&[
-                        GlyphVertex {
-                            pos: [x0, y0],
-                            uv: [u0, v0],
-                            color,
-                        },
-                        GlyphVertex {
-                            pos: [x1, y0],
-                            uv: [u1, v0],
-                            color,
-                        },
-                        GlyphVertex {
-                            pos: [x0, y1],
-                            uv: [u0, v1],
-                            color,
-                        },
-                        GlyphVertex {
-                            pos: [x1, y0],
-                            uv: [u1, v0],
-                            color,
-                        },
-                        GlyphVertex {
-                            pos: [x1, y1],
-                            uv: [u1, v1],
-                            color,
-                        },
-                        GlyphVertex {
-                            pos: [x0, y1],
-                            uv: [u0, v1],
-                            color,
-                        },
-                    ]);
+                    append_glyph_quad(&mut glyph_verts, sw, sh, gx, gy, region, color);
                 }
             }
+            let cached = &mut self.row_cache[row];
+            cached.glyphs.clear();
+            if cache_geometry {
+                cached
+                    .glyphs
+                    .extend_from_slice(&glyph_verts[first_vertex..]);
+            }
+            cached.valid = cache_geometry;
+            cached.cells.clear();
+            cached.cells.extend_from_slice(grid.row_cells(row));
+            cached.extended.clear();
+            if grid.has_extended_text() {
+                for (col, cell) in grid.row_cells(row).iter().enumerate() {
+                    if let Some(text) = grid.extended_text(cell) {
+                        cached.extended.push((col, text.to_string()));
+                    }
+                }
+            }
+            cached.key = row_keys[row];
         }
 
         // ── tab bar ──────────────────────────────────────────────────────────
@@ -1415,12 +1956,23 @@ impl Renderer {
                             ) else {
                                 continue;
                             };
-                            let rel_x = glyph.x + region.offset_x as f32;
+                            let title_color = if region.is_color {
+                                [1.0, 1.0, 1.0, title_color[3]]
+                            } else {
+                                title_color
+                            };
+                            let (rel_x, rel_y) = glyph_bitmap_origin(
+                                physical.x,
+                                physical.y,
+                                run.line_y,
+                                region.offset_x,
+                                region.offset_y,
+                            );
                             if rel_x + region.width as f32 > max_text_w {
                                 break;
                             }
-                            let gx = bx + glyph.x + region.offset_x as f32;
-                            let gy = by + run.line_y - region.offset_y as f32;
+                            let gx = bx + rel_x;
+                            let gy = by + rel_y;
                             let gw = region.width as f32;
                             let gh = region.height as f32;
                             let x0 = (gx / sw) * 2.0 - 1.0;
@@ -1575,6 +2127,146 @@ impl Renderer {
         for d in dividers {
             self.draw_rect(&mut bg_verts, d.x, d.y, d.width, d.height, d.color);
         }
+
+        // ── overlays: read-only badge, inspector, Find/rename prompt ─────────
+        // Drawn last so they sit on top of the terminal content and dividers.
+        if read_only {
+            let font_sz = 11.0 * self.scale_factor;
+            let pad = 5.0 * self.scale_factor;
+            let label = "READ-ONLY";
+            let box_w = Self::approx_text_width(label, font_sz) + pad * 2.0;
+            let box_h = font_sz * 1.7;
+            let box_x = phys_pad;
+            let box_y = content_top + phys_pad;
+            self.draw_rect(
+                &mut bg_verts,
+                box_x,
+                box_y,
+                box_w,
+                box_h,
+                [0.6, 0.15, 0.15, 0.85],
+            );
+            self.draw_text(
+                &mut glyph_verts,
+                label,
+                box_x + pad,
+                box_y + pad * 0.4,
+                font_sz,
+                [1.0, 0.9, 0.9, 1.0],
+            );
+        }
+
+        if let Some(info) = inspector.as_ref() {
+            let text = format!(
+                "grid {}x{}  cursor {},{}  scrollback {}",
+                info.cols, info.rows, info.cursor_col, info.cursor_row, info.scrollback_len
+            );
+            let font_sz = 11.0 * self.scale_factor;
+            let pad = 6.0 * self.scale_factor;
+            let box_w = Self::approx_text_width(&text, font_sz) + pad * 2.0;
+            let box_h = font_sz * 1.8;
+            let margin = 8.0 * self.scale_factor;
+            let box_x = sw - box_w - margin;
+            let box_y = sh - box_h - margin;
+            self.draw_rect(
+                &mut bg_verts,
+                box_x,
+                box_y,
+                box_w,
+                box_h,
+                [0.05, 0.05, 0.06, 0.85],
+            );
+            self.draw_text(
+                &mut glyph_verts,
+                &text,
+                box_x + pad,
+                box_y + pad * 0.5,
+                font_sz,
+                [0.85, 0.85, 0.5, 1.0],
+            );
+        }
+
+        if let Some(p) = prompt.as_ref() {
+            let box_w = (420.0 * self.scale_factor).min((sw - 40.0).max(200.0));
+            let box_h = 72.0 * self.scale_factor;
+            let box_x = (sw - box_w) / 2.0;
+            let box_y = (40.0 * self.scale_factor).max(20.0);
+            let border = (1.5 * self.scale_factor).max(1.0);
+            self.draw_rect(
+                &mut bg_verts,
+                box_x - border,
+                box_y - border,
+                box_w + border * 2.0,
+                box_h + border * 2.0,
+                [0.42, 0.42, 0.47, 1.0],
+            );
+            self.draw_rect(
+                &mut bg_verts,
+                box_x,
+                box_y,
+                box_w,
+                box_h,
+                [0.12, 0.12, 0.14, 0.97],
+            );
+
+            let pad = 14.0 * self.scale_factor;
+            let title_size = 12.0 * self.scale_factor;
+            let input_size = 15.0 * self.scale_factor;
+            self.draw_text(
+                &mut glyph_verts,
+                p.title,
+                box_x + pad,
+                box_y + pad * 0.5,
+                title_size,
+                [0.7, 0.7, 0.75, 1.0],
+            );
+
+            if p.title == "Find" {
+                let counter = if p.match_count == 0 {
+                    "0/0".to_string()
+                } else {
+                    format!(
+                        "{}/{}{}",
+                        p.current_match + 1,
+                        p.match_count,
+                        if p.matches_truncated { "+" } else { "" }
+                    )
+                };
+                let counter_w = Self::approx_text_width(&counter, title_size);
+                self.draw_text(
+                    &mut glyph_verts,
+                    &counter,
+                    box_x + box_w - pad - counter_w,
+                    box_y + pad * 0.5,
+                    title_size,
+                    [0.7, 0.7, 0.75, 1.0],
+                );
+            }
+
+            let input_y = box_y + pad * 0.5 + title_size * 1.5;
+            let display_text = if p.text.is_empty() { " " } else { p.text };
+            self.draw_text(
+                &mut glyph_verts,
+                display_text,
+                box_x + pad,
+                input_y,
+                input_size,
+                [0.95, 0.95, 0.97, 1.0],
+            );
+
+            let chars_before: String = p.text.chars().take(p.cursor).collect();
+            let cursor_x = box_x + pad + Self::approx_text_width(&chars_before, input_size);
+            let cursor_w = (1.5 * self.scale_factor).max(1.0);
+            self.draw_rect(
+                &mut bg_verts,
+                cursor_x,
+                input_y,
+                cursor_w,
+                input_size * 1.15,
+                [0.95, 0.95, 0.97, 0.9],
+            );
+        }
+
         self.submit_frame(
             view,
             output,
@@ -1590,5 +2282,71 @@ impl Renderer {
         );
         self.frame_bg_verts = bg_verts;
         self.frame_glyph_verts = glyph_verts;
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    #[test]
+    fn physical_glyph_offsets_and_bitmap_bearings_are_preserved() {
+        // A shaped glyph may carry offsets in both axes (notably fallback and
+        // combining glyphs). These are the coordinates cosmic-text draws at.
+        assert_eq!(glyph_bitmap_origin(7, -3, 15.5, -2, 11), (5.0, 1.5));
+        assert_eq!(glyph_bitmap_origin(0, 0, 18.0, 1, 14), (1.0, 4.0));
+    }
+
+    #[test]
+    fn underline_tracks_baseline_when_line_height_changes() {
+        let thickness = 2.0;
+        let top_short = underline_top(100.0, 15.0, thickness, 20.0);
+        let top_tall = underline_top(100.0, 23.0, thickness, 36.0);
+        assert_eq!(top_short, 117.0);
+        assert_eq!(top_tall, 125.0);
+        assert!(top_short + thickness <= 120.0);
+        assert!(top_tall + thickness <= 136.0);
+    }
+
+    /// CPU glyph shaping only; not a GPU-frame or input-to-photon benchmark.
+    /// Run with `cargo test -p volt-renderer --release benchmark_terminal_glyph_shaping -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn benchmark_terminal_glyph_shaping() {
+        let mut font_system = FontSystem::new();
+        let mut swash_cache = SwashCache::new();
+        let glyphs: Vec<char> = "0123456789abcdefNORMAL→│█".chars().collect();
+        let font_size = 14.0;
+        let iterations = 100;
+        let start = std::time::Instant::now();
+        let mut shaped = 0usize;
+        for line_height in [1.0, 1.2, 1.8] {
+            let metrics = Renderer::glyph_layout_metrics(font_size, line_height);
+            for _ in 0..iterations {
+                for &c in &glyphs {
+                    shaped += Renderer::shape_char(
+                        &mut font_system,
+                        c,
+                        metrics,
+                        9.0,
+                        font_size * line_height,
+                        "monospace",
+                        None,
+                        &mut swash_cache,
+                        false,
+                        false,
+                    )
+                    .len();
+                }
+            }
+        }
+        std::hint::black_box(shaped);
+        eprintln!(
+            "terminal glyph CPU shaping: {} chars, {} glyphs in {:?} ({:.0} chars/s)",
+            glyphs.len() * iterations * 3,
+            shaped,
+            start.elapsed(),
+            (glyphs.len() * iterations * 3) as f64 / start.elapsed().as_secs_f64()
+        );
     }
 }

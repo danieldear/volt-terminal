@@ -34,7 +34,7 @@ impl Default for Color {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
     pub background: Color,
     pub foreground: Color,

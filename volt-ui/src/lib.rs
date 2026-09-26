@@ -1,7 +1,9 @@
 pub mod app;
 pub mod chat_panel;
 pub mod display_link;
+pub mod menu;
 pub mod pane_tree;
+pub mod prompt;
 pub mod tab;
 pub mod tab_layout;
 pub use app::App;

@@ -62,6 +62,19 @@ impl PaneTree {
         direction: PaneSplitDirection,
         new_pane: TerminalPane,
     ) {
+        self.split_positioned(target_id, direction, new_pane, false);
+    }
+
+    /// Split `target_id`, placing the new pane before (left/above) the
+    /// original when `insert_before` is true, or after (right/below, the
+    /// default `split` behavior) otherwise.
+    pub fn split_positioned(
+        &mut self,
+        target_id: usize,
+        direction: PaneSplitDirection,
+        new_pane: TerminalPane,
+        insert_before: bool,
+    ) {
         let new_pane_id = self.next_id;
         self.next_id += 1;
         let divider_id = self.next_id;
@@ -75,6 +88,7 @@ impl PaneTree {
                 &mut pane_opt,
                 new_pane_id,
                 divider_id,
+                insert_before,
             ) {
                 self.active_id = new_pane_id;
             }
@@ -102,7 +116,20 @@ impl PaneTree {
     pub fn layout(&self, cols: usize, rows: usize) -> Vec<PaneRect> {
         let mut out = Vec::new();
         if let Some(root) = &self.root {
-            layout_node(root, 0, 0, cols, rows, &mut out);
+            let (minimum_cols, minimum_rows) = minimum_size_node(root);
+            if cols < minimum_cols || rows < minimum_rows {
+                // The tree cannot fit without overlapping panes. Keep the
+                // focused pane usable until the window is large enough again.
+                out.push(PaneRect {
+                    id: self.active_id,
+                    col: 0,
+                    row: 0,
+                    cols: cols.max(1),
+                    rows: rows.max(1),
+                });
+            } else {
+                layout_node(root, 0, 0, cols, rows, &mut out);
+            }
         }
         out
     }
@@ -125,6 +152,10 @@ impl PaneTree {
     ) -> Vec<DividerInfo> {
         let mut out = Vec::new();
         if let Some(root) = &self.root {
+            let (minimum_cols, minimum_rows) = minimum_size_node(root);
+            if cols < minimum_cols || rows < minimum_rows {
+                return out;
+            }
             dividers_node(
                 root,
                 0,
@@ -224,6 +255,38 @@ impl PaneTree {
 }
 
 // ── recursive helpers ─────────────────────────────────────────────────────────
+
+fn minimum_size_for_split(
+    direction: PaneSplitDirection,
+    first: (usize, usize),
+    second: (usize, usize),
+) -> (usize, usize) {
+    match direction {
+        PaneSplitDirection::Vertical => (
+            first.0.saturating_add(second.0).saturating_add(1),
+            first.1.max(second.1),
+        ),
+        PaneSplitDirection::Horizontal => (
+            first.0.max(second.0),
+            first.1.saturating_add(second.1).saturating_add(1),
+        ),
+    }
+}
+
+fn minimum_size_node(node: &PaneNode) -> (usize, usize) {
+    match node {
+        PaneNode::Leaf { .. } => (1, 1),
+        PaneNode::Split {
+            direction,
+            children,
+            ..
+        } => minimum_size_for_split(
+            *direction,
+            minimum_size_node(&children[0]),
+            minimum_size_node(&children[1]),
+        ),
+    }
+}
 
 fn layout_node(
     node: &PaneNode,
@@ -470,6 +533,7 @@ fn collect_leaf_ids(node: &PaneNode, out: &mut Vec<usize>) {
 }
 
 /// Returns `true` if target was found and split was performed.
+#[allow(clippy::too_many_arguments)]
 fn split_node(
     node: &mut PaneNode,
     target_id: usize,
@@ -477,6 +541,7 @@ fn split_node(
     new_pane: &mut Option<TerminalPane>,
     new_pane_id: usize,
     divider_id: usize,
+    insert_before: bool,
 ) -> bool {
     match node {
         PaneNode::Leaf { id, .. } if *id == target_id => {
@@ -486,16 +551,14 @@ fn split_node(
             // SAFETY: we immediately overwrite `node` before the old value can be observed
             // again; the old Leaf is moved into the new Split's children array.
             let old_leaf = unsafe { std::ptr::read(node) };
+            let new_leaf = PaneNode::Leaf {
+                pane,
+                id: new_pane_id,
+            };
             let new_split = PaneNode::Split {
                 direction,
                 ratio: 0.5,
-                children: Box::new([
-                    old_leaf,
-                    PaneNode::Leaf {
-                        pane,
-                        id: new_pane_id,
-                    },
-                ]),
+                children: Box::new(ordered_children(old_leaf, new_leaf, insert_before)),
                 divider_id,
             };
             unsafe { std::ptr::write(node, new_split) };
@@ -511,6 +574,7 @@ fn split_node(
                 new_pane,
                 new_pane_id,
                 divider_id,
+                insert_before,
             ) {
                 return true;
             }
@@ -521,6 +585,7 @@ fn split_node(
                 new_pane,
                 new_pane_id,
                 divider_id,
+                insert_before,
             )
         }
     }
@@ -702,6 +767,20 @@ fn for_each_leaf_mut_node(node: &mut PaneNode, f: &mut impl FnMut(usize, &mut Te
     }
 }
 
+/// `layout_node`/`dividers_node` place `children[0]` left-or-top and
+/// `children[1]` right-or-bottom, purely positionally — so "insert before"
+/// (Split Left / Split Up) is just swapping which slot the new pane lands
+/// in. Extracted as a plain function (not inlined into `split_node`) so the
+/// ordering decision is unit-testable without needing a real `TerminalPane`,
+/// which requires a live winit `EventLoopProxy` to construct.
+fn ordered_children<T>(old: T, new: T, insert_before: bool) -> [T; 2] {
+    if insert_before {
+        [new, old]
+    } else {
+        [old, new]
+    }
+}
+
 // ── layout arithmetic helpers ─────────────────────────────────────────────────
 
 fn left_cols_from_ratio(ratio: f32, cols: usize) -> usize {
@@ -724,4 +803,34 @@ fn top_rows_from_ratio(ratio: f32, rows: usize) -> usize {
     let max_ratio = (usable - 1) as f32 / usable as f32;
     let tr = (usable as f32 * ratio.clamp(min_ratio, max_ratio)).round() as usize;
     tr.max(1).min(usable - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordered_children_after_is_old_then_new() {
+        // Split Right / Split Down: original pane stays left/top (slot 0).
+        assert_eq!(ordered_children("old", "new", false), ["old", "new"]);
+    }
+
+    #[test]
+    fn ordered_children_before_is_new_then_old() {
+        // Split Left / Split Up: new pane takes left/top (slot 0), original
+        // pane is pushed to right/bottom (slot 1).
+        assert_eq!(ordered_children("old", "new", true), ["new", "old"]);
+    }
+
+    #[test]
+    fn split_minimum_size_accounts_for_divider_and_nested_children() {
+        assert_eq!(
+            minimum_size_for_split(PaneSplitDirection::Vertical, (1, 1), (1, 1)),
+            (3, 1)
+        );
+        assert_eq!(
+            minimum_size_for_split(PaneSplitDirection::Horizontal, (3, 1), (1, 1)),
+            (3, 3)
+        );
+    }
 }

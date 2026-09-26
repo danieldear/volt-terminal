@@ -2,6 +2,7 @@
 name = "volt-renderer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
@@ -13,3 +14,7 @@ pollster = "0.3"
 tokio = { workspace = true, features = ["rt", "sync"] }
 volt-core = { path = "../volt-core" }
 volt-config = { path = "../volt-config" }
+
+[dev-dependencies]
+vte = "0.15"
+png = "0.17"

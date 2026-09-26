@@ -8,6 +8,6 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @lo
     return VOut(vec4<f32>(in.pos, 0.0, 1.0), in.uv, in.color);
 }
 @fragment fn fs_glyph(in: VOut) -> @location(0) vec4<f32> {
-    let a = textureSample(t_atlas, s_atlas, in.uv).r;
-    return vec4<f32>(in.color.rgb, in.color.a * a);
+    let texel = textureSample(t_atlas, s_atlas, in.uv);
+    return vec4<f32>(in.color.rgb * texel.rgb, in.color.a * texel.a);
 }

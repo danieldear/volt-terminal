@@ -56,9 +56,17 @@ jobs:
             libxcursor-dev \
             libxinerama-dev
 
+      # Release must validate its own tagged source; the separately triggered
+      # CI workflow may still be running (or fail) when this workflow starts.
+      - name: Validate tagged source
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+
       - name: Build Linux binary
         if: matrix.package == 'linux'
-        run: cargo build --release -p volt
+        run: cargo build --locked --release -p volt
 
       - name: Package Linux binary
         if: matrix.package == 'linux'

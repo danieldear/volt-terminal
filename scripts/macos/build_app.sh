@@ -36,10 +36,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 if [[ "$MODE" == "release" ]]; then
-  BUILD_ARGS=(build --release -p volt)
+  BUILD_ARGS=(build --locked --release -p volt)
   BIN_PATH="${ROOT_DIR}/target/release/volt"
 else
-  BUILD_ARGS=(build -p volt)
+  BUILD_ARGS=(build --locked -p volt)
   BIN_PATH="${ROOT_DIR}/target/debug/volt"
 fi
 

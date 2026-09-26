@@ -360,6 +360,24 @@ pub fn config_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("config.toml"))
 }
 
+/// Open the same existing config that `load_with_diagnostics` prefers. When a
+/// legacy file is still in use, opening Settings must not create a new default
+/// primary file that silently shadows the user's old settings on reload.
+pub fn config_path_to_edit() -> Option<PathBuf> {
+    select_config_path_to_edit(config_path(), legacy_config_path())
+}
+
+fn select_config_path_to_edit(
+    primary: Option<PathBuf>,
+    legacy: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match (primary, legacy) {
+        (Some(primary), Some(legacy)) if !primary.exists() && legacy.exists() => Some(legacy),
+        (Some(primary), _) => Some(primary),
+        (None, legacy) => legacy,
+    }
+}
+
 fn legacy_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("volt").join("config.toml"))
 }
@@ -504,6 +522,32 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_prefers_existing_legacy_config_over_creating_shadow_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "volt-config-legacy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let primary = dir.join("preferred.toml");
+        let legacy = dir.join("legacy.toml");
+        std::fs::write(&legacy, "theme = \"dracula\"\n").unwrap();
+        assert_eq!(
+            select_config_path_to_edit(Some(primary.clone()), Some(legacy.clone())),
+            Some(legacy.clone())
+        );
+        std::fs::write(&primary, "theme = \"nord\"\n").unwrap();
+        assert_eq!(
+            select_config_path_to_edit(Some(primary.clone()), Some(legacy)),
+            Some(primary)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn test_default_config_is_valid() {

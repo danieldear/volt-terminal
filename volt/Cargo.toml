@@ -2,6 +2,7 @@
 name = "volt"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "A fast, GPU-accelerated terminal emulator"
 
 [package.metadata.bundle]

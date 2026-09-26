@@ -11,7 +11,7 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::macos::{ActiveEventLoopExtMacOS, WindowExtMacOS};
 use winit::window::{Window, WindowId};
 
-use volt_config::{config_path, sample_config_toml, Config, Theme};
+use volt_config::{config_path_to_edit, sample_config_toml, Config, Theme};
 use volt_core::events::CoreEvent;
 use volt_core::grid::Grid;
 use volt_core::performer::MouseTrackingMode;
@@ -37,6 +37,11 @@ pub enum VoltEvent {
     #[cfg(target_os = "macos")]
     /// Request to open a new terminal window (used for native macOS tab creation).
     CreateNewWindow,
+    #[cfg(target_os = "macos")]
+    /// A native menu bar or context menu item was clicked. Carries the raw
+    /// `muda::MenuId` string; resolved to a `menu::MenuAction` on receipt so
+    /// this event type doesn't need to depend on `muda`'s types directly.
+    Menu(String),
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -108,6 +113,19 @@ struct MainState {
     #[cfg(target_os = "macos")]
     /// Last title handed to the native window, so idle ticks skip `set_title`.
     last_native_title: String,
+    /// Time of the last left-click on empty tab-bar chrome (not a tab, not
+    /// the + button), for double-click-to-maximize detection.
+    last_tab_bar_click: Option<Instant>,
+    /// Active Find / Change Tab Title / Change Terminal Title overlay, if
+    /// any. While `Some`, keyboard input is captured by the prompt instead
+    /// of being sent to the terminal.
+    active_prompt: Option<crate::prompt::TextPrompt>,
+    search_dirty: bool,
+    search_target: Option<(usize, usize)>,
+    last_search_refresh: Instant,
+    /// Debug overlay toggled by the context menu's "Toggle Terminal
+    /// Inspector" — grid size, cursor position, scrollback length.
+    show_inspector: bool,
 }
 
 impl MainState {
@@ -376,14 +394,33 @@ impl MainState {
     }
 
     fn split_active_tab(&mut self, direction: PaneSplitDirection) -> bool {
+        self.split_active_tab_positioned(direction, false)
+    }
+
+    /// Split the active pane. `insert_before` places the new pane to the
+    /// left/above the original (Split Left/Up) instead of the default
+    /// right/below (Split Right/Down).
+    fn split_active_tab_positioned(
+        &mut self,
+        direction: PaneSplitDirection,
+        insert_before: bool,
+    ) -> bool {
         let (total_cols, total_rows) = self.current_grid_size();
         let active_id = self.active_tab().tree.active_id;
         let rects = self.active_tab().tree.layout(total_cols, total_rows);
         let active_rect = rects.iter().find(|r| r.id == active_id).copied();
+        let Some(active_rect) = active_rect else {
+            return false;
+        };
+        if match direction {
+            PaneSplitDirection::Vertical => active_rect.cols < 3,
+            PaneSplitDirection::Horizontal => active_rect.rows < 3,
+        } {
+            return false;
+        }
         let (pane_cols, pane_rows) = match (active_rect, direction) {
-            (Some(r), PaneSplitDirection::Vertical) => ((r.cols / 2).max(1), r.rows),
-            (Some(r), PaneSplitDirection::Horizontal) => (r.cols, (r.rows / 2).max(1)),
-            (None, _) => (total_cols.max(1), total_rows.max(1)),
+            (r, PaneSplitDirection::Vertical) => ((r.cols / 2).max(1), r.rows),
+            (r, PaneSplitDirection::Horizontal) => (r.cols, (r.rows / 2).max(1)),
         };
         let config = self.config.clone();
         let proxy = self.proxy.clone();
@@ -395,10 +432,41 @@ impl MainState {
         };
         self.active_tab_mut()
             .tree
-            .split(active_id, direction, new_pane);
+            .split_positioned(active_id, direction, new_pane, insert_before);
         self.resize_all_tabs_to_current_grid();
         self.selection = None;
         true
+    }
+
+    /// Close the active pane, and if it was the tab's last pane, close the
+    /// tab too. Returns `true` if the window itself should now close (this
+    /// was the last tab in this window). Shared by the Cmd+W shortcut and
+    /// the File > Close Tab menu action so both stay in sync.
+    fn close_active_pane_or_tab(&mut self) -> bool {
+        self.divider_drag = None;
+        let active_id = self.active_tab().tree.active_id;
+        let tab_idx = self.active_tab;
+        let should_close_tab = self.remove_pane_from_tab(tab_idx, active_id);
+        let close_window = if should_close_tab {
+            if self.tabs.len() > 1 {
+                self.close_tab(tab_idx);
+                false
+            } else {
+                // Last pane in the last tab of this window.
+                #[cfg(target_os = "macos")]
+                {
+                    true
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        self.begin_redraw();
+        close_window
     }
 
     /// Remove a pane from the given tab by id. Returns `true` if the tab itself
@@ -454,7 +522,7 @@ impl MainState {
         // Row-slice memcpys: this runs while holding the performer lock, so it
         // must be fast or it stalls the PTY parse thread.
         for row in 0..rows {
-            dst.copy_into_row(dst_row + row, dst_col, &src.row_cells(row)[..cols]);
+            dst.copy_from_grid(dst_row + row, dst_col, src, &src.row_cells(row)[..cols]);
         }
     }
 
@@ -487,10 +555,20 @@ impl MainState {
             if sb_idx >= sb_len {
                 break;
             }
-            dst.copy_into_row(dst_row + r, dst_col, &src.scrollback_row(sb_idx)[..cols]);
+            dst.copy_from_grid(
+                dst_row + r,
+                dst_col,
+                src,
+                &src.scrollback_row(sb_idx)[..cols],
+            );
         }
         for r in 0..grid_rows.min(src.rows) {
-            dst.copy_into_row(dst_row + sb_rows + r, dst_col, &src.row_cells(r)[..cols]);
+            dst.copy_from_grid(
+                dst_row + sb_rows + r,
+                dst_col,
+                src,
+                &src.row_cells(r)[..cols],
+            );
         }
     }
 
@@ -551,9 +629,13 @@ impl MainState {
         self.begin_redraw();
     }
 
-    fn handle_click(&mut self, mx: f32, my: f32) {
+    /// Handle a left-click within the tab bar. Returns `true` if it hit a
+    /// real target (a tab, its close button, or the + button); `false`
+    /// means it landed on empty chrome, which the caller treats as a
+    /// double-click-to-maximize candidate.
+    fn handle_click(&mut self, mx: f32, my: f32) -> bool {
         if !self.show_custom_tab_bar() {
-            return;
+            return false;
         }
         let sc = self.renderer.scale_factor;
         let sw = self.window.inner_size().width as f32;
@@ -564,8 +646,12 @@ impl MainState {
             } else {
                 self.switch_tab(i);
             }
+            true
         } else if tl.hit_plus(mx, my) {
             self.new_tab();
+            true
+        } else {
+            false
         }
     }
 
@@ -702,18 +788,19 @@ impl MainState {
         let performer = pane.performer.lock().ok()?;
         let grid = &performer.grid;
         let offset = pane.scroll_view_offset.min(grid.scrollback_len());
-        let class = char_select_class(Self::displayed_cell(grid, offset, col, row)?.c);
+        let class =
+            char_select_class(grid.cell_char(Self::displayed_cell(grid, offset, col, row)?));
         let mut start = col;
         while start > 0 {
             match Self::displayed_cell(grid, offset, start - 1, row) {
-                Some(cell) if char_select_class(cell.c) == class => start -= 1,
+                Some(cell) if char_select_class(grid.cell_char(cell)) == class => start -= 1,
                 _ => break,
             }
         }
         let mut end = col;
         while end + 1 < grid.cols {
             match Self::displayed_cell(grid, offset, end + 1, row) {
-                Some(cell) if char_select_class(cell.c) == class => end += 1,
+                Some(cell) if char_select_class(grid.cell_char(cell)) == class => end += 1,
                 _ => break,
             }
         }
@@ -779,7 +866,11 @@ impl MainState {
             }
             let mut line = String::new();
             for col in start_col..=end_col {
-                line.push(Self::displayed_cell(grid, offset, col, row).map_or(' ', |cell| cell.c));
+                if let Some(cell) = Self::displayed_cell(grid, offset, col, row) {
+                    grid.push_cell_text(&mut line, cell);
+                } else {
+                    line.push(' ');
+                }
             }
             if matches!(sel.mode, SelectionMode::Block) {
                 out.push_str(&line);
@@ -824,11 +915,16 @@ impl MainState {
     }
 
     /// Write user input to the active pane's PTY, returning the view to live
-    /// output and restarting the cursor blink cycle.
+    /// output and restarting the cursor blink cycle. No-ops (after still
+    /// resetting the scroll view, a harmless local UI convenience) when the
+    /// pane is marked read-only via the context menu.
     fn send_pty_input(&mut self, bytes: &[u8]) {
         self.bump_cursor_blink();
         let pane = self.active_pane_mut();
         pane.scroll_view_offset = 0;
+        if pane.read_only {
+            return;
+        }
         if let Err(err) = pane.pty.write(bytes) {
             eprintln!("volt-ui: failed to write PTY input: {err}");
         }
@@ -866,6 +962,197 @@ impl MainState {
         }
     }
 
+    // ── Find / rename overlay ────────────────────────────────────────────
+
+    #[cfg(target_os = "macos")]
+    fn open_find_prompt(&mut self) {
+        self.search_dirty = false;
+        self.search_target = Some((self.active_tab, self.active_tab().tree.active_id));
+        self.active_prompt = Some(crate::prompt::TextPrompt::new(
+            crate::prompt::PromptKind::Find,
+            "",
+        ));
+        self.begin_redraw();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_rename_prompt(&mut self, kind: crate::prompt::PromptKind) {
+        self.search_dirty = false;
+        self.search_target = None;
+        let custom = match kind {
+            crate::prompt::PromptKind::RenameTab => self.active_tab().custom_title.as_deref(),
+            crate::prompt::PromptKind::RenameTerminal => {
+                self.active_tab().active_pane().custom_title.as_deref()
+            }
+            crate::prompt::PromptKind::Find => None,
+        };
+        let initial = rename_initial_text(custom);
+        self.active_prompt = Some(crate::prompt::TextPrompt::new(kind, &initial));
+        self.begin_redraw();
+    }
+
+    fn confirm_active_prompt(&mut self) {
+        let Some(prompt) = self.active_prompt.take() else {
+            return;
+        };
+        self.search_dirty = false;
+        self.search_target = None;
+        match prompt.kind {
+            crate::prompt::PromptKind::Find => {
+                // Enter/Shift+Enter cycle matches instead of confirming while
+                // a Find prompt is open; reaching here just closes it.
+            }
+            crate::prompt::PromptKind::RenameTab => {
+                let text = prompt.text();
+                self.active_tab_mut().custom_title = if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                };
+            }
+            crate::prompt::PromptKind::RenameTerminal => {
+                let text = prompt.text();
+                self.active_pane_mut().custom_title = if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                };
+            }
+        }
+        self.begin_redraw();
+    }
+
+    fn on_prompt_text_changed(&mut self) {
+        self.recompute_search_matches();
+        self.scroll_to_current_match();
+        self.begin_redraw();
+    }
+
+    /// Snapshot grid characters under the performer lock, then perform the
+    /// potentially expensive scan without blocking the PTY parse thread.
+    fn recompute_search_matches(&mut self) {
+        let is_find = matches!(
+            self.active_prompt.as_ref().map(|p| p.kind),
+            Some(crate::prompt::PromptKind::Find)
+        );
+        if !is_find {
+            self.search_dirty = false;
+            return;
+        }
+        let query = self
+            .active_prompt
+            .as_ref()
+            .map(|p| p.text())
+            .unwrap_or_default();
+        if query.is_empty() {
+            if let Some(prompt) = self.active_prompt.as_mut() {
+                prompt.matches.clear();
+                prompt.matches_truncated = false;
+                prompt.current_match = 0;
+            }
+            self.search_dirty = false;
+            self.last_search_refresh = Instant::now();
+            return;
+        }
+        let rows = {
+            let pane = self.active_tab().active_pane();
+            let Ok(performer) = pane.performer.lock() else {
+                self.search_dirty = false;
+                return;
+            };
+            let grid = &performer.grid;
+            let sb_len = grid.scrollback_len();
+            let mut rows: Vec<(usize, String)> = Vec::with_capacity(sb_len + grid.rows);
+            for i in 0..sb_len {
+                let line = grid.row_text(grid.scrollback_row(i));
+                rows.push((i, line));
+            }
+            for r in 0..grid.rows {
+                let line = grid.row_text(grid.row_cells(r));
+                rows.push((sb_len + r, line));
+            }
+            rows
+        };
+        const MAX_SEARCH_MATCHES: usize = 100_000;
+        let (matches, truncated) = crate::prompt::find_matches_bounded(
+            &query,
+            rows.iter().map(|(i, s)| (*i, s.as_str())),
+            MAX_SEARCH_MATCHES,
+        );
+        if let Some(prompt) = self.active_prompt.as_mut() {
+            prompt.matches = matches;
+            prompt.matches_truncated = truncated;
+            prompt.current_match = 0;
+        }
+        self.search_dirty = false;
+        self.search_target = Some((self.active_tab, self.active_tab().tree.active_id));
+        self.last_search_refresh = Instant::now();
+    }
+
+    fn invalidate_search_if_target_changed(&mut self) {
+        if matches!(
+            self.active_prompt.as_ref().map(|p| p.kind),
+            Some(crate::prompt::PromptKind::Find)
+        ) && self.search_target != Some((self.active_tab, self.active_tab().tree.active_id))
+        {
+            self.invalidate_search_after_output();
+        }
+    }
+
+    fn invalidate_search_after_output(&mut self) {
+        if let Some(prompt) = self.active_prompt.as_mut() {
+            if prompt.kind == crate::prompt::PromptKind::Find && !prompt.is_empty() {
+                // Never display a stale highlight against a changed grid.
+                prompt.matches.clear();
+                prompt.matches_truncated = false;
+                prompt.current_match = 0;
+                self.search_dirty = true;
+            }
+        }
+    }
+
+    /// Scroll the active pane so the current search match is visible,
+    /// placing its row at the top of the viewport when it's in scrollback.
+    fn scroll_to_current_match(&mut self) {
+        let Some(m) = self
+            .active_prompt
+            .as_ref()
+            .and_then(|p| p.matches.get(p.current_match).copied())
+        else {
+            return;
+        };
+        let sb_len = {
+            let pane = self.active_tab().active_pane();
+            match pane.performer.lock() {
+                Ok(p) => p.grid.scrollback_len(),
+                Err(_) => return,
+            }
+        };
+        let pane = self.active_pane_mut();
+        pane.scroll_view_offset = if m.row < sb_len {
+            sb_len.saturating_sub(m.row)
+        } else {
+            0
+        };
+        self.begin_redraw();
+    }
+
+    /// Full reset (RIS) of the active pane's terminal — clears the grid and
+    /// scrollback, exits alt-screen, and resets cursor/SGR/mode state.
+    #[cfg(target_os = "macos")]
+    fn reset_active_terminal(&mut self) {
+        {
+            let pane = self.active_pane_mut();
+            pane.scroll_view_offset = 0;
+            match pane.performer.lock() {
+                Ok(mut p) => p.reset(),
+                Err(err) => eprintln!("volt-ui: failed to lock performer for reset: {err}"),
+            }
+        }
+        self.selection = None;
+        self.begin_redraw();
+    }
+
     fn selection_tuple(&self) -> Option<((usize, usize), (usize, usize))> {
         let sel = self.selection?.normalized();
         let (total_cols, total_rows) = self.current_grid_size();
@@ -881,6 +1168,47 @@ impl MainState {
         self.selection
             .map(|sel| matches!(sel.mode, SelectionMode::Block))
             .unwrap_or(false)
+    }
+
+    /// Global window-grid coordinates of the current search match, if the
+    /// Find prompt is open, there's at least one match, and it's currently
+    /// within the active pane's visible viewport (mirrors the offset
+    /// convention `blit_grid_with_scrollback` renders with — row 0 of the
+    /// viewport is scrollback row `scrollback_len - scroll_view_offset`).
+    fn current_match_tuple(&self) -> Option<((usize, usize), (usize, usize))> {
+        let prompt = self.active_prompt.as_ref()?;
+        let m = *prompt.matches.get(prompt.current_match)?;
+        let (total_cols, total_rows) = self.current_grid_size();
+        let tab = self.tabs.get(self.active_tab)?;
+        let pane_id = tab.tree.active_id;
+        let rects = tab.tree.layout(total_cols, total_rows);
+        let rect = rects.iter().find(|r| r.id == pane_id)?;
+        let pane = tab.tree.find_leaf(pane_id)?;
+        let performer = pane.performer.lock().ok()?;
+        let sb_len = performer.grid.scrollback_len();
+        let offset = pane.scroll_view_offset.min(sb_len);
+        let sb_rows_shown = offset.min(rect.rows);
+        let sb_start = sb_len.saturating_sub(offset);
+
+        let viewport_row = if m.row < sb_len {
+            if m.row < sb_start {
+                return None; // scrolled further back than the match
+            }
+            let r = m.row - sb_start;
+            (r < sb_rows_shown).then_some(r)?
+        } else {
+            let live_row = m.row - sb_len;
+            let r = sb_rows_shown + live_row;
+            (r < rect.rows).then_some(r)?
+        };
+
+        Some((
+            (m.start_col + rect.col, viewport_row + rect.row),
+            (
+                m.end_col.saturating_sub(1) + rect.col,
+                viewport_row + rect.row,
+            ),
+        ))
     }
 
     fn active_mouse_reporting(&self) -> Option<(MouseTrackingMode, bool)> {
@@ -931,6 +1259,9 @@ impl MainState {
     }
 
     fn write_mouse_report(&mut self, cb: u8, col: usize, row: usize, release: bool, sgr: bool) {
+        if self.active_pane_mut().read_only {
+            return;
+        }
         let x = col + 1;
         let y = row + 1;
         if sgr {
@@ -1068,6 +1399,17 @@ pub struct App {
     proxy: Option<EventLoopProxy<VoltEvent>>,
     pty_wake_pending: Arc<AtomicBool>,
     rt: tokio::runtime::Runtime,
+    #[cfg(target_os = "macos")]
+    /// The window that last reported `Focused(true)` — menu-bar actions
+    /// (which are process-global, not per-window) target this window.
+    focused_window: Option<WindowId>,
+    #[cfg(target_os = "macos")]
+    /// Must stay alive for the app's full lifetime — see the doc comment on
+    /// `menu::install_app_menu`. Dropping this frees the Rust-side data
+    /// every native `NSMenuItem`'s action handler reads via a raw pointer,
+    /// while AppKit's menu bar keeps running against those now-dangling
+    /// pointers; the first click then reads freed memory and aborts.
+    app_menu: Option<muda::Menu>,
 }
 
 impl App {
@@ -1082,6 +1424,10 @@ impl App {
             proxy: None,
             pty_wake_pending: Arc::new(AtomicBool::new(false)),
             rt,
+            #[cfg(target_os = "macos")]
+            focused_window: None,
+            #[cfg(target_os = "macos")]
+            app_menu: None,
         })
     }
 
@@ -1210,6 +1556,12 @@ impl App {
             click_count: 0,
             #[cfg(target_os = "macos")]
             last_native_title: String::new(),
+            last_tab_bar_click: None,
+            active_prompt: None,
+            search_dirty: false,
+            search_target: None,
+            last_search_refresh: Instant::now(),
+            show_inspector: false,
         };
         state
             .window
@@ -1221,6 +1573,182 @@ impl App {
         self.windows.insert(id, state);
         Ok(id)
     }
+
+    /// Reload `config.toml` and apply it to `window_id`'s state. Shared by
+    /// the Cmd+Shift+R shortcut and the "Reload Settings" menu action.
+    fn reload_config(&mut self, window_id: WindowId) {
+        let (new_cfg, config_alert) = Config::load_with_diagnostics();
+        self.config = new_cfg.clone();
+        self.config_alert = config_alert.clone();
+        if let Some(state) = self.windows.get_mut(&window_id) {
+            state.renderer.set_top_alert(config_alert);
+            state.apply_config(&new_cfg);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    /// Resolve which window a menu-bar/context-menu action should target:
+    /// the last-focused window, falling back to an arbitrary one if that's
+    /// stale (its window closed) or unset (no `Focused(true)` has fired
+    /// yet, e.g. right at startup).
+    fn target_window_id(&self) -> Option<WindowId> {
+        self.focused_window
+            .filter(|id| self.windows.contains_key(id))
+            .or_else(|| self.windows.keys().next().copied())
+    }
+
+    #[cfg(target_os = "macos")]
+    /// Route a native menu-bar or context-menu click to the same
+    /// `MainState`/`App` methods the matching keyboard shortcut calls, so
+    /// the two paths can never drift apart.
+    fn handle_menu_action(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        action: crate::menu::MenuAction,
+    ) {
+        use crate::menu::MenuAction as A;
+
+        match action {
+            A::NewWindow => {
+                let _ = self.create_main_window(event_loop, None);
+                return;
+            }
+            A::OpenSettings => {
+                open_config_in_editor();
+                return;
+            }
+            _ => {}
+        }
+
+        let Some(window_id) = self.target_window_id() else {
+            return;
+        };
+
+        match action {
+            A::ReloadSettings => {
+                self.reload_config(window_id);
+                return;
+            }
+            A::CloseWindow => {
+                self.windows.remove(&window_id);
+                if self.windows.is_empty() {
+                    event_loop.exit();
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        let Some(state) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+
+        match action {
+            A::NewTab => {
+                if state.config.appearance.native_tabs {
+                    if let Some(proxy) = self.proxy.as_ref() {
+                        let _ = proxy.send_event(VoltEvent::CreateNewWindow);
+                    }
+                } else {
+                    state.new_tab();
+                    state.begin_redraw();
+                }
+            }
+            A::CloseTab => {
+                if state.close_active_pane_or_tab() {
+                    let _ = state;
+                    self.windows.remove(&window_id);
+                    if self.windows.is_empty() {
+                        event_loop.exit();
+                    }
+                }
+            }
+            A::Copy => {
+                if state.copy_selection() {
+                    state.begin_redraw();
+                }
+            }
+            A::Paste => {
+                state.paste_clipboard();
+                state.begin_redraw();
+            }
+            A::Find => state.open_find_prompt(),
+            A::ToggleChatPanel => {
+                state.chat_panel.toggle();
+                state.begin_redraw();
+            }
+            A::IncreaseFontSize => {
+                if state.adjust_font_size(1.0) {
+                    self.config.font.size = state.config.font.size;
+                }
+            }
+            A::DecreaseFontSize => {
+                if state.adjust_font_size(-1.0) {
+                    self.config.font.size = state.config.font.size;
+                }
+            }
+            A::ToggleFullScreen => {
+                let is_fullscreen = state.window.fullscreen().is_some();
+                state.window.set_fullscreen(if is_fullscreen {
+                    None
+                } else {
+                    Some(winit::window::Fullscreen::Borderless(None))
+                });
+            }
+            A::Zoom => {
+                let maximized = state.window.is_maximized();
+                state.window.set_maximized(!maximized);
+            }
+            A::SplitRight => {
+                if state.split_active_tab_positioned(PaneSplitDirection::Vertical, false) {
+                    state.begin_redraw();
+                }
+            }
+            A::SplitLeft => {
+                if state.split_active_tab_positioned(PaneSplitDirection::Vertical, true) {
+                    state.begin_redraw();
+                }
+            }
+            A::SplitDown => {
+                if state.split_active_tab_positioned(PaneSplitDirection::Horizontal, false) {
+                    state.begin_redraw();
+                }
+            }
+            A::SplitUp => {
+                if state.split_active_tab_positioned(PaneSplitDirection::Horizontal, true) {
+                    state.begin_redraw();
+                }
+            }
+            A::ResetTerminal => state.reset_active_terminal(),
+            A::ToggleInspector => {
+                state.show_inspector = !state.show_inspector;
+                state.begin_redraw();
+            }
+            A::ToggleReadOnly => {
+                let pane = state.active_pane_mut();
+                pane.read_only = !pane.read_only;
+                state.begin_redraw();
+            }
+            A::ChangeTabTitle => state.open_rename_prompt(crate::prompt::PromptKind::RenameTab),
+            A::ChangeTerminalTitle => {
+                state.open_rename_prompt(crate::prompt::PromptKind::RenameTerminal)
+            }
+            A::SearchGoogle => {
+                if let Some(text) = state.selected_text() {
+                    let url = format!(
+                        "https://www.google.com/search?q={}",
+                        percent_encode_query(&text)
+                    );
+                    if let Err(err) = std::process::Command::new("open").arg(&url).spawn() {
+                        eprintln!("volt-ui: failed to open search URL: {err}");
+                    }
+                }
+            }
+            A::NewWindow | A::OpenSettings | A::ReloadSettings | A::CloseWindow => {
+                unreachable!("handled in the early-return blocks above")
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1231,28 +1759,12 @@ fn configure_macos_tab_chrome(_window: &Window, _native_tab_count: usize) {
 }
 
 fn open_config_in_editor() {
-    let Some(path) = config_path() else { return };
-
-    if !path.exists() {
-        // First run: write the fully-documented sample config
-        if let Some(dir) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(dir) {
-                eprintln!("volt-ui: failed to create config directory: {err}");
-                return;
-            }
-        }
-        if let Err(err) = std::fs::write(&path, sample_config_toml()) {
-            eprintln!("volt-ui: failed to write sample config: {err}");
-            return;
-        }
-    } else if let Ok(existing) = std::fs::read_to_string(&path) {
-        // Old config (created before documentation was added) — replace it
-        if !existing.contains("# Volt Terminal") {
-            if let Err(err) = std::fs::write(&path, sample_config_toml()) {
-                eprintln!("volt-ui: failed to refresh sample config: {err}");
-                return;
-            }
-        }
+    let Some(path) = config_path_to_edit() else {
+        return;
+    };
+    if let Err(err) = create_sample_config_if_missing(&path) {
+        eprintln!("volt-ui: failed to create sample config: {err}");
+        return;
     }
 
     #[cfg(target_os = "macos")]
@@ -1269,6 +1781,29 @@ fn open_config_in_editor() {
     }
 }
 
+/// Never replace an existing config, including old files without our comment
+/// header. `create_new` also closes the existence-check/write race.
+fn create_sample_config_if_missing(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => file.write_all(sample_config_toml().as_bytes()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn should_show_context_menu(shift_down: bool, mouse_reporting: bool, read_only: bool) -> bool {
+    shift_down || read_only || !mouse_reporting
+}
+
 // ── ApplicationHandler ────────────────────────────────────────────────────────
 
 impl ApplicationHandler<VoltEvent> for App {
@@ -1279,6 +1814,28 @@ impl ApplicationHandler<VoltEvent> for App {
 
         #[cfg(target_os = "macos")]
         set_app_icon();
+
+        #[cfg(target_os = "macos")]
+        {
+            // Stored on `self` for the app's full lifetime — see the doc
+            // comment on `install_app_menu`. Letting this drop after the
+            // call (as an earlier version of this code did) freed the
+            // Rust-side data every native menu item's click handler reads,
+            // while AppKit's menu bar kept running against the now-dangling
+            // pointers — confirmed via crash report as the cause of a
+            // reproducible SIGABRT on the first menu click or accelerator.
+            self.app_menu = Some(crate::menu::install_app_menu());
+            // NSApp.mainMenu is process-global — install once here, not per
+            // window. Menu clicks arrive on muda's own dispatch, off the
+            // winit event loop, so forward them through the same
+            // EventLoopProxy<VoltEvent> pattern display_link.rs already
+            // uses to wake the loop from a background source.
+            if let Some(proxy) = self.proxy.clone() {
+                muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
+                    let _ = proxy.send_event(VoltEvent::Menu(event.id().0.clone()));
+                }));
+            }
+        }
 
         if let Err(err) = self.create_main_window(event_loop, Some("volt".to_string())) {
             eprintln!("volt-ui: failed to create initial window: {err}");
@@ -1305,6 +1862,12 @@ impl ApplicationHandler<VoltEvent> for App {
             #[cfg(target_os = "macos")]
             VoltEvent::CreateNewWindow => {
                 let _ = self.create_main_window(_event_loop, None);
+            }
+            #[cfg(target_os = "macos")]
+            VoltEvent::Menu(id) => {
+                if let Some(action) = crate::menu::MenuAction::from_id(&id) {
+                    self.handle_menu_action(_event_loop, action);
+                }
             }
         }
     }
@@ -1373,6 +1936,7 @@ impl ApplicationHandler<VoltEvent> for App {
                 let native_tab_count = state.window.num_tabs().max(1);
                 state.last_known_native_tab_count = native_tab_count;
                 configure_macos_tab_chrome(state.window.as_ref(), native_tab_count);
+                self.focused_window = Some(window_id);
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -1481,10 +2045,74 @@ impl ApplicationHandler<VoltEvent> for App {
                 let in_tab_bar = state.show_custom_tab_bar() && my < state.current_tab_bar_height();
                 if in_tab_bar {
                     if button == MouseButton::Left && btn_state == ElementState::Pressed {
-                        state.handle_click(mx, my);
+                        let hit_target = state.handle_click(mx, my);
+                        if !hit_target {
+                            // Empty chrome — double-click here maximizes, like
+                            // Finder/Safari's tab-bar convention.
+                            let now = Instant::now();
+                            let is_double_click = state
+                                .last_tab_bar_click
+                                .is_some_and(|t| now.duration_since(t) < MULTI_CLICK_INTERVAL);
+                            if is_double_click {
+                                let maximized = state.window.is_maximized();
+                                state.window.set_maximized(!maximized);
+                                state.last_tab_bar_click = None;
+                            } else {
+                                state.last_tab_bar_click = Some(now);
+                            }
+                        } else {
+                            state.last_tab_bar_click = None;
+                        }
                         state.begin_redraw();
                     }
                     return;
+                }
+
+                #[cfg(target_os = "macos")]
+                if button == MouseButton::Right && btn_state == ElementState::Pressed {
+                    if let Some((pane_id, _col, _row)) = state.pane_cell_from_mouse(mx, my) {
+                        state.active_tab_mut().tree.active_id = pane_id;
+                        if state.selection.is_some_and(|s| s.pane_id != pane_id) {
+                            state.selection = None;
+                        }
+                        // Let TUIs receive ordinary right-clicks when they opted
+                        // into mouse reporting. Shift-right-click always opens
+                        // Volt's own menu, as Shift already bypasses reporting.
+                        if should_show_context_menu(
+                            state.shift_down(),
+                            state.active_mouse_reporting().is_some(),
+                            state.active_tab().active_pane().read_only,
+                        ) {
+                            // Deliberately NOT clearing `state.selection` here —
+                            // Copy and Search With Google below need something to
+                            // act on, so a right-click must preserve whatever was
+                            // already selected instead of discarding it first.
+                            let read_only = state.active_tab().active_pane().read_only;
+                            let has_selection = state.selected_text().is_some();
+                            let context_menu =
+                                crate::menu::build_context_menu(read_only, has_selection);
+                            use muda::ContextMenu;
+                            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                            if let Ok(handle) = state.window.window_handle() {
+                                if let RawWindowHandle::AppKit(h) = handle.as_raw() {
+                                    // Passing `None` here (rather than a position we
+                                    // compute ourselves) asks muda to use AppKit's
+                                    // own `NSEvent.mouseLocation` directly — this
+                                    // sidesteps our own physical/logical + NSView
+                                    // coordinate-flip math, which was landing the
+                                    // menu away from the actual click point.
+                                    unsafe {
+                                        context_menu.show_context_menu_for_nsview(
+                                            h.ns_view.as_ptr() as *const std::ffi::c_void,
+                                            None,
+                                        );
+                                    }
+                                }
+                            }
+                            state.begin_redraw();
+                            return;
+                        }
+                    }
                 }
 
                 // Divider drag: release
@@ -1691,6 +2319,110 @@ impl ApplicationHandler<VoltEvent> for App {
                 let shift = state.shift_down();
                 let alt = state.modifiers.alt_key();
 
+                // A Find/rename overlay is active — it captures all keyboard
+                // input until confirmed or cancelled. This must fully return
+                // in every branch: falling through to terminal input here
+                // would silently leak keystrokes to the PTY while the user
+                // believes they're typing into the overlay.
+                if state.active_prompt.is_some() {
+                    if state.search_dirty
+                        && matches!(
+                            physical_key,
+                            PhysicalKey::Code(
+                                KeyCode::Enter
+                                    | KeyCode::NumpadEnter
+                                    | KeyCode::ArrowUp
+                                    | KeyCode::ArrowDown
+                            )
+                        )
+                    {
+                        state.recompute_search_matches();
+                    }
+                    match physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            state.active_prompt = None;
+                            state.search_dirty = false;
+                            state.search_target = None;
+                            state.begin_redraw();
+                        }
+                        PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
+                            match state.active_prompt.as_ref().map(|p| p.kind) {
+                                Some(crate::prompt::PromptKind::Find) => {
+                                    if let Some(prompt) = state.active_prompt.as_mut() {
+                                        if shift {
+                                            prompt.prev_match();
+                                        } else {
+                                            prompt.next_match();
+                                        }
+                                    }
+                                    state.scroll_to_current_match();
+                                }
+                                Some(_) => state.confirm_active_prompt(),
+                                None => {}
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::Backspace) => {
+                            if let Some(prompt) = state.active_prompt.as_mut() {
+                                prompt.backspace();
+                            }
+                            state.on_prompt_text_changed();
+                        }
+                        PhysicalKey::Code(KeyCode::Delete) => {
+                            if let Some(prompt) = state.active_prompt.as_mut() {
+                                prompt.delete_forward();
+                            }
+                            state.on_prompt_text_changed();
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                            if let Some(prompt) = state.active_prompt.as_mut() {
+                                prompt.move_left();
+                            }
+                            state.begin_redraw();
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowRight) => {
+                            if let Some(prompt) = state.active_prompt.as_mut() {
+                                prompt.move_right();
+                            }
+                            state.begin_redraw();
+                        }
+                        PhysicalKey::Code(KeyCode::Home) => {
+                            if let Some(prompt) = state.active_prompt.as_mut() {
+                                prompt.move_home();
+                            }
+                            state.begin_redraw();
+                        }
+                        PhysicalKey::Code(KeyCode::End) => {
+                            if let Some(prompt) = state.active_prompt.as_mut() {
+                                prompt.move_end();
+                            }
+                            state.begin_redraw();
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowDown) => {
+                            if let Some(prompt) = state.active_prompt.as_mut() {
+                                prompt.next_match();
+                            }
+                            state.scroll_to_current_match();
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowUp) => {
+                            if let Some(prompt) = state.active_prompt.as_mut() {
+                                prompt.prev_match();
+                            }
+                            state.scroll_to_current_match();
+                        }
+                        _ => {
+                            if let Some(text) = text.as_ref() {
+                                if let Some(prompt) = state.active_prompt.as_mut() {
+                                    for c in text.chars() {
+                                        prompt.insert_char(c);
+                                    }
+                                }
+                                state.on_prompt_text_changed();
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 let reload_modifier = {
                     #[cfg(target_os = "macos")]
                     {
@@ -1706,11 +2438,8 @@ impl ApplicationHandler<VoltEvent> for App {
                     && shift
                     && reload_modifier
                 {
-                    let (new_cfg, config_alert) = Config::load_with_diagnostics();
-                    self.config = new_cfg.clone();
-                    self.config_alert = config_alert.clone();
-                    state.renderer.set_top_alert(config_alert);
-                    state.apply_config(&new_cfg);
+                    let _ = state;
+                    self.reload_config(window_id);
                     return;
                 }
 
@@ -1809,42 +2538,13 @@ impl ApplicationHandler<VoltEvent> for App {
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyW) => {
-                            state.divider_drag = None;
-                            let active_id = state.active_tab().tree.active_id;
-                            let tab_idx = state.active_tab;
-                            let should_close_tab = state.remove_pane_from_tab(tab_idx, active_id);
-                            if should_close_tab {
-                                if state.tabs.len() > 1 {
-                                    state.close_tab(tab_idx);
-                                } else {
-                                    // On native tabs (macOS) the last pane should close the window;
-                                    // do NOT return early so close_window_after_event is checked.
-                                    #[cfg(target_os = "macos")]
-                                    {
-                                        close_window_after_event = true;
-                                        state.begin_redraw();
-                                    }
-                                    #[cfg(not(target_os = "macos"))]
-                                    {
-                                        state.begin_redraw();
-                                        return;
-                                    }
-                                }
-                            } else {
-                                state.begin_redraw();
-                                return;
-                            }
-                            #[cfg(target_os = "macos")]
-                            if close_window_after_event {
-                                // Drop state borrow so self.windows.remove can run below.
+                            if state.close_active_pane_or_tab() {
                                 let _ = state;
                                 self.windows.remove(&window_id);
                                 if self.windows.is_empty() {
                                     event_loop.exit();
                                 }
-                                return;
                             }
-                            state.begin_redraw();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyC) => {
@@ -2048,6 +2748,7 @@ impl ApplicationHandler<VoltEvent> for App {
                 let active = state.active_tab;
                 let mut needs_full_redraw = false;
                 let mut pending_partial_damage: Option<(usize, usize)> = None;
+                let mut active_grid_changed = false;
                 // (tab_idx, pane_id)
                 let mut closed_panes: Vec<(usize, usize)> = Vec::new();
 
@@ -2058,6 +2759,7 @@ impl ApplicationHandler<VoltEvent> for App {
                             match ev {
                                 CoreEvent::GridUpdated { damaged_rows } => {
                                     if i == active {
+                                        active_grid_changed = true;
                                         if let Some((start, end)) = damaged_rows {
                                             pending_partial_damage =
                                                 Some(match pending_partial_damage {
@@ -2094,6 +2796,16 @@ impl ApplicationHandler<VoltEvent> for App {
                         state.renderer.set_top_alert(Some(msg));
                         needs_full_redraw = true;
                     }
+                }
+
+                if active_grid_changed {
+                    state.invalidate_search_after_output();
+                }
+                state.invalidate_search_if_target_changed();
+                if state.search_dirty
+                    && state.last_search_refresh.elapsed() >= Duration::from_millis(200)
+                {
+                    state.recompute_search_matches();
                 }
 
                 // Handle closed panes
@@ -2157,6 +2869,36 @@ impl ApplicationHandler<VoltEvent> for App {
                         .into_iter()
                         .map(|d| d.phys)
                         .collect();
+                    let search_match = state.current_match_tuple();
+                    let prompt_text = state.active_prompt.as_ref().map(|p| p.text());
+                    let prompt_overlay =
+                        state
+                            .active_prompt
+                            .as_ref()
+                            .map(|p| volt_renderer::PromptOverlay {
+                                title: p.title(),
+                                text: prompt_text.as_deref().unwrap_or(""),
+                                cursor: p.cursor,
+                                match_count: p.matches.len(),
+                                matches_truncated: p.matches_truncated,
+                                current_match: p.current_match,
+                            });
+                    let inspector_info = if state.show_inspector {
+                        let pane = state.active_tab().active_pane();
+                        pane.performer
+                            .lock()
+                            .ok()
+                            .map(|p| volt_renderer::InspectorInfo {
+                                cols: p.grid.cols,
+                                rows: p.grid.rows,
+                                cursor_col: p.grid.cursor_col,
+                                cursor_row: p.grid.cursor_row,
+                                scrollback_len: p.grid.scrollback_len(),
+                            })
+                    } else {
+                        None
+                    };
+                    let active_read_only = state.active_tab().active_pane().read_only;
                     state.renderer.render_frame(
                         &render_grid,
                         &state.theme,
@@ -2166,6 +2908,10 @@ impl ApplicationHandler<VoltEvent> for App {
                         state.selection_is_block(),
                         damage_rows,
                         &dividers,
+                        search_match,
+                        prompt_overlay,
+                        inspector_info,
+                        active_read_only,
                     );
                     if state.post_resize_redraws > 0 {
                         state.post_resize_redraws -= 1;
@@ -2219,6 +2965,7 @@ impl ApplicationHandler<VoltEvent> for App {
             let mut needs_redraw = false;
             let mut needs_full_redraw = false;
             let mut pending_partial_damage: Option<(usize, usize)> = None;
+            let mut active_grid_changed = false;
             let mut closed_panes: Vec<(usize, usize)> = Vec::new();
 
             if !state.redraw_pending {
@@ -2229,6 +2976,7 @@ impl ApplicationHandler<VoltEvent> for App {
                             match ev {
                                 CoreEvent::GridUpdated { damaged_rows } => {
                                     if i == active {
+                                        active_grid_changed = true;
                                         needs_redraw = true;
                                         if let Some((start, end)) = damaged_rows {
                                             pending_partial_damage =
@@ -2275,6 +3023,24 @@ impl ApplicationHandler<VoltEvent> for App {
                         needs_redraw = true;
                         needs_full_redraw = true;
                     }
+                }
+            }
+
+            if active_grid_changed {
+                state.invalidate_search_after_output();
+            }
+            state.invalidate_search_if_target_changed();
+            if state.search_dirty {
+                let deadline = state.last_search_refresh + Duration::from_millis(200);
+                if Instant::now() >= deadline {
+                    state.recompute_search_matches();
+                    needs_redraw = true;
+                    needs_full_redraw = true;
+                } else {
+                    next_blink_deadline = Some(match next_blink_deadline {
+                        Some(current) => current.min(deadline),
+                        None => deadline,
+                    });
                 }
             }
 
@@ -2370,6 +3136,36 @@ fn strip_bracketed_paste_end(data: &[u8]) -> Vec<u8> {
         } else {
             out.push(data[i]);
             i += 1;
+        }
+    }
+    out
+}
+
+/// Inherited OSC/cwd titles are not explicit overrides. Opening a rename
+/// prompt and pressing Enter unchanged must leave that inheritance intact.
+#[cfg(target_os = "macos")]
+fn rename_initial_text(custom: Option<&str>) -> String {
+    custom.unwrap_or_default().to_string()
+}
+
+/// Minimal RFC 3986 percent-encoding for a URL query value — encodes every
+/// byte outside the unreserved set (this correctly handles multi-byte UTF-8
+/// too, since each byte of a sequence gets its own `%XX`). Small and local
+/// rather than pulling in a crate for one query string.
+#[cfg(target_os = "macos")]
+fn percent_encode_query(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 15) as usize] as char);
+            }
         }
     }
     out
@@ -2604,5 +3400,94 @@ fn set_app_icon() {
             let _: () = msg_send![app, setApplicationIconImage: image];
             let _: () = msg_send![image, release];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_sample_config_if_missing;
+
+    use super::{Grid, MainState};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tui_right_click_is_forwarded_unless_shift_opens_volt_menu() {
+        assert!(!super::should_show_context_menu(false, true, false));
+        assert!(super::should_show_context_menu(true, true, false));
+        assert!(super::should_show_context_menu(false, false, false));
+        assert!(super::should_show_context_menu(false, true, true));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rename_prompt_only_prefills_explicit_overrides() {
+        assert_eq!(super::rename_initial_text(None), "");
+        assert_eq!(super::rename_initial_text(Some("Project")), "Project");
+        assert_eq!(super::rename_initial_text(Some("~")), "~");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_query_encoding_handles_utf8_and_reserved_bytes() {
+        assert_eq!(super::percent_encode_query("日 a&"), "%E6%97%A5%20a%26");
+        assert_eq!(super::percent_encode_query("a-Z_1.~"), "a-Z_1.~");
+    }
+
+    #[test]
+    fn opening_settings_never_replaces_existing_markerless_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "volt-config-preserve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let custom = "theme = \"dracula\"\n# My own settings\n";
+        std::fs::write(&path, custom).unwrap();
+        create_sample_config_if_missing(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn opening_settings_creates_sample_only_when_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "volt-config-create-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("config.toml");
+        create_sample_config_if_missing(&path).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("# Volt Terminal"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Measures render-grid composition, not GPU present. Run explicitly
+    /// with the ignored release tests to track this hot path over time.
+    #[test]
+    #[ignore]
+    fn benchmark_render_grid_blit() {
+        let src = Grid::new(200, 60);
+        let mut dst = Grid::new(200, 60);
+        let iterations = 2_000;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            MainState::blit_grid(&mut dst, &src, 0, 0);
+            std::hint::black_box(&dst);
+        }
+        let elapsed = start.elapsed();
+        let cells = iterations * src.cols * src.rows;
+        eprintln!(
+            "render-grid blit: {cells} cells in {elapsed:?} ({:.1} M cells/s)",
+            cells as f64 / elapsed.as_secs_f64() / 1_000_000.0
+        );
     }
 }
