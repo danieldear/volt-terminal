@@ -38,6 +38,8 @@ pub struct TextPrompt {
     pub matches_truncated: bool,
     /// Index into `matches` of the currently-highlighted match.
     pub current_match: usize,
+    // Preserve a location while the old result list is hidden during refresh.
+    refresh_anchor: Option<SearchMatch>,
 }
 
 impl TextPrompt {
@@ -51,6 +53,7 @@ impl TextPrompt {
             matches: Vec::new(),
             matches_truncated: false,
             current_match: 0,
+            refresh_anchor: None,
         }
     }
 
@@ -106,6 +109,42 @@ impl TextPrompt {
 
     pub fn move_end(&mut self) {
         self.cursor = self.chars.len();
+    }
+
+    /// Drop results and selection when the query or target changes.
+    pub fn clear_matches(&mut self) {
+        self.matches.clear();
+        self.matches_truncated = false;
+        self.current_match = 0;
+        self.refresh_anchor = None;
+    }
+
+    /// Hide stale highlights without forgetting the selected location. Multiple
+    /// output notifications can arrive before the throttled scan runs.
+    pub fn invalidate_matches(&mut self) {
+        let anchor = self
+            .matches
+            .get(self.current_match)
+            .copied()
+            .or(self.refresh_anchor);
+        self.clear_matches();
+        self.refresh_anchor = anchor;
+    }
+
+    /// Keep the selected location if it is still a match in the new snapshot.
+    /// This is coordinate-based, not a persistent line ID: if history is evicted
+    /// or the location disappears, selection falls back to the first result.
+    pub fn replace_matches(&mut self, matches: Vec<SearchMatch>, truncated: bool) {
+        let anchor = self
+            .matches
+            .get(self.current_match)
+            .copied()
+            .or(self.refresh_anchor.take());
+        self.current_match = anchor
+            .and_then(|selected| matches.iter().position(|m| *m == selected))
+            .unwrap_or(0);
+        self.matches = matches;
+        self.matches_truncated = truncated;
     }
 
     /// Advance to the next match, wrapping around. No-op if there are none.
@@ -292,6 +331,55 @@ mod tests {
     fn empty_query_matches_nothing() {
         let rows = vec![(0, "anything")];
         assert!(find_matches("", rows.into_iter()).is_empty());
+    }
+
+    #[test]
+    fn output_refresh_preserves_selected_match() {
+        let rows = [(0, "marker"), (1, "marker"), (2, "marker")];
+        let mut p = TextPrompt::new(PromptKind::Find, "marker");
+        p.replace_matches(find_matches("marker", rows.into_iter()), false);
+        p.next_match();
+        p.next_match();
+        p.invalidate_matches();
+        p.invalidate_matches(); // coalesced output must not lose the anchor
+        assert!(p.matches.is_empty()); // never render stale highlights
+        p.replace_matches(find_matches("marker", rows.into_iter()), false);
+        assert_eq!(p.current_match, 2);
+        p.next_match();
+        assert_eq!(p.current_match, 0);
+    }
+
+    #[test]
+    fn refreshed_selection_tracks_location_not_result_index() {
+        let mut p = TextPrompt::new(PromptKind::Find, "x");
+        p.replace_matches(find_matches("x", [(4, "x"), (8, "x")].into_iter()), false);
+        p.next_match();
+        p.invalidate_matches();
+        p.replace_matches(
+            find_matches("x", [(2, "x"), (4, "x"), (8, "x")].into_iter()),
+            true,
+        );
+        assert_eq!(p.current_match, 2);
+        assert!(p.matches_truncated);
+        p.clear_matches(); // editing the query or switching panes resets selection
+        p.replace_matches(find_matches("x", [(2, "x"), (8, "x")].into_iter()), false);
+        assert_eq!(p.current_match, 0);
+        assert!(!p.matches_truncated);
+    }
+
+    #[test]
+    fn removed_match_and_empty_refresh_are_safe() {
+        let mut p = TextPrompt::new(PromptKind::Find, "x");
+        p.replace_matches(find_matches("x", [(0, "x"), (1, "x")].into_iter()), false);
+        p.next_match();
+        p.invalidate_matches();
+        p.replace_matches(find_matches("x", [(0, "x")].into_iter()), false);
+        assert_eq!(p.current_match, 0);
+        p.invalidate_matches();
+        p.replace_matches(Vec::new(), false);
+        p.next_match();
+        p.prev_match();
+        assert_eq!(p.current_match, 0);
     }
 
     #[test]

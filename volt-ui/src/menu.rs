@@ -16,7 +16,9 @@ pub enum MenuAction {
     Copy,
     Paste,
     Find,
+    SearchWorkspace,
     ToggleChatPanel,
+    ToggleWorkspaceLayout,
     IncreaseFontSize,
     DecreaseFontSize,
     ToggleFullScreen,
@@ -46,6 +48,8 @@ impl MenuAction {
             Copy => "volt.copy",
             Paste => "volt.paste",
             Find => "volt.find",
+            SearchWorkspace => "volt.search_workspace",
+            ToggleWorkspaceLayout => "volt.toggle_workspace_layout",
             ToggleChatPanel => "volt.toggle_chat_panel",
             IncreaseFontSize => "volt.increase_font_size",
             DecreaseFontSize => "volt.decrease_font_size",
@@ -78,6 +82,8 @@ impl MenuAction {
             "volt.copy" => Copy,
             "volt.paste" => Paste,
             "volt.find" => Find,
+            "volt.search_workspace" => SearchWorkspace,
+            "volt.toggle_workspace_layout" => ToggleWorkspaceLayout,
             "volt.toggle_chat_panel" => ToggleChatPanel,
             "volt.increase_font_size" => IncreaseFontSize,
             "volt.decrease_font_size" => DecreaseFontSize,
@@ -176,7 +182,9 @@ pub fn install_app_menu() -> Menu {
 
     let view_menu = Submenu::new("View", true);
     let _ = view_menu.append_items(&[
-        &MenuAction::ToggleChatPanel.item("Toggle AI Chat Panel (Prototype)"),
+        &MenuAction::ToggleChatPanel.item("Toggle Workspace Panel"),
+        &MenuAction::SearchWorkspace.item("Search Workspace…  ⌘⇧P"),
+        &MenuAction::ToggleWorkspaceLayout.item("Switch Workspace: Docked / Floating"),
         &PredefinedMenuItem::separator(),
         &MenuAction::IncreaseFontSize.item("Increase Font Size"),
         &MenuAction::DecreaseFontSize.item("Decrease Font Size"),

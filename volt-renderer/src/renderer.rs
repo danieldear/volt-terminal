@@ -311,6 +311,10 @@ impl CachedRow {
 }
 
 pub struct Renderer {
+    pub search_palette: Option<crate::search_palette::SearchView>,
+    search_palette_cache: Option<search_palette_draw::SearchGeometry>,
+    pub workspace_card: Option<crate::workspace_card::WorkspaceCard>,
+    workspace_card_cache: Option<workspace_card_draw::CardGeometry>,
     row_cache: Vec<CachedRow>,
     cache_context: Option<([f32; 8], Theme, CursorStyle)>,
     row_cache_enabled: bool,
@@ -693,6 +697,10 @@ impl Renderer {
             swash_cache,
             cell_width,
             cell_height,
+            search_palette: None,
+            search_palette_cache: None,
+            workspace_card: None,
+            workspace_card_cache: None,
             tab_bar_height,
             custom_tab_bar: true,
             scale_factor,
@@ -878,6 +886,8 @@ impl Renderer {
         self.cell_height = self.font_size_phys * self.line_height;
         self.tab_bar_height = (38.0 * scale_factor).round();
         self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
+        self.workspace_card_cache = None;
+        self.search_palette_cache = None;
         self.shape_cache.clear();
         self.extended_shape_cache.clear();
         self.row_cache.clear();
@@ -933,7 +943,8 @@ impl Renderer {
 
     pub fn grid_size_for_tab_count(&self, tab_count: usize) -> (usize, usize) {
         let phys_pad = self.padding * self.scale_factor;
-        let term_w = self.config.width as f32 - 2.0 * phys_pad;
+        let term_w =
+            self.config.width as f32 - 2.0 * phys_pad - self.workspace_card_reserved_width();
         let term_h = self.config.height as f32
             - self.content_top_offset_for_tab_count(tab_count)
             - 2.0 * phys_pad;
@@ -1283,6 +1294,7 @@ impl Renderer {
 
     // ── GPU present helper ───────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     fn submit_frame(
         &mut self,
         view: wgpu::TextureView,
@@ -1291,6 +1303,9 @@ impl Renderer {
         glyph_verts: &[GlyphVertex],
         clear: [f64; 4],
         partial_redraw: bool,
+        hud_start: (usize, usize),
+        overlay_start: (usize, usize),
+        search_start: (usize, usize),
     ) {
         if let Some((x, y, width, height)) = self.atlas.take_dirty_rect() {
             let start = ((y * self.atlas.width + x) * 4) as usize;
@@ -1360,24 +1375,42 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if !bg_verts.is_empty() {
-                pass.set_pipeline(&self.bg_pipeline);
-                pass.set_vertex_buffer(
-                    0,
-                    self.bg_vertex_buffer
-                        .slice(0..std::mem::size_of_val(bg_verts) as u64),
-                );
-                pass.draw(0..bg_verts.len() as u32, 0..1);
-            }
-            if !glyph_verts.is_empty() {
-                pass.set_pipeline(&self.glyph_pipeline);
-                pass.set_bind_group(0, &self.atlas_bind_group, &[]);
-                pass.set_vertex_buffer(
-                    0,
-                    self.glyph_vertex_buffer
-                        .slice(0..std::mem::size_of_val(glyph_verts) as u64),
-                );
-                pass.draw(0..glyph_verts.len() as u32, 0..1);
+            // Composite the inspector after terminal glyphs, not just after
+            // backgrounds. Floating cards must actually occlude TUI text.
+            for (bg_range, glyph_range) in [
+                (0..hud_start.0 as u32, 0..hud_start.1 as u32),
+                (
+                    hud_start.0 as u32..overlay_start.0 as u32,
+                    hud_start.1 as u32..overlay_start.1 as u32,
+                ),
+                (
+                    overlay_start.0 as u32..search_start.0 as u32,
+                    overlay_start.1 as u32..search_start.1 as u32,
+                ),
+                (
+                    search_start.0 as u32..bg_verts.len() as u32,
+                    search_start.1 as u32..glyph_verts.len() as u32,
+                ),
+            ] {
+                if !bg_range.is_empty() {
+                    pass.set_pipeline(&self.bg_pipeline);
+                    pass.set_vertex_buffer(
+                        0,
+                        self.bg_vertex_buffer
+                            .slice(0..std::mem::size_of_val(bg_verts) as u64),
+                    );
+                    pass.draw(bg_range, 0..1);
+                }
+                if !glyph_range.is_empty() {
+                    pass.set_pipeline(&self.glyph_pipeline);
+                    pass.set_bind_group(0, &self.atlas_bind_group, &[]);
+                    pass.set_vertex_buffer(
+                        0,
+                        self.glyph_vertex_buffer
+                            .slice(0..std::mem::size_of_val(glyph_verts) as u64),
+                    );
+                    pass.draw(glyph_range, 0..1);
+                }
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -1406,6 +1439,8 @@ impl Renderer {
     ) {
         if self.atlas.full {
             self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
+            self.workspace_card_cache = None;
+            self.search_palette_cache = None;
             self.row_cache.clear();
         }
         if self.extended_shape_cache.len() > 4096 {
@@ -2128,6 +2163,7 @@ impl Renderer {
             self.draw_rect(&mut bg_verts, d.x, d.y, d.width, d.height, d.color);
         }
 
+        let hud_start = (bg_verts.len(), glyph_verts.len());
         // ── overlays: read-only badge, inspector, Find/rename prompt ─────────
         // Drawn last so they sit on top of the terminal content and dividers.
         if read_only {
@@ -2206,7 +2242,7 @@ impl Renderer {
                 box_y,
                 box_w,
                 box_h,
-                [0.12, 0.12, 0.14, 0.97],
+                [0.12, 0.12, 0.14, 1.0],
             );
 
             let pad = 14.0 * self.scale_factor;
@@ -2267,6 +2303,27 @@ impl Renderer {
             );
         }
 
+        let overlay_start = (bg_verts.len(), glyph_verts.len());
+        if let Some(card) = self.workspace_card.clone() {
+            self.draw_workspace_card(
+                &mut bg_verts,
+                &mut glyph_verts,
+                &card,
+                theme,
+                tab_top_h + alert_h,
+            );
+        }
+
+        let search_start = (bg_verts.len(), glyph_verts.len());
+        if let Some(search) = self.search_palette.clone() {
+            self.draw_search_palette(
+                &mut bg_verts,
+                &mut glyph_verts,
+                &search,
+                theme,
+                tab_top_h + alert_h,
+            );
+        }
         self.submit_frame(
             view,
             output,
@@ -2279,11 +2336,17 @@ impl Renderer {
                 self.background_opacity as f64,
             ],
             partial_redraw,
+            hud_start,
+            overlay_start,
+            search_start,
         );
         self.frame_bg_verts = bg_verts;
         self.frame_glyph_verts = glyph_verts;
     }
 }
+
+#[path = "workspace_card_draw.rs"]
+mod workspace_card_draw;
 
 #[cfg(test)]
 mod placement_tests {
@@ -2350,3 +2413,6 @@ mod placement_tests {
         );
     }
 }
+
+#[path = "search_palette_draw.rs"]
+mod search_palette_draw;

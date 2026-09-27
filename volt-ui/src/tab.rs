@@ -117,7 +117,7 @@ impl TerminalPane {
             performer,
             event_rx,
             title: "~".to_string(),
-            cwd: None,
+            cwd: std::env::current_dir().ok(),
             running: false,
             scroll_view_offset: 0,
             custom_title: None,

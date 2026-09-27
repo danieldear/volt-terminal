@@ -83,16 +83,24 @@ jobs:
             fonts-dejavu-core \
             mesa-vulkan-drivers
       - run: cargo test --locked --workspace
+      - name: Validation script unit tests
+        run: python3 -m unittest discover -s scripts/validation -p 'test_*.py'
       - name: Offscreen GPU renderer regressions (Mesa software Vulkan)
         if: matrix.os == 'ubuntu-latest'
         env:
           XDG_RUNTIME_DIR: /tmp
-        run: cargo run --locked -p volt-renderer --example rendercheck -- target/rendercheck --fixtures-only
+        run: |
+          cargo run --locked -p volt-renderer --example rendercheck -- target/rendercheck --fixtures-only
+          cargo run --locked -p volt-renderer --example cardcheck
+          cargo run --locked -p volt-renderer --example searchcheck
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always() && matrix.os == 'ubuntu-latest'
         with:
           name: rendering-fixtures-linux
-          path: target/rendercheck
+          path: |
+            target/rendercheck
+            target/cardcheck
+            target/searchcheck
           if-no-files-found: warn
 
   msrv:

@@ -6,6 +6,7 @@ No process arguments, environment, terminal output or clipboard are captured.
 """
 import argparse
 import json
+import math
 import platform
 import subprocess
 import time
@@ -36,7 +37,13 @@ def main():
     parser.add_argument('pid', type=int)
     parser.add_argument('--seconds', type=float, default=60)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--max-cpu-percent', type=float,
+                        help='Optional idle CPU budget (100 = one fully busy core); fail if exceeded')
     args = parser.parse_args()
+    if args.max_cpu_percent is not None and (
+        not math.isfinite(args.max_cpu_percent) or args.max_cpu_percent < 0
+    ):
+        parser.error('max CPU percent must be finite and non-negative')
     if args.pid <= 0 or not 1 <= args.seconds <= 3600:
         parser.error('PID must be positive; seconds must be 1..3600')
     initial = sample(args.pid)
@@ -58,6 +65,9 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps({k: v for k, v in result.items() if k != 'samples'}))
+    if args.max_cpu_percent is not None and result['cpu_percent_one_core'] > args.max_cpu_percent:
+        raise SystemExit(f"CPU budget exceeded: {result['cpu_percent_one_core']:.2f}% > "
+                         f"{args.max_cpu_percent:.2f}%")
 
 
 if __name__ == '__main__':

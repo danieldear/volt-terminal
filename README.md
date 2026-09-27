@@ -18,6 +18,7 @@
 - **Full mouse support** — click, scroll, drag selection, double-click word / triple-click line select
 - **Native macOS menu bar** — File/Edit/View/Window menus and a dynamic Services submenu; keyboard shortcuts are handled by Volt, not menu-item accelerators
 - **Native right-click context menu** — Copy/Paste, split in any direction, reset terminal, read-only toggle, rename tab/terminal
+- **Workspace Search** (`Cmd+Shift+P`) — floating local search for fuzzy file paths, saved text, retained output/current TUI screen, branches, worktrees, and task previews. [Scope and limits](docs/workspace-search.md).
 - **In-terminal Find** (`Cmd+F`) — search scrollback + visible output, jump between matches (navigation is capped at 100,000 matches)
 - **Alternate screen buffer** — vim, htop, etc. work correctly
 - **Config reload** — edit `config.toml`, press `Cmd+Shift+R`
@@ -127,12 +128,17 @@ commands, but not every shortcut or its key-equivalent hint.
 | `Cmd+V` / `Ctrl+Shift+V` | Paste |
 | `Cmd+F` | Find in terminal |
 | `Cmd+=` / `Cmd+-` | Increase / decrease font size |
-| `Cmd+Shift+A` | Toggle AI chat panel prototype (model transport is not wired up) |
+| `Cmd+Shift+A` | Toggle workspace card |
+| `Cmd+Shift+P` | Open workspace search |
+| `Enter` / `Shift+Enter` (Find open) | Next / previous terminal match |
 | `Ctrl+Cmd+F` | Toggle full screen |
 | `Cmd+K` | Clear screen and scrollback |
 | `Cmd+,` | Open config in editor |
 | `Cmd+Shift+R` | Reload config |
 | `Cmd+Q` | Quit |
+
+Use **View → Switch Workspace: Docked / Floating** or the card's pin button
+to change its layout (no dedicated keyboard shortcut).
 
 Double-clicking empty tab-bar chrome (not a tab) maximizes/restores the
 window, matching Finder/Safari.

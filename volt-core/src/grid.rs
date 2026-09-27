@@ -103,6 +103,41 @@ impl Grid {
         }
     }
 
+    /// Reset a render-only scratch grid to the same logical state as `new`,
+    /// retaining its allocations when dimensions are unchanged. Never use this
+    /// to resize a terminal: it deliberately discards contents and history.
+    pub fn prepare_for_snapshot(&mut self, cols: usize, rows: usize) {
+        let (cols, rows) = (cols.max(1), rows.max(1));
+        if (self.cols, self.rows) != (cols, rows) {
+            *self = Self::new(cols, rows);
+            return;
+        }
+        self.cells.fill(Cell::default());
+        for (row, physical) in self.row_map.iter_mut().enumerate() {
+            *physical = row;
+        }
+        self.soft_wrapped.fill(false);
+        self.cursor_col = 0;
+        self.cursor_row = 0;
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
+        self.pending_wrap = false;
+        self.dirty.fill(true);
+        self.scrollback_buf.clear();
+        self.scrollback_wrapped.clear();
+        self.scrollback_start = 0;
+        self.scrollback_count = 0;
+        self.history_enabled = true;
+        self.scrollback_limit = 10_000;
+        self.blank_row.clear();
+        self.erase_cell = Cell::default();
+        self.has_wide = false;
+        // IDs are grid-local. Do not let old frame IDs or strings leak into
+        // the next snapshot, even if tabs/panes now contain different text.
+        self.graphemes.clear();
+        self.grapheme_ids.clear();
+    }
+
     pub(crate) fn new_alt(cols: usize, rows: usize) -> Self {
         let mut grid = Self::new(cols, rows);
         grid.history_enabled = false;
@@ -150,18 +185,20 @@ impl Grid {
         &mut self.cells[idx]
     }
 
-    /// Keep the overwhelmingly common ASCII-only path free of wide-cell
-    /// boundary reads. Once a wide cell is present, use the repairing writer.
+    /// Keep ASCII-only grids free of boundary reads. A historical wide glyph
+    /// must not force every subsequent ASCII write through the repairing writer:
+    /// repair only when the overwritten cell is actually part of a wide pair.
     #[inline(always)]
     pub fn put_ascii(&mut self, col: usize, row: usize, cell: Cell) {
-        if self.has_wide {
+        let physical = self.row_map[row];
+        let index = physical * self.cols + col;
+        if self.has_wide && (self.cells[index].is_wide() || self.cells[index].is_continuation()) {
             self.put_char(col, row, cell);
             return;
         }
-        let physical = self.row_map[row];
         self.soft_wrapped[physical] = false;
         self.dirty[row] = true;
-        self.cells[physical * self.cols + col] = cell;
+        self.cells[index] = cell;
     }
 
     /// Hot-path single-cell write: one `row_map` lookup covers the cell store,
@@ -861,6 +898,57 @@ impl Grid {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scratch_snapshot_reset_matches_new_and_reuses_allocations() {
+        let mut grid = super::Grid::new(8, 3);
+        let mut wide = super::Cell::default();
+        wide.set_char('界');
+        wide.set_wide(true);
+        grid.put_char(1, 0, wide);
+        grid.set_grapheme(3, 0, "👩‍💻", 2);
+        grid.set_row_soft_wrapped(0, true);
+        grid.scroll_up(0, 2, 1);
+        grid.set_scrollback_limit(2);
+        grid.cursor_col = 7;
+        grid.cursor_row = 2;
+        grid.pending_wrap = true;
+        grid.scroll_top = 1;
+        grid.set_erase_background(super::CellColor::Indexed(3));
+        grid.clear_dirty();
+        let allocation = grid.cells.as_ptr();
+        grid.prepare_for_snapshot(8, 3);
+        assert_eq!(grid.cells.as_ptr(), allocation);
+        let fresh = super::Grid::new(8, 3);
+        macro_rules! same { ($($field:ident),*) => { $(assert_eq!(grid.$field, fresh.$field, stringify!($field));)* }; }
+        same!(
+            cols,
+            rows,
+            cells,
+            row_map,
+            soft_wrapped,
+            cursor_col,
+            cursor_row,
+            scroll_top,
+            scroll_bottom,
+            pending_wrap,
+            dirty,
+            scrollback_buf,
+            scrollback_wrapped,
+            history_enabled,
+            scrollback_start,
+            scrollback_count,
+            scrollback_limit,
+            blank_row,
+            erase_cell,
+            has_wide,
+            graphemes,
+            grapheme_ids
+        );
+        grid.prepare_for_snapshot(0, 0);
+        assert_eq!((grid.cols, grid.rows), (1, 1));
+        assert_eq!(grid.cells, super::Grid::new(1, 1).cells);
+    }
+
     use super::*;
 
     #[test]
@@ -904,6 +992,44 @@ mod tests {
         grid.put_ascii(2, 0, ascii);
         assert_eq!(grid.cell(1, 0).c(), ' ');
         assert_eq!(grid.cell(2, 0).c(), 'a');
+    }
+
+    #[test]
+    fn ascii_fast_writer_matches_repairing_writer_after_wide_history() {
+        for cols in [1, 2, 3, 8, 91] {
+            let mut base = Grid::new(cols, 3);
+            for row in 0..3 {
+                if cols > 1 {
+                    base.set_grapheme(0, row, "界", 2);
+                    if cols > 3 {
+                        base.set_grapheme(cols - 2, row, "👩‍💻", 2);
+                    }
+                }
+            }
+            for scroll in [false, true] {
+                let mut fast = base.clone();
+                if scroll {
+                    fast.scroll_up(0, 2, 3);
+                }
+                let mut reference = fast.clone();
+                fast.clear_dirty();
+                reference.clear_dirty();
+                for col in (0..cols).rev() {
+                    for row in 0..3 {
+                        let mut cell = Cell::default();
+                        cell.set_char('x');
+                        cell.bold = col % 2 == 0;
+                        fast.put_ascii(col, row, cell);
+                        reference.put_char(col, row, cell);
+                        for r in 0..3 {
+                            assert_eq!(fast.row_cells(r), reference.row_cells(r));
+                            assert_eq!(fast.row_soft_wrapped(r), reference.row_soft_wrapped(r));
+                        }
+                        assert_eq!(fast.dirty_rows(), reference.dirty_rows());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

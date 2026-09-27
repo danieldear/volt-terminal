@@ -32,6 +32,93 @@ const PIPELINE_QUEUE_BUFFERS: usize = 256;
 /// Stop coalescing queued buffers into a parse batch beyond this size.
 const COALESCE_LIMIT_BYTES: usize = 1024 * 1024;
 
+/// Persistent macOS readiness registration. Rebuilding poll's descriptor wait
+/// on every small PTY read is expensive; kqueue retains both registrations.
+/// Level-triggered reads preserve unread tail bytes, and shutdown stays wakeable.
+#[cfg(target_os = "macos")]
+struct PtyReadiness {
+    queue: std::os::fd::OwnedFd,
+    shutdown_fd: std::os::fd::RawFd,
+}
+
+#[cfg(target_os = "macos")]
+impl PtyReadiness {
+    fn new(reader: std::os::fd::RawFd, shutdown: std::os::fd::RawFd) -> std::io::Result<Self> {
+        let fd = unsafe { libc::kqueue() };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Own immediately so any later setup failure closes the queue.
+        let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let changes = [reader, shutdown].map(|fd| libc::kevent {
+            ident: fd as _,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD | libc::EV_ENABLE,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        });
+        if unsafe {
+            libc::kevent(
+                fd,
+                changes.as_ptr(),
+                2,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            queue,
+            shutdown_fd: shutdown,
+        })
+    }
+
+    /// False means shutdown; if output and shutdown arrive together, stop first.
+    fn wait(&self) -> std::io::Result<bool> {
+        let mut events = [libc::kevent {
+            ident: 0,
+            filter: 0,
+            flags: 0,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        }; 2];
+        let count = unsafe {
+            libc::kevent(
+                self.queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                2,
+                std::ptr::null(),
+            )
+        };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let events = &events[..count as usize];
+        if events
+            .iter()
+            .any(|event| event.ident == self.shutdown_fd as _)
+        {
+            return Ok(false);
+        }
+        for event in events {
+            if event.flags & libc::EV_ERROR != 0 {
+                return Err(std::io::Error::from_raw_os_error(event.data as i32));
+            }
+        }
+        Ok(true)
+    }
+}
+
 pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
@@ -43,6 +130,11 @@ pub struct Pty {
 }
 
 impl Pty {
+    /// Owned shell process identity for off-thread local workspace discovery.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|child| child.process_id())
+    }
+
     /// Spawn a shell in a PTY. Returns:
     /// - the `Pty` handle (for writing keyboard input and resizing)
     /// - an `Arc<Mutex<Performer>>` shared with the reader thread
@@ -106,6 +198,8 @@ impl Pty {
             }
             unsafe { std::fs::File::from_raw_fd(fd) }
         };
+        #[cfg(target_os = "macos")]
+        let readiness = PtyReadiness::new(reader.as_raw_fd(), shutdown_rx.as_raw_fd())?;
         // Complete fallible fd setup before starting the child.
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
@@ -118,7 +212,19 @@ impl Pty {
                 if reader_stopped.load(Ordering::Relaxed) {
                     break;
                 }
-                #[cfg(unix)]
+                #[cfg(target_os = "macos")]
+                {
+                    match readiness.wait() {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                    // Keep the shutdown descriptor owned by this worker while
+                    // its raw fd remains registered with kqueue.
+                    let _ = &shutdown_rx;
+                }
+                #[cfg(all(unix, not(target_os = "macos")))]
                 {
                     let mut fds = [
                         libc::pollfd {
@@ -356,6 +462,55 @@ impl Drop for Pty {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn readiness_drains_tail_before_eof_and_shutdown_takes_priority() {
+        use std::io::Write;
+        let (mut reader, mut output) = UnixStream::pair().unwrap();
+        let (shutdown_rx, mut shutdown_tx) = UnixStream::pair().unwrap();
+        let readiness = PtyReadiness::new(reader.as_raw_fd(), shutdown_rx.as_raw_fd()).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(readiness.queue.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        output.write_all(b"abcdef").unwrap();
+        drop(output);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = [0; 3];
+            for expected in [b"abc", b"def"] {
+                assert!(readiness.wait().unwrap());
+                reader.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes, expected);
+            }
+            assert!(readiness.wait().unwrap());
+            assert_eq!(reader.read(&mut bytes).unwrap(), 0);
+            // EOF remains readable, but shutdown must win over it.
+            shutdown_tx.write_all(&[1]).unwrap();
+            assert!(!readiness.wait().unwrap());
+            drop(shutdown_rx);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn readiness_shutdown_wakes_without_pty_output() {
+        use std::io::Write;
+        let (reader, _output) = UnixStream::pair().unwrap();
+        let (shutdown_rx, mut shutdown_tx) = UnixStream::pair().unwrap();
+        let readiness = PtyReadiness::new(reader.as_raw_fd(), shutdown_rx.as_raw_fd()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = readiness.wait().unwrap();
+            drop((reader, shutdown_rx));
+            tx.send(result).unwrap();
+        });
+        shutdown_tx.write_all(&[1]).unwrap();
+        assert!(!rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap());
+    }
 
     #[cfg(unix)]
     #[test]

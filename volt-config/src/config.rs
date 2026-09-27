@@ -161,6 +161,20 @@ impl Default for TerminalConfig {
     }
 }
 
+/// Workspace inspector placement. Floating never reserves terminal cells.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceLayout {
+    #[default]
+    Docked,
+    Floating,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkspaceConfig {
+    #[serde(default)]
+    pub layout: WorkspaceLayout,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -175,6 +189,8 @@ pub struct Config {
     pub terminal: TerminalConfig,
     #[serde(default)]
     pub ai: AiConfig,
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
 }
 fn default_theme() -> String {
     "catppuccin".to_string()
@@ -454,6 +470,10 @@ cursor_blink = true
 # divider_opacity = 0.09
 
 # ── Terminal ────────────────────────────────────────────────────────────────────
+[workspace]
+# "docked" reserves space; "floating" overlays and can be dragged by its header.
+layout = "docked"
+
 [terminal]
 # Number of lines retained in the scrollback buffer per pane.
 # Increase this for high-output commands such as `adb logcat`.

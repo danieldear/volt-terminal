@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 #[cfg(target_os = "macos")]
@@ -18,12 +18,12 @@ use volt_core::performer::MouseTrackingMode;
 
 use volt_renderer::{Renderer, TabEntry};
 
-use crate::chat_panel::ChatPanel;
 #[cfg(target_os = "macos")]
 use crate::display_link::DisplayLinkScheduler;
 use crate::pane_tree::RemoveResult;
 use crate::tab::{PaneSplitDirection, Selection, SelectionMode, TerminalPane, TerminalTab};
 use crate::tab_layout::TabLayout;
+use crate::workspace_panel::WorkspacePanel;
 
 // ── user events (used to wake the event loop from background threads) ────────
 
@@ -31,6 +31,12 @@ use crate::tab_layout::TabLayout;
 pub enum VoltEvent {
     /// PTY reader thread produced output — request a redraw.
     PtyData,
+    WorkspaceUpdated,
+    #[cfg(target_os = "macos")]
+    NativeText {
+        window_id: WindowId,
+        text: String,
+    },
     #[cfg(target_os = "macos")]
     /// Display link tick — redraw on display cadence when needed.
     DisplayLinkTick,
@@ -71,7 +77,10 @@ enum PaneFocusDirection {
 struct MainState {
     id: WindowId,
     window: Arc<Window>,
+    #[cfg(target_os = "macos")]
+    _native_text: crate::native_text::NativeTextInput,
     renderer: Renderer,
+    render_snapshot: Option<Grid>,
     tabs: Vec<TerminalTab>,
     active_tab: usize,
     theme: Theme,
@@ -105,7 +114,9 @@ struct MainState {
     /// ID of the divider the mouse is currently hovering over (for visual highlight).
     divider_hover_id: Option<usize>,
     /// AI Chat Panel sidebar state.
-    chat_panel: ChatPanel,
+    workspace_panel: WorkspacePanel,
+    workspace_search: crate::workspace_search::SearchPalette,
+    search_mouse_capture: Option<MouseButton>,
     /// Last left-click for double/triple-click detection: (time, pane, col, row).
     last_click: Option<(Instant, usize, usize, usize)>,
     /// Consecutive clicks at the same cell: 1 = cell, 2 = word, 3 = line.
@@ -129,6 +140,231 @@ struct MainState {
 }
 
 impl MainState {
+    fn sync_search(&mut self) {
+        self.renderer.search_palette = self.workspace_search.view();
+        if self.workspace_search.visible && self.renderer.search_layout().is_none() {
+            self.workspace_search.close();
+            self.renderer.search_palette = None;
+        }
+        self.begin_redraw();
+    }
+    fn toggle_search(&mut self) {
+        if self.workspace_search.visible {
+            self.workspace_search.close();
+        } else {
+            let pane = self.active_tab().active_pane();
+            let pid = pane.pty.child_pid();
+            let cwd = pid
+                .and_then(crate::workspace_panel::local_process_cwd)
+                .or_else(|| pane.cwd.clone());
+            self.workspace_search.open(pid, cwd);
+            self.workspace_panel.focused = false;
+            self.workspace_panel.drag_offset = None;
+            self.active_prompt = None;
+            self.search_dirty = false;
+            self.search_target = None;
+            self.is_drag_selecting = false;
+            self.divider_drag = None;
+            self.pressed_mouse_button = None;
+            self.selection = None;
+        }
+        self.sync_search();
+    }
+    fn activate_search_result(&mut self) {
+        use crate::workspace_search::Action;
+        let action = self
+            .workspace_search
+            .output
+            .rows
+            .get(self.workspace_search.selected)
+            .map(|r| r.action.clone());
+        if let Some(Action::Terminal {
+            text,
+            alternate,
+            row,
+        }) = action
+        {
+            let valid = {
+                let pane = self.active_tab().active_pane();
+                pane.performer.try_lock().ok().is_some_and(|p| {
+                    let g = &p.grid;
+                    let total = g.scrollback_len() + g.rows;
+                    p.alternate_screen_active() == alternate && row < total && {
+                        let now = if row < g.scrollback_len() {
+                            g.row_text(g.scrollback_row(row))
+                        } else {
+                            g.row_text(g.row_cells(row - g.scrollback_len()))
+                        };
+                        now == text
+                    }
+                })
+            };
+            if valid {
+                let query = self.workspace_search.input.text().trim().to_string();
+                let (matches, truncated) = crate::prompt::find_matches_bounded(
+                    &query,
+                    std::iter::once((row, text.as_str())),
+                    100,
+                );
+                let mut prompt =
+                    crate::prompt::TextPrompt::new(crate::prompt::PromptKind::Find, &query);
+                prompt.matches = matches;
+                prompt.matches_truncated = truncated;
+                self.workspace_search.close();
+                self.active_prompt = Some(prompt);
+                self.search_dirty = false;
+                self.search_target = Some((self.active_tab, self.active_tab().tree.active_id));
+                self.scroll_to_current_match();
+            } else {
+                self.workspace_search.output.status =
+                    "Output changed or busy — edit the query to refresh".into();
+            }
+        } else {
+            self.workspace_search.preview_selected(&self.proxy);
+        }
+        self.sync_search();
+    }
+    fn sync_workspace_card(&mut self) {
+        self.renderer.workspace_card = self.workspace_panel.presentation_card();
+        if let Some(card) = self.renderer.workspace_card.as_mut() {
+            card.floating =
+                self.config.workspace.layout == volt_config::config::WorkspaceLayout::Floating;
+            card.position = self.workspace_panel.position;
+        }
+        if self.renderer.workspace_card.is_none() {
+            // Auto-hidden cards must not capture keyboard input or clipboard paste.
+            self.workspace_panel.focused = false;
+            self.workspace_panel.hover = None;
+        }
+        if let Some(l) = self.renderer.workspace_card_layout() {
+            if let Some(card) = self.renderer.workspace_card.as_mut() {
+                self.workspace_panel.scroll = self
+                    .workspace_panel
+                    .scroll
+                    .min(card.rows.len().saturating_sub(l.count));
+                card.scroll = self.workspace_panel.scroll;
+            }
+        }
+    }
+
+    fn toggle_workspace_layout(&mut self) {
+        let previous_grid = self.current_grid_size();
+        use volt_config::config::WorkspaceLayout;
+        self.config.workspace.layout = match self.config.workspace.layout {
+            WorkspaceLayout::Docked => WorkspaceLayout::Floating,
+            WorkspaceLayout::Floating => WorkspaceLayout::Docked,
+        };
+        self.workspace_panel.drag_offset = None;
+        self.sync_workspace_card();
+        if self.current_grid_size() != previous_grid {
+            self.resize_all_tabs_to_current_grid();
+        }
+        self.begin_redraw();
+    }
+
+    fn toggle_workspace_panel(&mut self) {
+        let previous_grid = self.current_grid_size();
+        self.workspace_panel.drag_offset = None;
+        self.workspace_panel.visible = !self.workspace_panel.visible;
+        self.workspace_panel.focused = self.workspace_panel.visible;
+        self.workspace_panel.hover = self.workspace_panel.visible.then_some(102);
+        self.sync_workspace_card();
+        if self.current_grid_size() != previous_grid {
+            self.resize_all_tabs_to_current_grid();
+        }
+        self.begin_redraw();
+    }
+
+    fn activate_workspace_action(&mut self, id: usize) {
+        if id == 103 {
+            self.toggle_workspace_layout();
+            return;
+        }
+        if id == 900 || (3000..3032).contains(&id) {
+            let task = if id == 900 {
+                self.workspace_panel.selected_task.clone().filter(|task| {
+                    self.workspace_panel
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|s| s.project.tasks.contains(task))
+                })
+            } else {
+                self.workspace_panel
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| s.git_details.worktrees.get(id - 3000))
+                    .filter(|w| !w.prunable)
+                    .map(|w| crate::workspace_project::ProjectTask {
+                        label: format!("Worktree: {}", w.branch),
+                        cwd: w.path.clone(),
+                        definition: String::new(),
+                        argv: std::iter::once(self.config.shell.program.clone())
+                            .chain(self.config.shell.args.clone())
+                            .collect(),
+                    })
+            };
+            if let Some(task) = task {
+                let mut config = self.config.clone();
+                let shell = config.shell.program.clone();
+                config.shell.program = "/bin/sh".into();
+                config.shell.args = crate::workspace_project::task_shell_args(&task, &shell);
+                let (cols, rows) = self.current_grid_size();
+                if let Ok(mut tab) = TerminalTab::spawn(
+                    &config,
+                    cols as u16,
+                    rows as u16,
+                    self.proxy.clone(),
+                    Arc::clone(&self.pty_wake_pending),
+                ) {
+                    tab.custom_title = Some(task.label);
+                    self.tabs.push(tab);
+                    self.active_tab = self.tabs.len() - 1;
+                    self.workspace_panel.focused = false;
+                    self.resize_all_tabs_to_current_grid();
+                } else if let Some(snapshot) = self.workspace_panel.snapshot.as_mut() {
+                    snapshot.error = Some("Could not start task terminal".into());
+                }
+            }
+        } else if id == 6000 {
+            if let Some(crate::workspace_git::PrState::Found(pr)) =
+                &self.workspace_panel.pull_request
+            {
+                if crate::workspace_git::valid_pr_url(&pr.url) {
+                    let url = pr.url.clone();
+                    std::thread::spawn(move || {
+                        #[cfg(target_os = "macos")]
+                        let program = "open";
+                        #[cfg(not(target_os = "macos"))]
+                        let program = "xdg-open";
+                        let _ = std::process::Command::new(program).arg(url).status();
+                    });
+                }
+            }
+        } else {
+            let previous_grid = self.current_grid_size();
+            self.workspace_panel.activate(id);
+            self.sync_workspace_card();
+            if previous_grid != self.current_grid_size() {
+                self.resize_all_tabs_to_current_grid();
+            }
+        }
+    }
+
+    fn workspace_hit(&self) -> Option<usize> {
+        self.renderer.workspace_card_layout().and_then(|l| {
+            self.renderer
+                .workspace_card
+                .as_ref()
+                .and_then(|c| l.hit(self.mouse_pos.0, self.mouse_pos.1, c))
+        })
+    }
+
+    fn workspace_contains_pointer(&self) -> bool {
+        self.renderer
+            .workspace_card_layout()
+            .is_some_and(|l| l.contains(self.mouse_pos.0, self.mouse_pos.1))
+    }
+
     fn layout_tab_count(&self) -> usize {
         self.tabs.len().max(1)
     }
@@ -157,6 +393,7 @@ impl MainState {
     }
 
     fn resize_all_tabs_to_current_grid(&mut self) {
+        self.sync_workspace_card();
         let (total_cols, total_rows) = self.current_grid_size();
         for tab in &mut self.tabs {
             let rects = tab.tree.layout(total_cols, total_rows);
@@ -229,7 +466,9 @@ impl MainState {
         let scale = self.renderer.scale_factor;
         let drag_id = self.divider_drag.map(|d| d.divider_id);
         let divider_opacity = self.config.appearance.divider_opacity;
-        let phys_right = self.renderer.surface_width() as f32 - phys_pad;
+        let phys_right = self.renderer.surface_width() as f32
+            - phys_pad
+            - self.renderer.workspace_card_reserved_width();
         let phys_bottom = self.renderer.surface_height() as f32;
         tab.tree.dividers_with_ids(
             total_cols,
@@ -572,13 +811,17 @@ impl MainState {
         }
     }
 
-    fn build_render_grid_for_active_tab(&self) -> Option<(Grid, bool)> {
+    fn build_render_grid_for_active_tab(&mut self) -> Option<(Grid, bool)> {
         let (total_cols, total_rows) = self.current_grid_size();
+        let mut out = self
+            .render_snapshot
+            .take()
+            .unwrap_or_else(|| Grid::new(total_cols, total_rows));
+        out.prepare_for_snapshot(total_cols, total_rows);
         let tab = self.active_tab();
         let active_id = tab.tree.active_id;
         let rects = tab.tree.layout(total_cols, total_rows);
 
-        let mut out = Grid::new(total_cols.max(1), total_rows.max(1));
         let mut active_cursor_visible = false;
 
         for rect in &rects {
@@ -919,6 +1162,9 @@ impl MainState {
     /// resetting the scroll view, a harmless local UI convenience) when the
     /// pane is marked read-only via the context menu.
     fn send_pty_input(&mut self, bytes: &[u8]) {
+        if self.workspace_search.visible {
+            return;
+        }
         self.bump_cursor_blink();
         let pane = self.active_pane_mut();
         pane.scroll_view_offset = 0;
@@ -930,12 +1176,54 @@ impl MainState {
         }
     }
 
+    fn insert_committed_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match committed_text_target(
+            self.workspace_search.visible,
+            self.active_prompt.is_some(),
+            self.workspace_panel.visible
+                && self.workspace_panel.focused
+                && self.renderer.workspace_card_layout().is_some(),
+            self.active_tab().active_pane().read_only,
+        ) {
+            CommittedTextTarget::Search => {
+                self.workspace_search.edit(text);
+                self.sync_search();
+            }
+            CommittedTextTarget::Prompt => {
+                if let Some(prompt) = self.active_prompt.as_mut() {
+                    for c in text.chars() {
+                        prompt.insert_char(c);
+                    }
+                }
+                self.on_prompt_text_changed();
+            }
+            CommittedTextTarget::Terminal => self.send_pty_input(text.as_bytes()),
+            CommittedTextTarget::Ignore => {}
+        }
+    }
+
     fn paste_clipboard(&mut self) {
+        #[cfg(target_os = "macos")]
+        if !self.workspace_search.visible
+            && self.workspace_panel.visible
+            && self.workspace_panel.focused
+        {
+            return;
+        }
         #[cfg(target_os = "macos")]
         {
             match std::process::Command::new("pbpaste").output() {
                 Ok(output) => {
                     if output.status.success() {
+                        if self.workspace_search.visible {
+                            self.workspace_search
+                                .edit(&String::from_utf8_lossy(&output.stdout));
+                            self.sync_search();
+                            return;
+                        }
                         let bracketed = self
                             .tabs
                             .get(self.active_tab)
@@ -966,6 +1254,8 @@ impl MainState {
 
     #[cfg(target_os = "macos")]
     fn open_find_prompt(&mut self) {
+        self.workspace_search.close();
+        self.renderer.search_palette = None;
         self.search_dirty = false;
         self.search_target = Some((self.active_tab, self.active_tab().tree.active_id));
         self.active_prompt = Some(crate::prompt::TextPrompt::new(
@@ -977,6 +1267,8 @@ impl MainState {
 
     #[cfg(target_os = "macos")]
     fn open_rename_prompt(&mut self, kind: crate::prompt::PromptKind) {
+        self.workspace_search.close();
+        self.renderer.search_palette = None;
         self.search_dirty = false;
         self.search_target = None;
         let custom = match kind {
@@ -1023,6 +1315,9 @@ impl MainState {
     }
 
     fn on_prompt_text_changed(&mut self) {
+        if let Some(prompt) = self.active_prompt.as_mut() {
+            prompt.clear_matches();
+        }
         self.recompute_search_matches();
         self.scroll_to_current_match();
         self.begin_redraw();
@@ -1046,9 +1341,7 @@ impl MainState {
             .unwrap_or_default();
         if query.is_empty() {
             if let Some(prompt) = self.active_prompt.as_mut() {
-                prompt.matches.clear();
-                prompt.matches_truncated = false;
-                prompt.current_match = 0;
+                prompt.clear_matches();
             }
             self.search_dirty = false;
             self.last_search_refresh = Instant::now();
@@ -1080,9 +1373,7 @@ impl MainState {
             MAX_SEARCH_MATCHES,
         );
         if let Some(prompt) = self.active_prompt.as_mut() {
-            prompt.matches = matches;
-            prompt.matches_truncated = truncated;
-            prompt.current_match = 0;
+            prompt.replace_matches(matches, truncated);
         }
         self.search_dirty = false;
         self.search_target = Some((self.active_tab, self.active_tab().tree.active_id));
@@ -1095,6 +1386,9 @@ impl MainState {
             Some(crate::prompt::PromptKind::Find)
         ) && self.search_target != Some((self.active_tab, self.active_tab().tree.active_id))
         {
+            if let Some(prompt) = self.active_prompt.as_mut() {
+                prompt.clear_matches();
+            }
             self.invalidate_search_after_output();
         }
     }
@@ -1103,9 +1397,7 @@ impl MainState {
         if let Some(prompt) = self.active_prompt.as_mut() {
             if prompt.kind == crate::prompt::PromptKind::Find && !prompt.is_empty() {
                 // Never display a stale highlight against a changed grid.
-                prompt.matches.clear();
-                prompt.matches_truncated = false;
-                prompt.current_match = 0;
+                prompt.invalidate_matches();
                 self.search_dirty = true;
             }
         }
@@ -1475,6 +1767,10 @@ impl App {
             .with_blur(self.config.appearance.blur_enabled());
 
         let window = Arc::new(event_loop.create_window(window_attrs)?);
+        // Capture native picker text without changing normal keyboard/IME handling.
+        #[cfg(target_os = "macos")]
+        let native_text =
+            crate::native_text::NativeTextInput::install(window.clone(), proxy.clone())?;
         #[cfg(target_os = "macos")]
         let native_tab_count = window.num_tabs().max(1);
         #[cfg(target_os = "macos")]
@@ -1520,7 +1816,10 @@ impl App {
         let mut state = MainState {
             id,
             window,
+            #[cfg(target_os = "macos")]
+            _native_text: native_text,
             renderer,
+            render_snapshot: None,
             tabs: vec![first_tab],
             active_tab: 0,
             theme,
@@ -1551,7 +1850,9 @@ impl App {
             pty_wake_pending: Arc::clone(&self.pty_wake_pending),
             divider_drag: None,
             divider_hover_id: None,
-            chat_panel: ChatPanel::new(),
+            workspace_panel: WorkspacePanel::default(),
+            workspace_search: crate::workspace_search::SearchPalette::default(),
+            search_mouse_capture: None,
             last_click: None,
             click_count: 0,
             #[cfg(target_os = "macos")]
@@ -1672,10 +1973,11 @@ impl App {
                 state.paste_clipboard();
                 state.begin_redraw();
             }
+            A::SearchWorkspace => state.toggle_search(),
             A::Find => state.open_find_prompt(),
+            A::ToggleWorkspaceLayout => state.toggle_workspace_layout(),
             A::ToggleChatPanel => {
-                state.chat_panel.toggle();
-                state.begin_redraw();
+                state.toggle_workspace_panel();
             }
             A::IncreaseFontSize => {
                 if state.adjust_font_size(1.0) {
@@ -1804,6 +2106,33 @@ fn should_show_context_menu(shift_down: bool, mouse_reporting: bool, read_only: 
     shift_down || read_only || !mouse_reporting
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CommittedTextTarget {
+    Search,
+    Prompt,
+    Terminal,
+    Ignore,
+}
+
+/// Native picker/IME text follows the same modal ownership as keyboard input.
+/// Read-only terminal state must not stop editing a local Find/search field.
+fn committed_text_target(
+    search: bool,
+    prompt: bool,
+    inspector_focused: bool,
+    read_only: bool,
+) -> CommittedTextTarget {
+    if search {
+        CommittedTextTarget::Search
+    } else if prompt {
+        CommittedTextTarget::Prompt
+    } else if inspector_focused || read_only {
+        CommittedTextTarget::Ignore
+    } else {
+        CommittedTextTarget::Terminal
+    }
+}
+
 // ── ApplicationHandler ────────────────────────────────────────────────────────
 
 impl ApplicationHandler<VoltEvent> for App {
@@ -1845,6 +2174,13 @@ impl ApplicationHandler<VoltEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: VoltEvent) {
         match event {
+            VoltEvent::WorkspaceUpdated => {}
+            #[cfg(target_os = "macos")]
+            VoltEvent::NativeText { window_id, text } => {
+                if let Some(state) = self.windows.get_mut(&window_id) {
+                    state.insert_committed_text(&text);
+                }
+            }
             VoltEvent::PtyData => {
                 self.pty_wake_pending.store(false, Ordering::Release);
                 for state in self.windows.values_mut() {
@@ -1891,8 +2227,16 @@ impl ApplicationHandler<VoltEvent> for App {
         let mut close_window_after_event = false;
 
         match event {
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                // Commit is final UTF-8 input, not paste or a command key.
+                // Winit suppresses the composing key event to avoid duplicates.
+                state.insert_committed_text(&text);
+            }
             WindowEvent::Resized(size) => {
                 state.renderer.resize(size.width, size.height);
+                if state.workspace_search.visible {
+                    state.sync_search();
+                }
                 state.resize_all_tabs_to_current_grid();
                 #[cfg(target_os = "macos")]
                 {
@@ -1924,6 +2268,7 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::Focused(false) => {
+                state.workspace_panel.drag_offset = None;
                 state.left_shift_down = false;
                 state.right_shift_down = false;
                 state.left_control_down = false;
@@ -1940,8 +2285,39 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                let pointer_moved = state.mouse_pos != (position.x as f32, position.y as f32);
                 state.mouse_pos = (position.x as f32, position.y as f32);
+                if state.workspace_search.visible || state.search_mouse_capture.is_some() {
+                    return;
+                }
+                if let Some([dx, dy]) = state.workspace_panel.drag_offset {
+                    let scale = state.renderer.scale_factor;
+                    state.workspace_panel.position = Some([
+                        position.x as f32 / scale - dx,
+                        (position.y as f32 - state.renderer.workspace_card_top_offset()) / scale
+                            - dy,
+                    ]);
+                    state.sync_workspace_card();
+                    state.begin_redraw();
+                    return;
+                }
 
+                if state.divider_drag.is_none() && !state.is_drag_selecting {
+                    let hit = state.workspace_hit();
+                    if pointer_moved && hit != state.workspace_panel.hover {
+                        state.workspace_panel.hover = hit;
+                        state.sync_workspace_card();
+                        state.begin_redraw();
+                    }
+                    if state.workspace_contains_pointer() {
+                        state.window.set_cursor(if hit.is_some() {
+                            winit::window::CursorIcon::Pointer
+                        } else {
+                            winit::window::CursorIcon::Default
+                        });
+                        return;
+                    }
+                }
                 if let Some(drag) = state.divider_drag {
                     // Absolute ratio: start_ratio + total_delta / local_span.
                     // delta_px is the total movement since drag began — no per-frame reset needed.
@@ -2038,7 +2414,79 @@ impl ApplicationHandler<VoltEvent> for App {
                 button,
                 ..
             } => {
+                if btn_state == ElementState::Released && state.search_mouse_capture == Some(button)
+                {
+                    state.search_mouse_capture = None;
+                    return;
+                }
+                if state.workspace_search.visible {
+                    if btn_state == ElementState::Pressed {
+                        state.search_mouse_capture = Some(button);
+                    }
+                    if btn_state == ElementState::Pressed && button == MouseButton::Left {
+                        use volt_renderer::search_palette::SearchHit;
+                        if let Some(l) = state.renderer.search_layout() {
+                            match l.hit(
+                                state.mouse_pos.0,
+                                state.mouse_pos.1,
+                                state.workspace_search.selected,
+                                state.workspace_search.output.rows.len(),
+                            ) {
+                                SearchHit::Close | SearchHit::Outside => {
+                                    state.workspace_search.close()
+                                }
+                                SearchHit::Scope(i) => state
+                                    .workspace_search
+                                    .set_scope(crate::workspace_search::Scope::ALL[i]),
+                                SearchHit::Row(i) => {
+                                    state.workspace_search.selected = i;
+                                    state.workspace_search.preview_selected(&state.proxy);
+                                }
+                                SearchHit::Body => {}
+                            }
+                        }
+                        state.sync_search();
+                    }
+                    return;
+                }
+                if button == MouseButton::Left
+                    && btn_state == ElementState::Released
+                    && state.workspace_panel.drag_offset.take().is_some()
+                {
+                    return;
+                }
+                if button == MouseButton::Left
+                    && btn_state == ElementState::Pressed
+                    && !state.is_drag_selecting
+                    && state.divider_drag.is_none()
+                    && state.config.workspace.layout
+                        == volt_config::config::WorkspaceLayout::Floating
+                {
+                    if let Some(l) = state.renderer.workspace_card_layout() {
+                        let (x, y) = state.mouse_pos;
+                        if l.header_drag_contains(x, y, state.workspace_panel.minimized) {
+                            state.workspace_panel.drag_offset =
+                                Some([(x - l.x) / l.scale, (y - l.y) / l.scale]);
+                            return;
+                        }
+                    }
+                }
+                if state.workspace_contains_pointer()
+                    && !state.is_drag_selecting
+                    && state.divider_drag.is_none()
+                {
+                    if button == MouseButton::Left && btn_state == ElementState::Pressed {
+                        state.workspace_panel.focused = true;
+                        if let Some(id) = state.workspace_hit() {
+                            state.activate_workspace_action(id);
+                        }
+                        state.sync_workspace_card();
+                        state.begin_redraw();
+                    }
+                    return;
+                }
                 if btn_state == ElementState::Pressed {
+                    state.workspace_panel.focused = false;
                     state.bump_cursor_blink();
                 }
                 let (mx, my) = state.mouse_pos;
@@ -2212,6 +2660,38 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                if state.workspace_search.visible {
+                    let dy = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                    };
+                    if dy != 0. {
+                        state.workspace_search.select(if dy < 0. { 1 } else { -1 });
+                        state.sync_search();
+                    }
+                    return;
+                }
+                if state.workspace_contains_pointer() {
+                    let dy = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                    };
+                    if let Some(l) = state.renderer.workspace_card_layout() {
+                        if state.workspace_panel.minimized {
+                            return;
+                        }
+                        let count = state.workspace_panel.card().rows.len();
+                        let max = count.saturating_sub(l.count);
+                        state.workspace_panel.scroll = if dy < 0.0 {
+                            (state.workspace_panel.scroll + 1).min(max)
+                        } else {
+                            state.workspace_panel.scroll.saturating_sub(1)
+                        };
+                        state.sync_workspace_card();
+                        state.begin_redraw();
+                    }
+                    return;
+                }
                 let my = state.mouse_pos.1;
                 if state.show_custom_tab_bar() && my < state.current_tab_bar_height() {
                     let direction = match delta {
@@ -2318,6 +2798,156 @@ impl ApplicationHandler<VoltEvent> for App {
                 let super_key = state.super_down();
                 let shift = state.shift_down();
                 let alt = state.modifiers.alt_key();
+                if super_key && shift && physical_key == PhysicalKey::Code(KeyCode::KeyP) {
+                    state.toggle_search();
+                    return;
+                }
+                // Cmd+F opens terminal Find regardless of whether the workspace
+                // search palette happens to be open. This used to be handled
+                // only inside the `workspace_search.visible` branch below,
+                // which meant Cmd+F silently did nothing the rest of the time
+                // — the common case.
+                #[cfg(target_os = "macos")]
+                if super_key
+                    && !ctrl
+                    && !alt
+                    && !shift
+                    && physical_key == PhysicalKey::Code(KeyCode::KeyF)
+                {
+                    state.open_find_prompt();
+                    return;
+                }
+                if state.workspace_search.visible {
+                    if super_key {
+                        match physical_key {
+                            PhysicalKey::Code(KeyCode::KeyA) => {
+                                state.workspace_search.query_selected = true
+                            }
+                            PhysicalKey::Code(KeyCode::KeyV) => state.paste_clipboard(),
+                            PhysicalKey::Code(KeyCode::Backspace) => {
+                                state.workspace_search.input = crate::prompt::TextPrompt::new(
+                                    crate::prompt::PromptKind::Find,
+                                    "",
+                                );
+                                state.workspace_search.query_selected = false;
+                                state.workspace_search.changed();
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match physical_key {
+                            PhysicalKey::Code(KeyCode::Escape) => state.workspace_search.close(),
+                            PhysicalKey::Code(KeyCode::ArrowDown) => {
+                                state.workspace_search.select(1)
+                            }
+                            PhysicalKey::Code(KeyCode::ArrowUp) => {
+                                state.workspace_search.select(-1)
+                            }
+                            PhysicalKey::Code(KeyCode::Tab) => {
+                                let i = state.workspace_search.scope.index();
+                                state.workspace_search.set_scope(
+                                    crate::workspace_search::Scope::ALL
+                                        [(i + if shift { 5 } else { 1 }) % 6],
+                                );
+                            }
+                            PhysicalKey::Code(KeyCode::Enter) => state.activate_search_result(),
+                            PhysicalKey::Code(KeyCode::Backspace) => {
+                                state.workspace_search.delete_query(true);
+                            }
+                            PhysicalKey::Code(KeyCode::Delete) => {
+                                state.workspace_search.delete_query(false);
+                            }
+                            PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                                if state.workspace_search.query_selected {
+                                    state.workspace_search.input.cursor = 0;
+                                } else {
+                                    state.workspace_search.input.move_left();
+                                }
+                                state.workspace_search.query_selected = false;
+                            }
+                            PhysicalKey::Code(KeyCode::ArrowRight) => {
+                                if state.workspace_search.query_selected {
+                                    state.workspace_search.input.cursor =
+                                        state.workspace_search.input.text().chars().count();
+                                } else {
+                                    state.workspace_search.input.move_right();
+                                }
+                                state.workspace_search.query_selected = false;
+                            }
+                            PhysicalKey::Code(KeyCode::Home) => {
+                                state.workspace_search.query_selected = false;
+                                state.workspace_search.input.cursor = 0
+                            }
+                            PhysicalKey::Code(KeyCode::End) => {
+                                state.workspace_search.query_selected = false;
+                                state.workspace_search.input.cursor =
+                                    state.workspace_search.input.text().chars().count()
+                            }
+                            _ => {
+                                if !ctrl && !alt {
+                                    if let Some(text) = text.as_ref() {
+                                        state.workspace_search.edit(text.as_str());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    state.sync_search();
+                    return;
+                }
+
+                if state.workspace_panel.visible
+                    && state.workspace_panel.focused
+                    && state.renderer.workspace_card_layout().is_some()
+                    && state.active_prompt.is_none()
+                    && !super_key
+                {
+                    match physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            state.workspace_panel.focused = false;
+                            state.workspace_panel.hover = None;
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowDown | KeyCode::Tab | KeyCode::ArrowUp) => {
+                            let card = state.workspace_panel.card();
+                            let actions = card.actions();
+                            if !actions.is_empty() {
+                                let old = actions
+                                    .iter()
+                                    .position(|a| Some(*a) == state.workspace_panel.hover);
+                                let back =
+                                    physical_key == PhysicalKey::Code(KeyCode::ArrowUp) || shift;
+                                let i = match old {
+                                    Some(i) if back => (i + actions.len() - 1) % actions.len(),
+                                    Some(i) => (i + 1) % actions.len(),
+                                    None => 0,
+                                };
+                                state.workspace_panel.hover = Some(actions[i]);
+                                if let Some(l) = state.renderer.workspace_card_layout() {
+                                    let row = card
+                                        .rows
+                                        .iter()
+                                        .position(|r| r.action == Some(actions[i]))
+                                        .unwrap_or(0);
+                                    if row < state.workspace_panel.scroll {
+                                        state.workspace_panel.scroll = row;
+                                    }
+                                    if row >= state.workspace_panel.scroll + l.count {
+                                        state.workspace_panel.scroll = row + 1 - l.count;
+                                    }
+                                }
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::Enter | KeyCode::Space) => {
+                            if let Some(id) = state.workspace_panel.hover {
+                                state.activate_workspace_action(id);
+                            }
+                        }
+                        _ => {}
+                    }
+                    state.sync_workspace_card();
+                    state.begin_redraw();
+                    return;
+                }
 
                 // A Find/rename overlay is active — it captures all keyboard
                 // input until confirmed or cancelled. This must fully return
@@ -2483,9 +3113,8 @@ impl ApplicationHandler<VoltEvent> for App {
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyA) if shift => {
-                            // Cmd+Shift+A: toggle AI Chat Panel
-                            state.chat_panel.toggle();
-                            state.begin_redraw();
+                            // Cmd+Shift+A: toggle the inset workspace inspector
+                            state.toggle_workspace_panel();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::ArrowLeft) if alt => {
@@ -2913,6 +3542,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         inspector_info,
                         active_read_only,
                     );
+                    state.render_snapshot = Some(render_grid);
                     if state.post_resize_redraws > 0 {
                         state.post_resize_redraws -= 1;
                         state.mark_full_redraw();
@@ -2945,6 +3575,53 @@ impl ApplicationHandler<VoltEvent> for App {
         let mut windows_to_close = Vec::new();
 
         for (window_id, state) in self.windows.iter_mut() {
+            let cwd = state.active_tab().active_pane().cwd.clone();
+            let pid = state.active_tab().active_pane().pty.child_pid();
+            if state.workspace_search.visible
+                && (state.workspace_search.target != pid
+                    || pid
+                        .and_then(crate::workspace_panel::local_process_cwd)
+                        .or_else(|| cwd.clone())
+                        != state.workspace_search.cwd)
+            {
+                state.workspace_search.close();
+                state.sync_search();
+            }
+            if state.workspace_search.visible {
+                let performer = state.active_tab().active_pane().performer.clone();
+                let query = state.workspace_search.input.text();
+                let scope = state.workspace_search.scope;
+                let search_cwd = state.workspace_search.cwd.clone();
+                let snapshot = state.workspace_panel.search_snapshot(&search_cwd, pid);
+                if state.workspace_search.tick(
+                    || crate::workspace_search::SearchInput {
+                        query,
+                        scope,
+                        cwd: search_cwd,
+                        snapshot: snapshot.cloned(),
+                        performer,
+                    },
+                    &state.proxy,
+                ) {
+                    state.sync_search();
+                }
+                if let Some(deadline) = state.workspace_search.deadline() {
+                    next_blink_deadline =
+                        Some(next_blink_deadline.map_or(deadline, |d| d.min(deadline)));
+                }
+            }
+            if state.workspace_panel.tick(cwd, pid, &state.proxy) {
+                let previous_grid = state.current_grid_size();
+                state.sync_workspace_card();
+                if previous_grid != state.current_grid_size() {
+                    state.resize_all_tabs_to_current_grid();
+                }
+                state.begin_redraw();
+            }
+            if let Some(deadline) = state.workspace_panel.refresh_deadline() {
+                next_blink_deadline =
+                    Some(next_blink_deadline.map_or(deadline, |d| d.min(deadline)));
+            }
             #[cfg(target_os = "macos")]
             {
                 let native_tab_count = state.window.num_tabs().max(1);
@@ -3409,6 +4086,19 @@ mod tests {
 
     use super::{Grid, MainState};
 
+    #[test]
+    fn native_text_respects_modal_input_and_read_only_panes() {
+        use super::{committed_text_target as target, CommittedTextTarget::*};
+        assert_eq!(target(false, false, false, false), Terminal);
+        assert_eq!(target(false, false, false, true), Ignore);
+        assert_eq!(target(false, false, true, false), Ignore);
+        assert_eq!(target(false, false, true, true), Ignore);
+        assert_eq!(target(true, false, false, false), Search);
+        assert_eq!(target(true, true, true, true), Search);
+        assert_eq!(target(false, true, false, false), Prompt);
+        assert_eq!(target(false, true, false, true), Prompt);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn tui_right_click_is_forwarded_unless_shift_opens_volt_menu() {
@@ -3468,6 +4158,69 @@ mod tests {
             .unwrap()
             .contains("# Volt Terminal"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reused_snapshot_matches_fresh_across_panes_unicode_history_and_resize() {
+        let mut source = volt_core::performer::Performer::new(8, 3);
+        // Create clusters directly so the UI test does not depend on VTE.
+        source.grid.set_grapheme(1, 0, "👩‍💻", 2);
+        source.grid.set_grapheme(4, 0, "e\u{301}", 1);
+        source.grid.scroll_up(0, 2, 1);
+        source.grid.set_grapheme(2, 1, "🇮🇳", 2);
+        let other = Grid::new(3, 2);
+        let mut reused = Grid::new(20, 6);
+        for (frame, (cols, rows)) in [(20, 6), (20, 6), (12, 4), (1, 1), (20, 6)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut fresh = Grid::new(cols, rows);
+            reused.prepare_for_snapshot(cols, rows);
+            for dst in [&mut fresh, &mut reused] {
+                if frame % 2 == 0 {
+                    MainState::blit_grid_with_scrollback(dst, &source.grid, 0, 0, 3, 1);
+                } else {
+                    MainState::blit_grid(dst, &source.grid, 1, 1);
+                }
+                MainState::blit_grid(dst, &other, 9, 2);
+            }
+            assert_eq!(fresh.dirty_rows(), reused.dirty_rows());
+            for row in 0..rows {
+                assert_eq!(fresh.row_cells(row), reused.row_cells(row));
+                assert_eq!(
+                    fresh.row_text(fresh.row_cells(row)),
+                    reused.row_text(reused.row_cells(row))
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual CPU snapshot benchmark, not GPU throughput"]
+    fn benchmark_snapshot_allocation_vs_reuse() {
+        for (cols, rows) in [(91, 16), (200, 60)] {
+            let source = Grid::new(cols, rows);
+            let mut scratch = Grid::new(cols, rows);
+            for reuse in [false, true, true, false] {
+                let start = std::time::Instant::now();
+                let iterations = 10_000;
+                for _ in 0..iterations {
+                    if reuse {
+                        scratch.prepare_for_snapshot(cols, rows);
+                        MainState::blit_grid(&mut scratch, &source, 0, 0);
+                        std::hint::black_box(&scratch);
+                    } else {
+                        let mut fresh = Grid::new(cols, rows);
+                        MainState::blit_grid(&mut fresh, &source, 0, 0);
+                        std::hint::black_box(&fresh);
+                    }
+                }
+                eprintln!(
+                    "snapshot {cols}x{rows} reuse={reuse}: {:.3} us/frame",
+                    start.elapsed().as_secs_f64() * 1e6 / iterations as f64
+                );
+            }
+        }
     }
 
     /// Measures render-grid composition, not GPU present. Run explicitly

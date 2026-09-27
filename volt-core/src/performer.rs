@@ -53,6 +53,10 @@ pub struct Performer {
 }
 
 impl Performer {
+    pub fn alternate_screen_active(&self) -> bool {
+        self.use_alt_screen
+    }
+
     pub fn new(cols: usize, rows: usize) -> Self {
         Self {
             grid: Grid::new(cols, rows),
@@ -234,7 +238,14 @@ impl Performer {
         self.display_dirty = true;
     }
 
+    #[inline]
     fn mark_dirty_row(&mut self, row: usize) {
+        self.display_dirty = true;
+        if let Some((start, end)) = self.damage_rows {
+            if row >= start && row <= end {
+                return;
+            }
+        }
         self.mark_dirty_range(row, row);
     }
 
@@ -1354,6 +1365,30 @@ mod tests {
         assert_eq!(p.grid.cell(0, 1).bg, CellColor::Indexed(4));
         feed(&mut p, b"\x1b[0m\r\n");
         assert_eq!(p.grid.cell(0, 1).bg, CellColor::Default);
+    }
+
+    #[test]
+    fn repeated_damage_marks_preserve_range_and_reset_contract() {
+        let mut p = Performer::new(8, 4);
+        for (row, expected) in [
+            (2, (2, 2)),
+            (2, (2, 2)),
+            (0, (0, 2)),
+            (1, (0, 2)),
+            (3, (0, 3)),
+            (99, (0, 3)),
+        ] {
+            p.display_dirty = false;
+            p.mark_dirty_row(row);
+            assert_eq!(p.damage_rows, Some(expected));
+            assert!(p.display_dirty);
+        }
+        assert_eq!(p.take_damage_rows(), Some((0, 3)));
+        assert_eq!(p.take_damage_rows(), None);
+        p.display_dirty = false;
+        p.mark_dirty_row(1);
+        assert_eq!(p.take_damage_rows(), Some((1, 1)));
+        assert!(p.display_dirty);
     }
 
     #[test]

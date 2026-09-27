@@ -7,3 +7,13 @@ pub mod prompt;
 pub mod tab;
 pub mod tab_layout;
 pub use app::App;
+
+pub mod workspace_panel;
+
+pub mod workspace_git;
+pub mod workspace_project;
+
+pub mod workspace_search;
+
+#[cfg(target_os = "macos")]
+mod native_text;
