@@ -1,4 +1,5 @@
 use crate::cell::{Cell, CellColor};
+use crate::hyperlink::{Hyperlink, MAX_LINKED_TEXTS, MAX_LINKED_TEXT_BYTES, MAX_LINKS};
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone)]
@@ -42,6 +43,17 @@ pub struct Grid {
     has_wide: bool,
     graphemes: Vec<Arc<str>>,
     grapheme_ids: HashMap<Arc<str>, usize>,
+    // Linked cells share the existing extended-text IDs, so erasure, memcpy,
+    // reflow and scrollback move metadata with text without growing Cell.
+    links: Option<Box<LinkPool>>,
+    prompt_marks: Option<Box<crate::shell::PromptMarks>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LinkPool {
+    grapheme_links: HashMap<usize, Arc<Hyperlink>>,
+    linked_ids: HashMap<Arc<Hyperlink>, HashMap<Arc<str>, usize>>,
+    linked_text_bytes: usize,
 }
 
 struct ReflowSource<'a> {
@@ -100,6 +112,8 @@ impl Grid {
             has_wide: false,
             graphemes: Vec::new(),
             grapheme_ids: HashMap::new(),
+            links: None,
+            prompt_marks: None,
         }
     }
 
@@ -136,6 +150,8 @@ impl Grid {
         // the next snapshot, even if tabs/panes now contain different text.
         self.graphemes.clear();
         self.grapheme_ids.clear();
+        self.links = None;
+        self.prompt_marks = None;
     }
 
     pub(crate) fn new_alt(cols: usize, rows: usize) -> Self {
@@ -166,6 +182,9 @@ impl Grid {
         for row in skip..self.scrollback_count {
             cells.extend_from_slice(self.scrollback_row(row));
             wrapped.push(self.scrollback_row_soft_wrapped(row));
+        }
+        if let Some(marks) = &mut self.prompt_marks {
+            marks.evict(skip);
         }
         self.scrollback_count -= skip;
         self.scrollback_start = 0;
@@ -271,21 +290,87 @@ impl Grid {
         id
     }
 
+    pub fn hyperlink(&self, cell: &Cell) -> Option<&Arc<Hyperlink>> {
+        cell.cluster_id()
+            .and_then(|id| self.links.as_ref()?.grapheme_links.get(&id))
+    }
+
+    fn intern_linked(&mut self, text: &str, link: &Arc<Hyperlink>) -> Option<usize> {
+        let pool = self.links.get_or_insert_with(Default::default);
+        if let Some(id) = pool.linked_ids.get(link).and_then(|texts| texts.get(text)) {
+            return Some(*id);
+        }
+        // Fixed budgets, including text bytes. On exhaustion, keep displaying
+        // ordinary text rather than scanning history on every untrusted OSC.
+        if pool.grapheme_links.len() >= MAX_LINKED_TEXTS
+            || pool.linked_text_bytes.saturating_add(text.len()) > MAX_LINKED_TEXT_BYTES
+            || (pool.linked_ids.len() >= MAX_LINKS && !pool.linked_ids.contains_key(link))
+        {
+            return None;
+        }
+        let text: Arc<str> = Arc::from(text);
+        let id = self.graphemes.len();
+        self.graphemes.push(Arc::clone(&text));
+        pool.grapheme_links.insert(id, Arc::clone(link));
+        pool.linked_text_bytes += text.len();
+        pool.linked_ids
+            .entry(Arc::clone(link))
+            .or_default()
+            .insert(text, id);
+        Some(id)
+    }
+
+    /// Only called while OSC 8 is active, never by ordinary ASCII output.
+    #[cold]
+    #[inline(never)]
+    pub fn link_cell(&mut self, cell: &mut Cell, c: char, link: &Arc<Hyperlink>) {
+        let mut utf8 = [0; 4];
+        if let Some(id) = self.intern_linked(c.encode_utf8(&mut utf8), link) {
+            cell.set_cluster(id);
+        }
+    }
+
     fn compact_graphemes(&mut self) {
+        let mut remap = HashMap::new();
         let mut ids = HashMap::new();
         let mut texts = Vec::new();
+        let mut links = HashMap::new();
+        let mut linked_ids: HashMap<Arc<Hyperlink>, HashMap<Arc<str>, usize>> = HashMap::new();
+        let mut bytes = 0;
         for cell in self.cells.iter_mut().chain(self.scrollback_buf.iter_mut()) {
             if let Some(old) = cell.cluster_id() {
-                let text = &self.graphemes[old];
-                let id = *ids.entry(Arc::clone(text)).or_insert_with(|| {
-                    texts.push(Arc::clone(text));
-                    texts.len() - 1
+                let id = *remap.entry(old).or_insert_with(|| {
+                    let text = Arc::clone(&self.graphemes[old]);
+                    let id = texts.len();
+                    texts.push(Arc::clone(&text));
+                    if let Some(link) = self
+                        .links
+                        .as_ref()
+                        .and_then(|pool| pool.grapheme_links.get(&old))
+                    {
+                        links.insert(id, Arc::clone(link));
+                        bytes += text.len();
+                        linked_ids
+                            .entry(Arc::clone(link))
+                            .or_default()
+                            .insert(text, id);
+                    } else {
+                        ids.insert(text, id);
+                    }
+                    id
                 });
                 cell.set_cluster(id);
             }
         }
         self.graphemes = texts;
         self.grapheme_ids = ids;
+        self.links = (!links.is_empty()).then(|| {
+            Box::new(LinkPool {
+                grapheme_links: links,
+                linked_ids,
+                linked_text_bytes: bytes,
+            })
+        });
     }
 
     pub fn set_grapheme(&mut self, col: usize, row: usize, text: &str, width: usize) {
@@ -295,8 +380,12 @@ impl Grid {
         if self.graphemes.len() > 1024 + 2 * (self.cells.len() + self.scrollback_buf.len()) {
             self.compact_graphemes();
         }
-        let id = self.intern_grapheme(text);
         let mut cell = *self.cell(col, row);
+        let link = self.hyperlink(&cell).cloned();
+        let id = link
+            .as_ref()
+            .and_then(|link| self.intern_linked(text, link))
+            .unwrap_or_else(|| self.intern_grapheme(text));
         cell.set_cluster(id);
         cell.set_wide(width == 2);
         let wrapped = self.row_soft_wrapped(row);
@@ -313,18 +402,52 @@ impl Grid {
             self.copy_into_row(row, col, cells);
             return;
         }
-        self.copy_extended_row(row, col, source, cells);
+        self.copy_extended_row(row, col, source, cells, true);
+    }
+
+    /// Render-only import: interactions resolve links against the source pane.
+    /// Keep URLs out of per-frame snapshots, and restore linked scalar cells to
+    /// the cheap scalar representation. Never use this for terminal state/reflow.
+    pub fn copy_text_from_grid(&mut self, row: usize, col: usize, source: &Grid, cells: &[Cell]) {
+        self.has_wide |= source.has_wide;
+        if source.graphemes.is_empty() {
+            self.copy_into_row(row, col, cells);
+        } else {
+            self.copy_extended_row(row, col, source, cells, false);
+        }
     }
 
     #[inline(never)]
-    fn copy_extended_row(&mut self, row: usize, col: usize, source: &Grid, cells: &[Cell]) {
+    fn copy_extended_row(
+        &mut self,
+        row: usize,
+        col: usize,
+        source: &Grid,
+        cells: &[Cell],
+        preserve_links: bool,
+    ) {
         if self.graphemes.len() > 1024 + 2 * (self.cells.len() + self.scrollback_buf.len()) {
             self.compact_graphemes();
         }
         let mut imported = cells.to_vec();
         for cell in &mut imported {
             if let Some(text) = source.extended_text(cell) {
-                cell.set_cluster(self.intern_grapheme(text));
+                if !preserve_links {
+                    let mut chars = text.chars();
+                    if let (Some(c), None) = (chars.next(), chars.next()) {
+                        let (wide, clipped) = (cell.is_wide(), cell.is_clipped_wide());
+                        cell.set_char(c);
+                        cell.set_wide(wide);
+                        cell.set_clipped_wide(clipped);
+                        continue;
+                    }
+                }
+                let id = preserve_links
+                    .then(|| source.hyperlink(cell))
+                    .flatten()
+                    .and_then(|link| self.intern_linked(text, link))
+                    .unwrap_or_else(|| self.intern_grapheme(text));
+                cell.set_cluster(id);
             }
         }
         self.copy_into_row(row, col, &imported);
@@ -608,6 +731,9 @@ impl Grid {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        // Reflow changes visual row coordinates. Drop anchors rather than
+        // navigating to unrelated text until anchor remapping is implemented.
+        self.prompt_marks = None;
         if !self.history_enabled {
             // Alternate-screen TUIs own their layout and redraw on SIGWINCH.
             // Resize their rectangle, never reflow it into shell history.
@@ -695,6 +821,7 @@ impl Grid {
             return;
         }
 
+        self.invalidate_live_prompts();
         self.row_map[top..=bottom].rotate_right(count);
         for row in top..(top + count) {
             let physical = self.row_map[row];
@@ -730,6 +857,18 @@ impl Grid {
         let count = count.min(region_rows);
         if count == 0 {
             return;
+        }
+
+        if let Some(marks) = &mut self.prompt_marks {
+            if self.history_enabled
+                && top == 0
+                && bottom + 1 == self.rows
+                && self.scrollback_limit > 0
+            {
+                marks.evict((self.scrollback_count + count).saturating_sub(self.scrollback_limit));
+            } else {
+                marks.invalidate_live(self.scrollback_count);
+            }
         }
 
         // Save rows scrolling off the top into the scrollback buffer.
@@ -796,6 +935,7 @@ impl Grid {
     }
 
     pub fn clear_screen(&mut self) {
+        self.invalidate_live_prompts();
         self.cells.fill(self.erase_cell);
         self.soft_wrapped.fill(false);
         self.cursor_col = 0;
@@ -804,6 +944,7 @@ impl Grid {
     }
 
     pub fn erase_all(&mut self) {
+        self.invalidate_live_prompts();
         self.cells.fill(self.erase_cell);
         self.soft_wrapped.fill(false);
         self.mark_all_dirty();
@@ -887,17 +1028,79 @@ impl Grid {
         self.dirty[row] = true;
     }
 
+    /// Record OSC 133 A on the main screen only. Allocates on first use.
+    pub(crate) fn mark_prompt(&mut self) {
+        if self.history_enabled {
+            self.prompt_marks
+                .get_or_insert_with(Default::default)
+                .add(self.scrollback_count + self.cursor_row);
+        }
+    }
+
+    fn invalidate_live_prompts(&mut self) {
+        if let Some(marks) = &mut self.prompt_marks {
+            marks.invalidate_live(self.scrollback_count);
+        }
+    }
+
+    /// Scrollback offset for the previous/next prompt above the viewport.
+    /// Going past the newest anchor returns to live output; oldest is clamped.
+    pub fn prompt_scroll_offset(&self, offset: usize, previous: bool) -> usize {
+        self.prompt_marks
+            .as_ref()
+            .map_or(offset.min(self.scrollback_count), |marks| {
+                marks.offset(self.scrollback_count, offset, previous)
+            })
+    }
+
     /// Discard all scrollback history (e.g. Cmd+K clear).
     pub fn clear_scrollback(&mut self) {
+        self.prompt_marks = None;
         self.scrollback_buf.clear();
         self.scrollback_wrapped.clear();
         self.scrollback_start = 0;
         self.scrollback_count = 0;
+        if self.links.is_some() {
+            self.compact_graphemes();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn linked_text_compaction_preserves_identity_and_budgets() {
+        let mut g = super::Grid::new(10, 2);
+        let a = crate::hyperlink::Hyperlink::from_osc(&[b"8", b"id=a", b"https://a.test"]).unwrap();
+        let b = crate::hyperlink::Hyperlink::from_osc(&[b"8", b"id=b", b"https://a.test"]).unwrap();
+        for (col, link) in [(0, &a), (1, &b)] {
+            let mut cell = super::Cell::default();
+            cell.set_char('x');
+            g.link_cell(&mut cell, 'x', link);
+            g.put_char(col, 0, cell);
+        }
+        // A plain extended cell with the same text is not implicitly linked.
+        g.set_grapheme(2, 0, "x", 1);
+        g.compact_graphemes();
+        assert_eq!(g.hyperlink(g.cell(0, 0)), Some(&a));
+        assert_eq!(g.hyperlink(g.cell(1, 0)), Some(&b));
+        assert!(g.hyperlink(g.cell(2, 0)).is_none());
+        assert_eq!(g.links.as_ref().unwrap().linked_text_bytes, 2);
+        let mut snapshot = super::Grid::new(10, 2);
+        snapshot.copy_text_from_grid(0, 0, &g, g.row_cells(0));
+        assert_eq!(
+            snapshot.row_text(snapshot.row_cells(0)),
+            g.row_text(g.row_cells(0))
+        );
+        assert!(snapshot.links.is_none());
+        assert!(!snapshot.has_extended_text());
+        assert!(g
+            .intern_linked(&"x".repeat(super::MAX_LINKED_TEXT_BYTES + 1), &a)
+            .is_none());
+        g.prepare_for_snapshot(10, 2);
+        assert!(g.links.is_none());
+    }
+
     #[test]
     fn scratch_snapshot_reset_matches_new_and_reuses_allocations() {
         let mut grid = super::Grid::new(8, 3);
@@ -915,6 +1118,7 @@ mod tests {
         grid.scroll_top = 1;
         grid.set_erase_background(super::CellColor::Indexed(3));
         grid.clear_dirty();
+        grid.mark_prompt();
         let allocation = grid.cells.as_ptr();
         grid.prepare_for_snapshot(8, 3);
         assert_eq!(grid.cells.as_ptr(), allocation);
@@ -942,7 +1146,9 @@ mod tests {
             erase_cell,
             has_wide,
             graphemes,
-            grapheme_ids
+            grapheme_ids,
+            links,
+            prompt_marks
         );
         grid.prepare_for_snapshot(0, 0);
         assert_eq!((grid.cols, grid.rows), (1, 1));

@@ -25,3 +25,7 @@ CLAUDE.md
 AGENT007*.md
 AGENTS.agent007.generated.md
 /*.patch
+
+# Python validation bytecode
+__pycache__/
+*.pyc

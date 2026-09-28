@@ -264,6 +264,8 @@ pub struct PaneDivider {
 pub struct PromptOverlay<'a> {
     pub title: &'a str,
     pub text: &'a str,
+    /// Read-only destination preview; enable bounded horizontal paging.
+    pub read_only: bool,
     /// Char index of the input cursor within `text`.
     pub cursor: usize,
     /// Total live search matches, or 0 outside Find mode.
@@ -1697,7 +1699,11 @@ impl Renderer {
             let first_vertex = glyph_verts.len();
             for col in 0..grid.cols {
                 let cell = grid.cell(col, row);
-                let extended = grid.extended_text(cell);
+                // OSC 8 may store a single scalar in the extended-cell table.
+                // Keep scalar shaping/procedural symbols identical to unlinked text.
+                let extended = grid
+                    .extended_text(cell)
+                    .filter(|text| text.chars().nth(1).is_some());
                 let c = grid.cell_char(cell);
                 if cell.is_continuation() || (c == ' ' && extended.is_none()) {
                     continue;
@@ -1794,11 +1800,9 @@ impl Renderer {
                         region.offset_x,
                         region.offset_y,
                     );
-                    let gx = phys_pad
-                        + col as f32 * cw
-                        + local_x
-                        + Self::cell_x_offset_for_char(cell.c()) * cw;
-                    let gy = cell_top + local_y + Self::cell_y_offset_for_char(cell.c(), ch);
+                    let gx =
+                        phys_pad + col as f32 * cw + local_x + Self::cell_x_offset_for_char(c) * cw;
+                    let gy = cell_top + local_y + Self::cell_y_offset_for_char(c, ch);
                     let gx = Self::snap_to_pixel(gx);
                     let gy = Self::snap_to_pixel(gy);
                     append_glyph_quad(&mut glyph_verts, sw, sh, gx, gy, region, color);
@@ -2280,7 +2284,22 @@ impl Renderer {
             }
 
             let input_y = box_y + pad * 0.5 + title_size * 1.5;
-            let display_text = if p.text.is_empty() { " " } else { p.text };
+            let preview = p.read_only.then(|| {
+                crate::prompt_viewport::window(
+                    p.text,
+                    p.cursor,
+                    ((box_w - 2.0 * pad) / (input_size * 0.65)).floor().max(4.0) as usize,
+                )
+            });
+            let (display_text, display_cursor) = preview
+                .as_ref()
+                .map(|(text, cursor)| (text.as_str(), *cursor))
+                .unwrap_or((p.text, p.cursor));
+            let display_text = if display_text.is_empty() {
+                " "
+            } else {
+                display_text
+            };
             self.draw_text(
                 &mut glyph_verts,
                 display_text,
@@ -2290,8 +2309,15 @@ impl Renderer {
                 [0.95, 0.95, 0.97, 1.0],
             );
 
-            let chars_before: String = p.text.chars().take(p.cursor).collect();
-            let cursor_x = box_x + pad + Self::approx_text_width(&chars_before, input_size);
+            let chars_before: String = display_text.chars().take(display_cursor).collect();
+            let cursor_advance = if p.read_only {
+                unicode_width::UnicodeWidthStr::width(chars_before.as_str()) as f32
+                    * input_size
+                    * 0.6
+            } else {
+                Self::approx_text_width(&chars_before, input_size)
+            };
+            let cursor_x = box_x + pad + cursor_advance;
             let cursor_w = (1.5 * self.scale_factor).max(1.0);
             self.draw_rect(
                 &mut bg_verts,

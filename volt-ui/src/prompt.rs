@@ -26,6 +26,7 @@ pub enum PromptKind {
     Find,
     RenameTab,
     RenameTerminal,
+    OpenLink,
 }
 
 pub struct TextPrompt {
@@ -45,7 +46,11 @@ pub struct TextPrompt {
 impl TextPrompt {
     pub fn new(kind: PromptKind, initial: &str) -> Self {
         let chars: Vec<char> = initial.chars().collect();
-        let cursor = chars.len();
+        let cursor = if kind == PromptKind::OpenLink {
+            0
+        } else {
+            chars.len()
+        };
         Self {
             kind,
             chars,
@@ -60,6 +65,7 @@ impl TextPrompt {
     pub fn title(&self) -> &'static str {
         match self.kind {
             PromptKind::Find => "Find",
+            PromptKind::OpenLink => "Open link? Enter: open / Esc: cancel",
             PromptKind::RenameTab => "Change Tab Title",
             PromptKind::RenameTerminal => "Change Terminal Title",
         }
@@ -74,7 +80,7 @@ impl TextPrompt {
     }
 
     pub fn insert_char(&mut self, c: char) {
-        if c.is_control() {
+        if self.kind == PromptKind::OpenLink || c.is_control() {
             return;
         }
         self.chars.insert(self.cursor, c);
@@ -82,7 +88,7 @@ impl TextPrompt {
     }
 
     pub fn backspace(&mut self) {
-        if self.cursor == 0 {
+        if self.kind == PromptKind::OpenLink || self.cursor == 0 {
             return;
         }
         self.chars.remove(self.cursor - 1);
@@ -90,7 +96,7 @@ impl TextPrompt {
     }
 
     pub fn delete_forward(&mut self) {
-        if self.cursor < self.chars.len() {
+        if self.kind != PromptKind::OpenLink && self.cursor < self.chars.len() {
             self.chars.remove(self.cursor);
         }
     }
@@ -228,6 +234,19 @@ pub fn find_matches_bounded<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_confirmation_cannot_be_edited_by_typing_paste_or_ime() {
+        let mut p = TextPrompt::new(PromptKind::OpenLink, "https://actual.test/path");
+        assert_eq!(p.cursor, 0);
+        p.move_end();
+        p.insert_char('x');
+        p.backspace();
+        p.move_home();
+        p.delete_forward();
+        assert_eq!(p.text(), "https://actual.test/path");
+        assert_eq!(p.title(), "Open link? Enter: open / Esc: cancel");
+    }
 
     #[test]
     fn search_uses_grapheme_cell_columns() {

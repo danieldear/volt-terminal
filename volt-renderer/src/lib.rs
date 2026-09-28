@@ -9,3 +9,5 @@ pub mod symbols;
 pub mod workspace_card;
 
 pub mod search_palette;
+
+mod prompt_viewport;

@@ -1,5 +1,5 @@
 /// Per-tab and per-pane state for the Volt terminal.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -96,11 +96,23 @@ impl TerminalPane {
         proxy: EventLoopProxy<VoltEvent>,
         wake_pending: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
-        let (pty, performer, event_rx) = Pty::spawn(
+        Self::spawn_in(config, cols, rows, proxy, wake_pending, None)
+    }
+
+    pub fn spawn_in(
+        config: &Config,
+        cols: u16,
+        rows: u16,
+        proxy: EventLoopProxy<VoltEvent>,
+        wake_pending: Arc<AtomicBool>,
+        cwd: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let (pty, performer, event_rx) = Pty::spawn_in(
             &config.shell.program,
             &config.shell.args,
             cols,
             rows,
+            cwd,
             move || {
                 if !wake_pending.swap(true, Ordering::AcqRel) {
                     if let Err(err) = proxy.send_event(VoltEvent::PtyData) {
@@ -117,12 +129,23 @@ impl TerminalPane {
             performer,
             event_rx,
             title: "~".to_string(),
-            cwd: std::env::current_dir().ok(),
+            cwd: cwd
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::current_dir().ok()),
             running: false,
             scroll_view_offset: 0,
             custom_title: None,
             read_only: false,
         })
+    }
+
+    /// OSC 7 may describe a remote machine. Only the owned local process is
+    /// authoritative for spawning another local shell; never trust terminal text.
+    pub fn local_cwd(&self) -> Option<PathBuf> {
+        self.pty
+            .child_pid()
+            .and_then(crate::workspace_panel::local_process_cwd)
+            .filter(|p| p.is_absolute())
     }
 
     pub fn display_title(&self) -> String {
@@ -192,7 +215,18 @@ impl TerminalTab {
         proxy: EventLoopProxy<VoltEvent>,
         wake_pending: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
-        let primary = TerminalPane::spawn(config, cols, rows, proxy, wake_pending)?;
+        Self::spawn_in(config, cols, rows, proxy, wake_pending, None)
+    }
+
+    pub fn spawn_in(
+        config: &Config,
+        cols: u16,
+        rows: u16,
+        proxy: EventLoopProxy<VoltEvent>,
+        wake_pending: Arc<AtomicBool>,
+        cwd: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let primary = TerminalPane::spawn_in(config, cols, rows, proxy, wake_pending, cwd)?;
         Ok(Self {
             tree: PaneTree::new(primary),
             custom_title: None,

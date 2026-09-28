@@ -7,6 +7,7 @@ pub enum CoreEvent {
     },
     CwdChanged(PathBuf),
     TitleChanged(String),
+    CommandStarted,
     CommandFinished {
         exit_code: i32,
         duration_ms: u64,

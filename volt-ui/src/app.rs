@@ -92,6 +92,7 @@ struct MainState {
     left_super_down: bool,
     right_super_down: bool,
     config: Config,
+    keybindings: crate::keybindings::Bindings,
     mouse_pos: (f32, f32),
     is_drag_selecting: bool,
     selection: Option<Selection>,
@@ -606,14 +607,86 @@ impl MainState {
         self.switch_tab(prev);
     }
 
+    fn run_keybinding(&mut self, action: volt_config::keybindings::Action) {
+        use volt_config::keybindings::Action as A;
+        match action {
+            A::Copy => {
+                self.copy_selection();
+            }
+            A::Paste => self.paste_clipboard(),
+            A::Find => self.open_find_prompt(),
+            A::SearchWorkspace => self.toggle_search(),
+            A::ToggleWorkspace => self.toggle_workspace_panel(),
+            A::ToggleWorkspaceLayout => self.toggle_workspace_layout(),
+            A::NewTab => {
+                #[cfg(target_os = "macos")]
+                if self.config.appearance.native_tabs {
+                    let _ = self.proxy.send_event(VoltEvent::CreateNewWindow);
+                    return;
+                }
+                self.new_tab();
+            }
+            A::NextTab => self.cycle_tab_next(),
+            A::PreviousTab => self.cycle_tab_prev(),
+            A::PreviousPrompt => self.jump_prompt(true),
+            A::NextPrompt => self.jump_prompt(false),
+            A::SplitRight | A::SplitLeft => {
+                self.split_active_tab_positioned(
+                    PaneSplitDirection::Vertical,
+                    action == A::SplitLeft,
+                );
+            }
+            A::SplitDown | A::SplitUp => {
+                self.split_active_tab_positioned(
+                    PaneSplitDirection::Horizontal,
+                    action == A::SplitUp,
+                );
+            }
+            A::FocusLeft => {
+                self.move_focus_in_direction(PaneFocusDirection::Left);
+            }
+            A::FocusRight => {
+                self.move_focus_in_direction(PaneFocusDirection::Right);
+            }
+            A::FocusUp => {
+                self.move_focus_in_direction(PaneFocusDirection::Up);
+            }
+            A::FocusDown => {
+                self.move_focus_in_direction(PaneFocusDirection::Down);
+            }
+            A::IncreaseFontSize => {
+                self.adjust_font_size(1.0);
+            }
+            A::DecreaseFontSize => {
+                self.adjust_font_size(-1.0);
+            }
+            A::ToggleFullscreen => {
+                let next = self
+                    .window
+                    .fullscreen()
+                    .is_none()
+                    .then_some(winit::window::Fullscreen::Borderless(None));
+                self.window.set_fullscreen(next);
+            }
+            A::OpenConfig => open_config_in_editor(),
+            A::Ignore | A::Unbind => return,
+            A::NewWindow | A::ReloadConfig | A::Quit | A::ClosePane => {
+                unreachable!("App-owned action")
+            }
+        }
+        self.begin_redraw();
+    }
+
     fn new_tab(&mut self) {
         let (cols, rows) = self.current_grid_size();
-        if let Ok(tab) = TerminalTab::spawn(
+        let cwd = self.active_tab().active_pane().local_cwd();
+        if let Ok(tab) = TerminalTab::spawn_in(
             &self.config,
             cols as u16,
             rows as u16,
             self.proxy.clone(),
             Arc::clone(&self.pty_wake_pending),
+            cwd.as_deref(),
         ) {
             self.tabs.push(tab);
             self.active_tab = self.tabs.len() - 1;
@@ -664,9 +737,15 @@ impl MainState {
         let config = self.config.clone();
         let proxy = self.proxy.clone();
         let wake = Arc::clone(&self.pty_wake_pending);
-        let Ok(new_pane) =
-            TerminalPane::spawn(&config, pane_cols as u16, pane_rows as u16, proxy, wake)
-        else {
+        let cwd = self.active_tab().active_pane().local_cwd();
+        let Ok(new_pane) = TerminalPane::spawn_in(
+            &config,
+            pane_cols as u16,
+            pane_rows as u16,
+            proxy,
+            wake,
+            cwd.as_deref(),
+        ) else {
             return false;
         };
         self.active_tab_mut()
@@ -761,7 +840,7 @@ impl MainState {
         // Row-slice memcpys: this runs while holding the performer lock, so it
         // must be fast or it stalls the PTY parse thread.
         for row in 0..rows {
-            dst.copy_from_grid(dst_row + row, dst_col, src, &src.row_cells(row)[..cols]);
+            dst.copy_text_from_grid(dst_row + row, dst_col, src, &src.row_cells(row)[..cols]);
         }
     }
 
@@ -794,7 +873,7 @@ impl MainState {
             if sb_idx >= sb_len {
                 break;
             }
-            dst.copy_from_grid(
+            dst.copy_text_from_grid(
                 dst_row + r,
                 dst_col,
                 src,
@@ -802,7 +881,7 @@ impl MainState {
             );
         }
         for r in 0..grid_rows.min(src.rows) {
-            dst.copy_from_grid(
+            dst.copy_text_from_grid(
                 dst_row + sb_rows + r,
                 dst_col,
                 src,
@@ -857,6 +936,7 @@ impl MainState {
     fn apply_config(&mut self, config: &Config) {
         self.theme = Theme::by_name(&config.theme);
         self.config = config.clone();
+        self.keybindings = crate::keybindings::Bindings::compile(&config.keybindings);
         self.window
             .set_transparent(config.appearance.transparent_enabled());
         self.window.set_blur(config.appearance.blur_enabled());
@@ -1252,7 +1332,6 @@ impl MainState {
 
     // ── Find / rename overlay ────────────────────────────────────────────
 
-    #[cfg(target_os = "macos")]
     fn open_find_prompt(&mut self) {
         self.workspace_search.close();
         self.renderer.search_palette = None;
@@ -1276,7 +1355,7 @@ impl MainState {
             crate::prompt::PromptKind::RenameTerminal => {
                 self.active_tab().active_pane().custom_title.as_deref()
             }
-            crate::prompt::PromptKind::Find => None,
+            crate::prompt::PromptKind::Find | crate::prompt::PromptKind::OpenLink => None,
         };
         let initial = rename_initial_text(custom);
         self.active_prompt = Some(crate::prompt::TextPrompt::new(kind, &initial));
@@ -1290,6 +1369,12 @@ impl MainState {
         self.search_dirty = false;
         self.search_target = None;
         match prompt.kind {
+            crate::prompt::PromptKind::OpenLink => {
+                if let Err(err) = crate::links::open(&prompt.text()) {
+                    self.renderer
+                        .set_top_alert(Some(format!("Could not open link: {err}")));
+                }
+            }
             crate::prompt::PromptKind::Find => {
                 // Enter/Shift+Enter cycle matches instead of confirming while
                 // a Find prompt is open; reaching here just closes it.
@@ -1405,6 +1490,19 @@ impl MainState {
 
     /// Scroll the active pane so the current search match is visible,
     /// placing its row at the top of the viewport when it's in scrollback.
+    fn jump_prompt(&mut self, previous: bool) {
+        let pane = self.active_pane_mut();
+        let offset = match pane.performer.lock() {
+            Ok(p) if !p.alternate_screen_active() => p
+                .grid
+                .prompt_scroll_offset(pane.scroll_view_offset, previous),
+            _ => return,
+        };
+        pane.scroll_view_offset = offset;
+        self.selection = None;
+        self.begin_redraw();
+    }
+
     fn scroll_to_current_match(&mut self) {
         let Some(m) = self
             .active_prompt
@@ -1691,9 +1789,8 @@ pub struct App {
     proxy: Option<EventLoopProxy<VoltEvent>>,
     pty_wake_pending: Arc<AtomicBool>,
     rt: tokio::runtime::Runtime,
-    #[cfg(target_os = "macos")]
-    /// The window that last reported `Focused(true)` — menu-bar actions
-    /// (which are process-global, not per-window) target this window.
+    /// The window that last reported `Focused(true)`. Native menu actions and
+    /// new-window CWD inheritance use this window on every platform.
     focused_window: Option<WindowId>,
     #[cfg(target_os = "macos")]
     /// Must stay alive for the app's full lifetime — see the doc comment on
@@ -1716,7 +1813,6 @@ impl App {
             proxy: None,
             pty_wake_pending: Arc::new(AtomicBool::new(false)),
             rt,
-            #[cfg(target_os = "macos")]
             focused_window: None,
             #[cfg(target_os = "macos")]
             app_menu: None,
@@ -1794,12 +1890,17 @@ impl App {
         let (cols, rows) = renderer.grid_size_for_tab_count(native_tab_count);
         #[cfg(not(target_os = "macos"))]
         let (cols, rows) = renderer.grid_size_for_tab_count(1);
-        let first_tab = TerminalTab::spawn(
+        let cwd = self
+            .target_window_id()
+            .and_then(|id| self.windows.get(&id))
+            .and_then(|state| state.active_tab().active_pane().local_cwd());
+        let first_tab = TerminalTab::spawn_in(
             &self.config,
             cols as u16,
             rows as u16,
             proxy.clone(),
             Arc::clone(&self.pty_wake_pending),
+            cwd.as_deref(),
         )?;
         let theme = Theme::by_name(&self.config.theme);
         let id = window.id();
@@ -1830,6 +1931,7 @@ impl App {
             right_control_down: false,
             left_super_down: false,
             right_super_down: false,
+            keybindings: crate::keybindings::Bindings::compile(&self.config.keybindings),
             config: self.config.clone(),
             mouse_pos: (0.0, 0.0),
             is_drag_selecting: false,
@@ -1887,7 +1989,6 @@ impl App {
         }
     }
 
-    #[cfg(target_os = "macos")]
     /// Resolve which window a menu-bar/context-menu action should target:
     /// the last-focused window, falling back to an arbitrary one if that's
     /// stale (its window closed) or unset (no `Focused(true)` has fired
@@ -2276,11 +2377,13 @@ impl ApplicationHandler<VoltEvent> for App {
                 state.left_super_down = false;
                 state.right_super_down = false;
             }
-            #[cfg(target_os = "macos")]
             WindowEvent::Focused(true) => {
-                let native_tab_count = state.window.num_tabs().max(1);
-                state.last_known_native_tab_count = native_tab_count;
-                configure_macos_tab_chrome(state.window.as_ref(), native_tab_count);
+                #[cfg(target_os = "macos")]
+                {
+                    let native_tab_count = state.window.num_tabs().max(1);
+                    state.last_known_native_tab_count = native_tab_count;
+                    configure_macos_tab_chrome(state.window.as_ref(), native_tab_count);
+                }
                 self.focused_window = Some(window_id);
             }
 
@@ -2604,6 +2707,44 @@ impl ApplicationHandler<VoltEvent> for App {
                     }
                 }
 
+                // Explicit modifier-click is owned by Volt, even in a mouse-aware
+                // TUI. Never forward an orphan release or start a selection drag.
+                let link_modifier = if cfg!(target_os = "macos") {
+                    state.super_down()
+                } else {
+                    state.ctrl_down()
+                };
+                if button == MouseButton::Left
+                    && btn_state == ElementState::Pressed
+                    && link_modifier
+                {
+                    state.search_mouse_capture = Some(button);
+                    if let Some((pane_id, col, row)) = state.pane_cell_from_mouse(mx, my) {
+                        let pane = state.active_tab().tree.find_leaf(pane_id);
+                        let url = pane.and_then(|pane| {
+                            let p = pane.performer.try_lock().ok()?;
+                            crate::links::target_at(&p.grid, pane.scroll_view_offset, col, row)
+                        });
+                        if let Some(target) = url {
+                            if target.explicit {
+                                state.search_dirty = false;
+                                state.search_target = None;
+                                state.active_prompt = Some(crate::prompt::TextPrompt::new(
+                                    crate::prompt::PromptKind::OpenLink,
+                                    &target.uri,
+                                ));
+                                state.begin_redraw();
+                            } else if let Err(err) = crate::links::open(&target.uri) {
+                                state
+                                    .renderer
+                                    .set_top_alert(Some(format!("Could not open link: {err}")));
+                                state.begin_redraw();
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 if let Some((pane_id, col, row)) = state.pane_cell_from_mouse(mx, my) {
                     state.active_tab_mut().tree.active_id = pane_id;
                     // Shift bypasses app mouse reporting so selection still works
@@ -2798,9 +2939,84 @@ impl ApplicationHandler<VoltEvent> for App {
                 let super_key = state.super_down();
                 let shift = state.shift_down();
                 let alt = state.modifiers.alt_key();
-                if super_key && shift && physical_key == PhysicalKey::Code(KeyCode::KeyP) {
+                // Local text fields and inspector navigation own their keys.
+                let custom = if crate::keybindings::terminal_owns_keys(
+                    state.active_prompt.is_some(),
+                    state.workspace_search.visible,
+                    state.workspace_panel.visible,
+                    state.workspace_panel.focused,
+                ) {
+                    state
+                        .keybindings
+                        .lookup(physical_key, ctrl, alt, shift, super_key)
+                } else {
+                    None
+                };
+                let defaults = custom != Some(volt_config::keybindings::Action::Unbind);
+                if let Some(action) =
+                    custom.filter(|a| *a != volt_config::keybindings::Action::Unbind)
+                {
+                    use volt_config::keybindings::Action as A;
+                    match action {
+                        A::Quit => event_loop.exit(),
+                        A::ReloadConfig => {
+                            let _ = state;
+                            self.reload_config(window_id);
+                        }
+                        A::NewWindow => {
+                            let _ = state;
+                            let _ = self.create_main_window(event_loop, None);
+                        }
+                        A::ClosePane => {
+                            if state.close_active_pane_or_tab() {
+                                let _ = state;
+                                self.windows.remove(&window_id);
+                                if self.windows.is_empty() {
+                                    event_loop.exit();
+                                }
+                            }
+                        }
+                        A::IncreaseFontSize | A::DecreaseFontSize => {
+                            state.run_keybinding(action);
+                            self.config.font.size = state.config.font.size;
+                        }
+                        _ => state.run_keybinding(action),
+                    }
+                    return;
+                }
+                if defaults
+                    && super_key
+                    && shift
+                    && physical_key == PhysicalKey::Code(KeyCode::KeyP)
+                {
                     state.toggle_search();
                     return;
+                }
+                // Prompt navigation is an application action, never text sent
+                // to a TUI. Modal inputs retain ownership; overrides/unbind win.
+                if defaults
+                    && super_key
+                    && shift
+                    && !ctrl
+                    && !alt
+                    && crate::keybindings::terminal_owns_keys(
+                        state.active_prompt.is_some(),
+                        state.workspace_search.visible,
+                        state.workspace_panel.visible,
+                        state.workspace_panel.focused,
+                    )
+                {
+                    match physical_key {
+                        PhysicalKey::Code(KeyCode::ArrowUp) => {
+                            state.jump_prompt(true);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowDown) => {
+                            state.jump_prompt(false);
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
                 // Cmd+F opens terminal Find regardless of whether the workspace
                 // search palette happens to be open. This used to be handled
@@ -2808,7 +3024,8 @@ impl ApplicationHandler<VoltEvent> for App {
                 // which meant Cmd+F silently did nothing the rest of the time
                 // — the common case.
                 #[cfg(target_os = "macos")]
-                if super_key
+                if defaults
+                    && super_key
                     && !ctrl
                     && !alt
                     && !shift
@@ -3064,7 +3281,8 @@ impl ApplicationHandler<VoltEvent> for App {
                     }
                 };
 
-                if matches!(physical_key, PhysicalKey::Code(KeyCode::KeyR))
+                if defaults
+                    && matches!(physical_key, PhysicalKey::Code(KeyCode::KeyR))
                     && shift
                     && reload_modifier
                 {
@@ -3074,7 +3292,7 @@ impl ApplicationHandler<VoltEvent> for App {
                 }
 
                 // ── global shortcuts ─────────────────────────────────────────
-                if super_key {
+                if defaults && super_key {
                     match physical_key {
                         PhysicalKey::Code(KeyCode::Tab) => {
                             if shift {
@@ -3276,7 +3494,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     return;
                 }
 
-                if ctrl && shift {
+                if defaults && ctrl && shift {
                     match physical_key {
                         PhysicalKey::Code(KeyCode::KeyC) => {
                             if state.copy_selection() {
@@ -3293,7 +3511,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     }
                 }
 
-                if alt && ctrl {
+                if defaults && alt && ctrl {
                     let moved = match physical_key {
                         PhysicalKey::Code(KeyCode::ArrowLeft) => {
                             state.move_focus_in_direction(PaneFocusDirection::Left)
@@ -3315,7 +3533,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     }
                 }
 
-                if ctrl && matches!(physical_key, PhysicalKey::Code(KeyCode::Tab)) {
+                if defaults && ctrl && matches!(physical_key, PhysicalKey::Code(KeyCode::Tab)) {
                     if shift {
                         state.cycle_tab_prev();
                     } else {
@@ -3407,6 +3625,9 @@ impl ApplicationHandler<VoltEvent> for App {
                                 }
                                 CoreEvent::TitleChanged(t) => {
                                     pane.title = t;
+                                }
+                                CoreEvent::CommandStarted => {
+                                    pane.running = true;
                                 }
                                 CoreEvent::CommandFinished { .. } => {
                                     pane.running = false;
@@ -3506,6 +3727,7 @@ impl ApplicationHandler<VoltEvent> for App {
                             .as_ref()
                             .map(|p| volt_renderer::PromptOverlay {
                                 title: p.title(),
+                                read_only: p.kind == crate::prompt::PromptKind::OpenLink,
                                 text: prompt_text.as_deref().unwrap_or(""),
                                 cursor: p.cursor,
                                 match_count: p.matches.len(),
@@ -3681,6 +3903,9 @@ impl ApplicationHandler<VoltEvent> for App {
                                         needs_redraw = true;
                                         needs_full_redraw = true;
                                     }
+                                }
+                                CoreEvent::CommandStarted => {
+                                    pane.running = true;
                                 }
                                 CoreEvent::CommandFinished { .. } => {
                                     pane.running = false;

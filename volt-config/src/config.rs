@@ -177,6 +177,8 @@ pub struct WorkspaceConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    #[serde(default, deserialize_with = "crate::keybindings::deserialize_bindings")]
+    pub keybindings: Vec<crate::keybindings::KeyBinding>,
     #[serde(default)]
     pub font: FontConfig,
     #[serde(default)]

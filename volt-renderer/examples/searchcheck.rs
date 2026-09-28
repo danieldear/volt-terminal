@@ -122,6 +122,7 @@ fn main() -> Result<()> {
                     None,
                     Some(volt_renderer::renderer::PromptOverlay {
                         title: "Find",
+                        read_only: false,
                         text: "needle",
                         cursor: 6,
                         match_count: 1,

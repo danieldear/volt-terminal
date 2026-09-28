@@ -1,4 +1,6 @@
+use crate::hyperlink::Hyperlink;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::cell::{Cell, CellColor};
 use crate::events::CoreEvent;
@@ -50,536 +52,147 @@ pub struct Performer {
     mouse_sgr: bool,
     application_cursor_keys: bool,
     bracketed_paste: bool,
+    active_link: Option<Arc<Hyperlink>>,
+    command_started: Option<std::time::Instant>,
 }
 
 impl Performer {
-    pub fn alternate_screen_active(&self) -> bool {
-        self.use_alt_screen
-    }
-
-    pub fn new(cols: usize, rows: usize) -> Self {
-        Self {
-            grid: Grid::new(cols, rows),
-            use_alt_screen: false,
-            alt_grid: Grid::new_alt(cols, rows),
-            saved_cursors: [SavedCursor::default(); 2],
-            main_return: SavedCursor::default(),
-            origin_mode: false,
-            autowrap: true,
-            current_fg: CellColor::Default,
-            current_bg: CellColor::Default,
-            current_bold: false,
-            current_italic: false,
-            current_underline: false,
-            current_reverse: false,
-            cursor_visible: true,
-            pending_writes: Vec::new(),
-            pending_events: Vec::new(),
-            display_dirty: false,
-            damage_rows: None,
-            mouse_tracking: MouseTrackingMode::Off,
-            mouse_sgr: false,
-            application_cursor_keys: false,
-            bracketed_paste: false,
-        }
-    }
-
-    /// Resize both the main and alt screen grids.
-    pub fn resize(&mut self, cols: usize, rows: usize) {
-        self.grid.resize(cols, rows);
-        self.alt_grid.resize(cols, rows);
-        if self.use_alt_screen {
-            self.main_return.col = self.alt_grid.cursor_col;
-            self.main_return.row = self.alt_grid.cursor_row;
-            self.main_return.pending_wrap = self.alt_grid.pending_wrap;
-        }
-    }
-
-    /// Set the configured scrollback limit on both grid buffers. The inactive
-    /// buffer may become the active one after an alt-screen swap or RIS.
-    pub fn set_scrollback_limit(&mut self, limit: usize) {
-        // Configured limits are at least one; resize populated rings safely.
-        self.grid.set_scrollback_limit(limit);
-        self.alt_grid.set_scrollback_limit(limit);
-    }
-
-    pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
-        self.mouse_tracking
-    }
-
-    pub fn mouse_sgr_mode(&self) -> bool {
-        self.mouse_sgr
-    }
-
-    pub fn mouse_reporting_enabled(&self) -> bool {
-        self.mouse_tracking != MouseTrackingMode::Off
-    }
-
-    pub fn application_cursor_keys_mode(&self) -> bool {
-        self.application_cursor_keys
-    }
-
-    /// Whether the application requested bracketed paste (DECSET 2004).
-    /// When enabled, pasted text must be wrapped in ESC[200~ … ESC[201~.
-    pub fn bracketed_paste_mode(&self) -> bool {
-        self.bracketed_paste
-    }
-
-    pub fn take_damage_rows(&mut self) -> Option<(usize, usize)> {
-        self.damage_rows.take()
-    }
-
-    /// Extend the preceding grapheme without allocating anything in ASCII
-    /// print(). Handles combining marks, variation selectors, emoji modifiers,
-    /// ZWJ sequences and regional-indicator pairs across PTY chunk boundaries.
+    // Keep infrequent shell bookkeeping out of the inlined VTE dispatch loop.
+    #[cold]
     #[inline(never)]
-    fn extend_grapheme(&mut self, c: char) -> bool {
-        if self.grid.cols == 0 || self.grid.rows == 0 {
-            return false;
+    fn shell_integration(&mut self, params: &[&[u8]]) {
+        if params.len() >= 2 && params[0] == b"133" && !self.use_alt_screen {
+            match params[1] {
+                b"A" => {
+                    self.grid.mark_prompt();
+                    // A prompt also terminates stale busy state if a shell did
+                    // not send D (e.g. interrupted input or prompt-only hooks).
+                    if let Some(start) = self.command_started.take() {
+                        self.pending_events.push(CoreEvent::CommandFinished {
+                            exit_code: -1,
+                            duration_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        });
+                    }
+                }
+                b"C" => {
+                    if self.command_started.is_none() {
+                        self.command_started = Some(std::time::Instant::now());
+                        self.pending_events.push(CoreEvent::CommandStarted);
+                    }
+                }
+                b"D" => {
+                    // Absent status is unknown, not success. Ignore malformed
+                    // status rather than trusting arbitrary terminal output.
+                    let exit_code = match params.get(2) {
+                        None | Some(&b"") => -1,
+                        Some(code) => match std::str::from_utf8(code)
+                            .ok()
+                            .and_then(|s| s.parse::<u8>().ok())
+                        {
+                            Some(code) => i32::from(code),
+                            None => return,
+                        },
+                    };
+                    let duration_ms = self.command_started.take().map_or(0, |start| {
+                        start.elapsed().as_millis().min(u64::MAX as u128) as u64
+                    });
+                    self.pending_events.push(CoreEvent::CommandFinished {
+                        exit_code,
+                        duration_ms,
+                    });
+                }
+                // B is the input boundary. No command text is collected.
+                _ => {}
+            }
         }
-        let row = self.grid.cursor_row;
-        let mut col = if self.grid.pending_wrap {
-            self.grid.cursor_col
-        } else if self.grid.cursor_col > 0 {
-            self.grid.cursor_col - 1
-        } else {
-            return false;
-        };
-        if self.grid.cell(col, row).is_continuation() && col > 0 {
-            col -= 1;
-        }
-        let previous = *self.grid.cell(col, row);
-        let mut text = String::new();
-        self.grid.push_cell_text(&mut text, &previous);
-        // Bounded per-cell extension protects against unbounded combining-mark
-        // streams. The limit is bytes, not the number of stored grid cells.
-        if text.len() + c.len_utf8() > 4096 {
-            return char_display_width(c) == 0;
-        }
-        text.push(c);
-        if text.graphemes(true).count() != 1 {
-            return false;
-        }
-        let intrinsic_width = UnicodeWidthStr::width(text.as_str()).clamp(1, 2);
-        let width = intrinsic_width.min(if self.autowrap {
-            self.grid.cols
-        } else {
-            self.grid.cols - col
-        });
-        let old_width = previous.width();
-        let mut target_col = col;
-        let mut target_row = row;
-        if width == 2 && col + 1 >= self.grid.cols {
-            self.grid.put_char(col, row, Cell::wrap_spacer());
-            self.grid.set_row_soft_wrapped(row, true);
-            self.grid.cursor_col = 0;
-            self.grid.pending_wrap = false;
-            self.grid.newline();
-            target_col = 0;
-            target_row = self.grid.cursor_row;
-            self.mark_dirty_all();
-        }
-        let mut cell = previous;
-        cell.set_wide(width == 2);
-        cell.set_clipped_wide(intrinsic_width == 2 && width == 1);
-        self.grid.put_char(target_col, target_row, cell);
-        // Retain the existing precomposed fast representation when possible.
-        let composed = if previous.cluster_id().is_none() {
-            unicode_normalization::char::compose(previous.c(), c)
-        } else {
-            None
-        };
-        if let Some(composed) = composed {
-            let cell = self.grid.cell_mut(target_col, target_row);
-            cell.set_char(composed);
-            cell.set_wide(width == 2);
-            cell.set_clipped_wide(intrinsic_width == 2 && width == 1);
-        } else {
-            self.grid.set_grapheme(target_col, target_row, &text, width);
-        }
-        if width != old_width || target_row != row || target_col != col {
-            self.grid.cursor_row = target_row;
-            self.grid.cursor_col = (target_col + width).min(self.grid.cols - 1);
-            self.grid.pending_wrap = target_col + width >= self.grid.cols;
-        }
-        self.mark_dirty_row(target_row);
-        true
-    }
-
-    #[inline(always)]
-    fn make_cell(&self, c: char) -> Cell {
-        let mut cell = Cell::default();
-        cell.set_char(c);
-        Cell {
-            fg: self.current_fg,
-            bg: self.current_bg,
-            bold: self.current_bold,
-            italic: self.current_italic,
-            underline: self.current_underline,
-            reverse: self.current_reverse,
-            ..cell
-        }
-    }
-
-    fn mark_dirty_range(&mut self, start_row: usize, end_row: usize) {
-        if self.grid.rows == 0 {
-            self.display_dirty = true;
-            return;
-        }
-        let start = start_row.min(self.grid.rows - 1);
-        let end = end_row.min(self.grid.rows - 1);
-        if start > end {
-            return;
-        }
-        self.damage_rows = Some(match self.damage_rows {
-            Some((cur_start, cur_end)) => (cur_start.min(start), cur_end.max(end)),
-            None => (start, end),
-        });
-        self.display_dirty = true;
     }
 
     #[inline]
-    fn mark_dirty_row(&mut self, row: usize) {
-        self.display_dirty = true;
-        if let Some((start, end)) = self.damage_rows {
-            if row >= start && row <= end {
-                return;
-            }
+    fn sgr(&mut self, params: &vte::Params) {
+        // SGR
+        let mut iter = params.iter().peekable();
+        if iter.peek().is_none() {
+            self.reset_attrs();
+            return;
         }
-        self.mark_dirty_range(row, row);
-    }
-
-    fn mark_dirty_all(&mut self) {
-        if self.grid.rows > 0 {
-            self.mark_dirty_range(0, self.grid.rows - 1);
-        } else {
-            self.display_dirty = true;
-        }
-    }
-
-    fn mark_cursor_row_change(&mut self, old_row: usize) {
-        let new_row = self.grid.cursor_row;
-        if old_row == new_row {
-            self.mark_dirty_row(new_row);
-        } else {
-            self.mark_dirty_row(old_row);
-            self.mark_dirty_row(new_row);
-        }
-    }
-
-    fn reset_attrs(&mut self) {
-        self.current_fg = CellColor::Default;
-        self.current_bg = CellColor::Default;
-        self.grid.set_erase_background(self.current_bg);
-        self.current_bold = false;
-        self.current_italic = false;
-        self.current_underline = false;
-        self.current_reverse = false;
-    }
-
-    fn param(params: &vte::Params, idx: usize) -> u16 {
-        params
-            .iter()
-            .nth(idx)
-            .and_then(|s| s.first().copied())
-            .unwrap_or(0)
-    }
-
-    /// Full terminal reset (RIS — Reset to Initial State, `ESC c`): drops the
-    /// alt screen entirely (not a restore — RIS discards it), clears the grid
-    /// and scrollback, resets the cursor and all SGR attributes, and turns
-    /// off every optional mode (mouse tracking, bracketed paste, application
-    /// cursor keys). `scrollback_limit` is a config value, not terminal
-    /// state, so it's preserved across the reset.
-    pub fn reset(&mut self) {
-        self.use_alt_screen = false;
-        let cols = self.grid.cols;
-        let rows = self.grid.rows;
-        let scrollback_limit = self.grid.scrollback_limit;
-        self.grid = Grid::new(cols, rows);
-        self.grid.scrollback_limit = scrollback_limit;
-        self.alt_grid = Grid::new_alt(cols, rows);
-        self.alt_grid.scrollback_limit = scrollback_limit;
-        self.saved_cursors = [SavedCursor::default(); 2];
-        self.main_return = SavedCursor::default();
-        self.origin_mode = false;
-        self.autowrap = true;
-        self.reset_attrs();
-        self.cursor_visible = true;
-        self.pending_writes.clear();
-        self.mouse_tracking = MouseTrackingMode::Off;
-        self.mouse_sgr = false;
-        self.application_cursor_keys = false;
-        self.bracketed_paste = false;
-        self.mark_dirty_all();
-    }
-
-    fn cursor_snapshot(&self) -> SavedCursor {
-        SavedCursor {
-            col: self.grid.cursor_col,
-            row: self.grid.cursor_row,
-            attrs: self.make_cell(' '),
-            origin: self.origin_mode,
-            pending_wrap: self.grid.pending_wrap,
-        }
-    }
-
-    fn restore_snapshot(&mut self, saved: SavedCursor) {
-        self.origin_mode = saved.origin;
-        self.grid.cursor_col = saved.col.min(self.grid.cols - 1);
-        self.grid.cursor_row = saved.row.min(self.grid.rows - 1);
-        if self.origin_mode {
-            self.grid.cursor_row = self
-                .grid
-                .cursor_row
-                .clamp(self.grid.scroll_top, self.grid.scroll_bottom);
-        }
-        self.grid.pending_wrap = saved.pending_wrap && self.grid.cursor_col + 1 == self.grid.cols;
-        self.current_fg = saved.attrs.fg;
-        self.current_bg = saved.attrs.bg;
-        self.current_bold = saved.attrs.bold;
-        self.current_italic = saved.attrs.italic;
-        self.current_underline = saved.attrs.underline;
-        self.current_reverse = saved.attrs.reverse;
-        self.grid.set_erase_background(self.current_bg);
-    }
-
-    fn home_cursor(&mut self) {
-        self.grid.cursor_col = 0;
-        self.grid.cursor_row = if self.origin_mode {
-            self.grid.scroll_top
-        } else {
-            0
-        };
-        self.grid.pending_wrap = false;
-    }
-
-    fn set_private_mode(&mut self, mode: u16, enabled: bool) {
-        match mode {
-            1 => self.application_cursor_keys = enabled,
-            6 => {
-                self.origin_mode = enabled;
-                self.home_cursor();
-                self.mark_dirty_all();
-            }
-            7 => {
-                self.autowrap = enabled;
-                self.grid.pending_wrap = false;
-            }
-            25 => {
-                self.cursor_visible = enabled;
-                self.mark_dirty_row(self.grid.cursor_row);
-            }
-            1049 => {
-                if enabled {
-                    self.enter_alt_screen();
-                } else {
-                    self.exit_alt_screen();
-                }
-                self.mark_dirty_all();
-            }
-            1000 | 1002 | 1003 => {
-                self.mouse_tracking = if !enabled {
-                    MouseTrackingMode::Off
-                } else {
-                    match mode {
-                        1000 => MouseTrackingMode::X10,
-                        1002 => MouseTrackingMode::ButtonEvent,
-                        _ => MouseTrackingMode::AnyMotion,
+        while let Some(subparams) = iter.next() {
+            let p = subparams.first().copied().unwrap_or(0);
+            match p {
+                0 => self.reset_attrs(),
+                1 => self.current_bold = true,
+                3 => self.current_italic = true,
+                4 => self.current_underline = true,
+                7 => self.current_reverse = true,
+                22 => self.current_bold = false,
+                23 => self.current_italic = false,
+                24 => self.current_underline = false,
+                27 => self.current_reverse = false,
+                30..=37 => self.current_fg = CellColor::Indexed(p as u8 - 30),
+                39 => self.current_fg = CellColor::Default,
+                40..=47 => self.current_bg = CellColor::Indexed(p as u8 - 40),
+                49 => self.current_bg = CellColor::Default,
+                90..=97 => self.current_fg = CellColor::Indexed(p as u8 - 90 + 8),
+                100..=107 => self.current_bg = CellColor::Indexed(p as u8 - 100 + 8),
+                38 | 48 => {
+                    let is_fg = p == 38;
+                    if subparams.len() >= 3 && subparams[1] == 5 {
+                        let idx = subparams[2] as u8;
+                        if is_fg {
+                            self.current_fg = CellColor::Indexed(idx);
+                        } else {
+                            self.current_bg = CellColor::Indexed(idx);
+                        }
+                    } else if subparams.len() >= 5 && subparams[1] == 2 {
+                        // ISO colon syntax includes an optional colour-space slot.
+                        let offset = if subparams.len() >= 6 { 3 } else { 2 };
+                        let c = Color::rgb(
+                            subparams[offset].min(255) as u8,
+                            subparams[offset + 1].min(255) as u8,
+                            subparams[offset + 2].min(255) as u8,
+                        );
+                        if is_fg {
+                            self.current_fg = CellColor::Rgb(c);
+                        } else {
+                            self.current_bg = CellColor::Rgb(c);
+                        }
+                    } else if let Some(next) = iter.next() {
+                        match next.first().copied().unwrap_or(0) {
+                            5 => {
+                                if let Some(idx_param) = iter.next() {
+                                    let idx = idx_param.first().copied().unwrap_or(0) as u8;
+                                    if is_fg {
+                                        self.current_fg = CellColor::Indexed(idx);
+                                    } else {
+                                        self.current_bg = CellColor::Indexed(idx);
+                                    }
+                                }
+                            }
+                            2 => {
+                                let r =
+                                    iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                                let g =
+                                    iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                                let b =
+                                    iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                                let c = Color::rgb(r, g, b);
+                                if is_fg {
+                                    self.current_fg = CellColor::Rgb(c);
+                                } else {
+                                    self.current_bg = CellColor::Rgb(c);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
+                _ => {}
             }
-            1006 => self.mouse_sgr = enabled,
-            2004 => self.bracketed_paste = enabled,
-            _ => {}
         }
+        self.grid.set_erase_background(self.current_bg);
     }
 
-    fn enter_alt_screen(&mut self) {
-        if !self.use_alt_screen {
-            self.main_return = self.cursor_snapshot();
-            let cols = self.grid.cols;
-            let rows = self.grid.rows;
-            self.alt_grid.resize(cols, rows);
-            std::mem::swap(&mut self.grid, &mut self.alt_grid);
-            self.grid.set_erase_background(self.current_bg);
-            self.grid.erase_all();
-            self.home_cursor();
-            self.use_alt_screen = true;
-        }
-    }
-
-    fn exit_alt_screen(&mut self) {
-        if self.use_alt_screen {
-            std::mem::swap(&mut self.grid, &mut self.alt_grid);
-            self.restore_snapshot(self.main_return);
-            self.grid.set_erase_background(self.current_bg);
-            self.use_alt_screen = false;
-        }
-    }
-}
-
-fn percent_decode(input: &str) -> String {
-    fn hex_value(b: u8) -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
-    }
-
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
-fn parse_osc7_path(raw: &[u8]) -> Option<PathBuf> {
-    let s = std::str::from_utf8(raw).ok()?;
-    let rest = s.strip_prefix("file://")?;
-    let slash = rest.find('/')?;
-    let path = &rest[slash..];
-    Some(PathBuf::from(percent_decode(path)))
-}
-
-fn char_display_width(c: char) -> usize {
-    UnicodeWidthChar::width(c).unwrap_or(1)
-}
-
-impl Perform for Performer {
-    #[inline(always)]
-    fn print(&mut self, c: char) {
-        // Fast path for the overwhelmingly common case: printable ASCII with
-        // no pending wrap, landing strictly inside the row. One row_map lookup
-        // and one damage mark per character.
-        if !self.grid.pending_wrap && (c as u32) >= 0x20 && (c as u32) < 0x7f {
-            let col = self.grid.cursor_col;
-            let row = self.grid.cursor_row;
-            if col + 1 < self.grid.cols && row < self.grid.rows {
-                let cell = self.make_cell(c);
-                self.grid.put_ascii(col, row, cell);
-                self.grid.cursor_col = col + 1;
-                self.mark_dirty_row(row);
-                return;
-            }
-        }
-
-        if self.grid.cols == 0 || self.grid.rows == 0 {
-            return;
-        }
-        let old_cursor_row = self.grid.cursor_row;
-        if !c.is_ascii() && self.extend_grapheme(c) {
-            return;
-        }
-        let intrinsic_width = char_display_width(c);
-        let mut width = intrinsic_width.min(self.grid.cols);
-        if width == 0 {
-            return;
-        }
-
-        // Deferred wrap: fire the pending wrap before placing the new character.
-        if self.grid.pending_wrap && self.autowrap {
-            self.grid.pending_wrap = false;
-            self.grid.set_row_soft_wrapped(self.grid.cursor_row, true);
-            self.grid.cursor_col = 0;
-            let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
-            self.grid.newline();
-            if will_scroll {
-                self.mark_dirty_range(self.grid.scroll_top, self.grid.scroll_bottom);
-            }
-        }
-
-        if width == 2 && self.grid.cursor_col + 1 >= self.grid.cols && self.autowrap {
-            let col = self.grid.cursor_col;
-            let row = self.grid.cursor_row;
-            self.grid.put_char(col, row, Cell::wrap_spacer());
-            self.grid.set_row_soft_wrapped(self.grid.cursor_row, true);
-            self.grid.cursor_col = 0;
-            let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
-            self.grid.newline();
-            if will_scroll {
-                self.mark_dirty_range(self.grid.scroll_top, self.grid.scroll_bottom);
-            }
-        }
-
-        let col = self.grid.cursor_col;
-        let row = self.grid.cursor_row;
-        width = width.min(self.grid.cols - col);
-        if col < self.grid.cols && row < self.grid.rows {
-            let mut cell = self.make_cell(c);
-            cell.set_wide(width == 2);
-            cell.set_clipped_wide(intrinsic_width == 2 && width == 1);
-            self.grid.put_char(col, row, cell);
-            self.mark_dirty_row(row);
-        }
-
-        if width == 1 {
-            self.grid.advance_cursor();
-        } else if col + 2 >= self.grid.cols {
-            self.grid.pending_wrap = true;
-            self.grid.cursor_col = self.grid.cols.saturating_sub(1);
-        } else {
-            self.grid.cursor_col += 2;
-        }
-        // The written row is already marked; only mark extra rows if the
-        // cursor moved (wrap/scroll), avoiding a redundant per-char update.
-        if self.grid.cursor_row != old_cursor_row {
-            self.mark_cursor_row_change(old_cursor_row);
-        }
-    }
-
-    fn execute(&mut self, byte: u8) {
-        let old_cursor_row = self.grid.cursor_row;
-        // Only cursor controls cancel deferred wrap; BEL/NUL must not.
-        if matches!(byte, 0x08..=0x0d) {
-            self.grid.pending_wrap = false;
-        }
-        match byte {
-            0x08 => {
-                // BS
-                if self.grid.cursor_col > 0 {
-                    self.grid.cursor_col -= 1;
-                }
-                self.mark_cursor_row_change(old_cursor_row);
-            }
-            0x09 => {
-                // HT
-                let next = (self.grid.cursor_col / 8 + 1) * 8;
-                self.grid.cursor_col = next.min(self.grid.cols.saturating_sub(1));
-                self.mark_cursor_row_change(old_cursor_row);
-            }
-            0x0a..=0x0c => {
-                // LF/VT/FF
-                self.grid.set_row_soft_wrapped(self.grid.cursor_row, false);
-                let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
-                self.grid.newline();
-                if will_scroll {
-                    self.mark_dirty_range(self.grid.scroll_top, self.grid.scroll_bottom);
-                } else {
-                    self.mark_cursor_row_change(old_cursor_row);
-                }
-            }
-            0x0d => {
-                self.grid.cursor_col = 0; // CR
-                self.mark_cursor_row_change(old_cursor_row);
-            }
-            _ => {}
-        }
-    }
-
-    fn csi_dispatch(
+    #[inline(never)]
+    fn csi_non_sgr(
         &mut self,
         params: &vte::Params,
         intermediates: &[u8],
@@ -886,98 +499,560 @@ impl Perform for Performer {
                     self.set_private_mode(param.first().copied().unwrap_or(0), action == 'h');
                 }
             }
-            'm' => {
-                // SGR
-                let mut iter = params.iter().peekable();
-                if iter.peek().is_none() {
-                    self.reset_attrs();
-                    return;
+
+            _ => {}
+        }
+    }
+
+    pub fn alternate_screen_active(&self) -> bool {
+        self.use_alt_screen
+    }
+
+    pub fn new(cols: usize, rows: usize) -> Self {
+        Self {
+            grid: Grid::new(cols, rows),
+            use_alt_screen: false,
+            alt_grid: Grid::new_alt(cols, rows),
+            saved_cursors: [SavedCursor::default(); 2],
+            main_return: SavedCursor::default(),
+            origin_mode: false,
+            autowrap: true,
+            current_fg: CellColor::Default,
+            current_bg: CellColor::Default,
+            current_bold: false,
+            current_italic: false,
+            current_underline: false,
+            current_reverse: false,
+            cursor_visible: true,
+            pending_writes: Vec::new(),
+            pending_events: Vec::new(),
+            display_dirty: false,
+            damage_rows: None,
+            mouse_tracking: MouseTrackingMode::Off,
+            mouse_sgr: false,
+            application_cursor_keys: false,
+            bracketed_paste: false,
+            active_link: None,
+            command_started: None,
+        }
+    }
+
+    /// Resize both the main and alt screen grids.
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.grid.resize(cols, rows);
+        self.alt_grid.resize(cols, rows);
+        if self.use_alt_screen {
+            self.main_return.col = self.alt_grid.cursor_col;
+            self.main_return.row = self.alt_grid.cursor_row;
+            self.main_return.pending_wrap = self.alt_grid.pending_wrap;
+        }
+    }
+
+    /// Set the configured scrollback limit on both grid buffers. The inactive
+    /// buffer may become the active one after an alt-screen swap or RIS.
+    pub fn set_scrollback_limit(&mut self, limit: usize) {
+        // Configured limits are at least one; resize populated rings safely.
+        self.grid.set_scrollback_limit(limit);
+        self.alt_grid.set_scrollback_limit(limit);
+    }
+
+    pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
+        self.mouse_tracking
+    }
+
+    pub fn mouse_sgr_mode(&self) -> bool {
+        self.mouse_sgr
+    }
+
+    pub fn mouse_reporting_enabled(&self) -> bool {
+        self.mouse_tracking != MouseTrackingMode::Off
+    }
+
+    pub fn application_cursor_keys_mode(&self) -> bool {
+        self.application_cursor_keys
+    }
+
+    /// Whether the application requested bracketed paste (DECSET 2004).
+    /// When enabled, pasted text must be wrapped in ESC[200~ … ESC[201~.
+    pub fn bracketed_paste_mode(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    pub fn take_damage_rows(&mut self) -> Option<(usize, usize)> {
+        self.damage_rows.take()
+    }
+
+    /// Extend the preceding grapheme without allocating anything in ASCII
+    /// print(). Handles combining marks, variation selectors, emoji modifiers,
+    /// ZWJ sequences and regional-indicator pairs across PTY chunk boundaries.
+    #[inline(never)]
+    fn extend_grapheme(&mut self, c: char) -> bool {
+        if self.grid.cols == 0 || self.grid.rows == 0 {
+            return false;
+        }
+        let row = self.grid.cursor_row;
+        let mut col = if self.grid.pending_wrap {
+            self.grid.cursor_col
+        } else if self.grid.cursor_col > 0 {
+            self.grid.cursor_col - 1
+        } else {
+            return false;
+        };
+        if self.grid.cell(col, row).is_continuation() && col > 0 {
+            col -= 1;
+        }
+        let previous = *self.grid.cell(col, row);
+        let mut text = String::new();
+        self.grid.push_cell_text(&mut text, &previous);
+        // Bounded per-cell extension protects against unbounded combining-mark
+        // streams. The limit is bytes, not the number of stored grid cells.
+        if text.len() + c.len_utf8() > 4096 {
+            return char_display_width(c) == 0;
+        }
+        text.push(c);
+        if text.graphemes(true).count() != 1 {
+            return false;
+        }
+        let intrinsic_width = UnicodeWidthStr::width(text.as_str()).clamp(1, 2);
+        let width = intrinsic_width.min(if self.autowrap {
+            self.grid.cols
+        } else {
+            self.grid.cols - col
+        });
+        let old_width = previous.width();
+        let mut target_col = col;
+        let mut target_row = row;
+        if width == 2 && col + 1 >= self.grid.cols {
+            self.grid.put_char(col, row, Cell::wrap_spacer());
+            self.grid.set_row_soft_wrapped(row, true);
+            self.grid.cursor_col = 0;
+            self.grid.pending_wrap = false;
+            self.grid.newline();
+            target_col = 0;
+            target_row = self.grid.cursor_row;
+            self.mark_dirty_all();
+        }
+        let mut cell = previous;
+        cell.set_wide(width == 2);
+        cell.set_clipped_wide(intrinsic_width == 2 && width == 1);
+        self.grid.put_char(target_col, target_row, cell);
+        // Retain the existing precomposed fast representation when possible.
+        let composed = if previous.cluster_id().is_none() {
+            unicode_normalization::char::compose(previous.c(), c)
+        } else {
+            None
+        };
+        if let Some(composed) = composed {
+            let cell = self.grid.cell_mut(target_col, target_row);
+            cell.set_char(composed);
+            cell.set_wide(width == 2);
+            cell.set_clipped_wide(intrinsic_width == 2 && width == 1);
+        } else {
+            self.grid.set_grapheme(target_col, target_row, &text, width);
+        }
+        if width != old_width || target_row != row || target_col != col {
+            self.grid.cursor_row = target_row;
+            self.grid.cursor_col = (target_col + width).min(self.grid.cols - 1);
+            self.grid.pending_wrap = target_col + width >= self.grid.cols;
+        }
+        self.mark_dirty_row(target_row);
+        true
+    }
+
+    #[inline(always)]
+    fn make_cell(&self, c: char) -> Cell {
+        let mut cell = Cell::default();
+        cell.set_char(c);
+        Cell {
+            fg: self.current_fg,
+            bg: self.current_bg,
+            bold: self.current_bold,
+            italic: self.current_italic,
+            underline: self.current_underline,
+            reverse: self.current_reverse,
+            ..cell
+        }
+    }
+
+    fn mark_dirty_range(&mut self, start_row: usize, end_row: usize) {
+        if self.grid.rows == 0 {
+            self.display_dirty = true;
+            return;
+        }
+        let start = start_row.min(self.grid.rows - 1);
+        let end = end_row.min(self.grid.rows - 1);
+        if start > end {
+            return;
+        }
+        self.damage_rows = Some(match self.damage_rows {
+            Some((cur_start, cur_end)) => (cur_start.min(start), cur_end.max(end)),
+            None => (start, end),
+        });
+        self.display_dirty = true;
+    }
+
+    #[inline]
+    fn mark_dirty_row(&mut self, row: usize) {
+        self.display_dirty = true;
+        if let Some((start, end)) = self.damage_rows {
+            if row >= start && row <= end {
+                return;
+            }
+        }
+        self.mark_dirty_range(row, row);
+    }
+
+    fn mark_dirty_all(&mut self) {
+        if self.grid.rows > 0 {
+            self.mark_dirty_range(0, self.grid.rows - 1);
+        } else {
+            self.display_dirty = true;
+        }
+    }
+
+    fn mark_cursor_row_change(&mut self, old_row: usize) {
+        let new_row = self.grid.cursor_row;
+        if old_row == new_row {
+            self.mark_dirty_row(new_row);
+        } else {
+            self.mark_dirty_row(old_row);
+            self.mark_dirty_row(new_row);
+        }
+    }
+
+    fn reset_attrs(&mut self) {
+        self.current_fg = CellColor::Default;
+        self.current_bg = CellColor::Default;
+        self.grid.set_erase_background(self.current_bg);
+        self.current_bold = false;
+        self.current_italic = false;
+        self.current_underline = false;
+        self.current_reverse = false;
+    }
+
+    fn param(params: &vte::Params, idx: usize) -> u16 {
+        params
+            .iter()
+            .nth(idx)
+            .and_then(|s| s.first().copied())
+            .unwrap_or(0)
+    }
+
+    /// Full terminal reset (RIS — Reset to Initial State, `ESC c`): drops the
+    /// alt screen entirely (not a restore — RIS discards it), clears the grid
+    /// and scrollback, resets the cursor and all SGR attributes, and turns
+    /// off every optional mode (mouse tracking, bracketed paste, application
+    /// cursor keys). `scrollback_limit` is a config value, not terminal
+    /// state, so it's preserved across the reset.
+    pub fn reset(&mut self) {
+        self.use_alt_screen = false;
+        let cols = self.grid.cols;
+        let rows = self.grid.rows;
+        let scrollback_limit = self.grid.scrollback_limit;
+        self.grid = Grid::new(cols, rows);
+        self.grid.scrollback_limit = scrollback_limit;
+        self.alt_grid = Grid::new_alt(cols, rows);
+        self.alt_grid.scrollback_limit = scrollback_limit;
+        self.saved_cursors = [SavedCursor::default(); 2];
+        self.main_return = SavedCursor::default();
+        self.origin_mode = false;
+        self.autowrap = true;
+        self.reset_attrs();
+        self.cursor_visible = true;
+        self.pending_writes.clear();
+        self.mouse_tracking = MouseTrackingMode::Off;
+        self.mouse_sgr = false;
+        self.application_cursor_keys = false;
+        self.bracketed_paste = false;
+        self.active_link = None;
+        self.command_started = None;
+        self.mark_dirty_all();
+    }
+
+    fn cursor_snapshot(&self) -> SavedCursor {
+        SavedCursor {
+            col: self.grid.cursor_col,
+            row: self.grid.cursor_row,
+            attrs: self.make_cell(' '),
+            origin: self.origin_mode,
+            pending_wrap: self.grid.pending_wrap,
+        }
+    }
+
+    fn restore_snapshot(&mut self, saved: SavedCursor) {
+        self.origin_mode = saved.origin;
+        self.grid.cursor_col = saved.col.min(self.grid.cols - 1);
+        self.grid.cursor_row = saved.row.min(self.grid.rows - 1);
+        if self.origin_mode {
+            self.grid.cursor_row = self
+                .grid
+                .cursor_row
+                .clamp(self.grid.scroll_top, self.grid.scroll_bottom);
+        }
+        self.grid.pending_wrap = saved.pending_wrap && self.grid.cursor_col + 1 == self.grid.cols;
+        self.current_fg = saved.attrs.fg;
+        self.current_bg = saved.attrs.bg;
+        self.current_bold = saved.attrs.bold;
+        self.current_italic = saved.attrs.italic;
+        self.current_underline = saved.attrs.underline;
+        self.current_reverse = saved.attrs.reverse;
+        self.grid.set_erase_background(self.current_bg);
+    }
+
+    fn home_cursor(&mut self) {
+        self.grid.cursor_col = 0;
+        self.grid.cursor_row = if self.origin_mode {
+            self.grid.scroll_top
+        } else {
+            0
+        };
+        self.grid.pending_wrap = false;
+    }
+
+    fn set_private_mode(&mut self, mode: u16, enabled: bool) {
+        match mode {
+            1 => self.application_cursor_keys = enabled,
+            6 => {
+                self.origin_mode = enabled;
+                self.home_cursor();
+                self.mark_dirty_all();
+            }
+            7 => {
+                self.autowrap = enabled;
+                self.grid.pending_wrap = false;
+            }
+            25 => {
+                self.cursor_visible = enabled;
+                self.mark_dirty_row(self.grid.cursor_row);
+            }
+            1049 => {
+                if enabled {
+                    self.enter_alt_screen();
+                } else {
+                    self.exit_alt_screen();
                 }
-                while let Some(subparams) = iter.next() {
-                    let p = subparams.first().copied().unwrap_or(0);
-                    match p {
-                        0 => self.reset_attrs(),
-                        1 => self.current_bold = true,
-                        3 => self.current_italic = true,
-                        4 => self.current_underline = true,
-                        7 => self.current_reverse = true,
-                        22 => self.current_bold = false,
-                        23 => self.current_italic = false,
-                        24 => self.current_underline = false,
-                        27 => self.current_reverse = false,
-                        30..=37 => self.current_fg = CellColor::Indexed(p as u8 - 30),
-                        39 => self.current_fg = CellColor::Default,
-                        40..=47 => self.current_bg = CellColor::Indexed(p as u8 - 40),
-                        49 => self.current_bg = CellColor::Default,
-                        90..=97 => self.current_fg = CellColor::Indexed(p as u8 - 90 + 8),
-                        100..=107 => self.current_bg = CellColor::Indexed(p as u8 - 100 + 8),
-                        38 | 48 => {
-                            let is_fg = p == 38;
-                            if subparams.len() >= 3 && subparams[1] == 5 {
-                                let idx = subparams[2] as u8;
-                                if is_fg {
-                                    self.current_fg = CellColor::Indexed(idx);
-                                } else {
-                                    self.current_bg = CellColor::Indexed(idx);
-                                }
-                            } else if subparams.len() >= 5 && subparams[1] == 2 {
-                                // ISO colon syntax includes an optional colour-space slot.
-                                let offset = if subparams.len() >= 6 { 3 } else { 2 };
-                                let c = Color::rgb(
-                                    subparams[offset].min(255) as u8,
-                                    subparams[offset + 1].min(255) as u8,
-                                    subparams[offset + 2].min(255) as u8,
-                                );
-                                if is_fg {
-                                    self.current_fg = CellColor::Rgb(c);
-                                } else {
-                                    self.current_bg = CellColor::Rgb(c);
-                                }
-                            } else if let Some(next) = iter.next() {
-                                match next.first().copied().unwrap_or(0) {
-                                    5 => {
-                                        if let Some(idx_param) = iter.next() {
-                                            let idx = idx_param.first().copied().unwrap_or(0) as u8;
-                                            if is_fg {
-                                                self.current_fg = CellColor::Indexed(idx);
-                                            } else {
-                                                self.current_bg = CellColor::Indexed(idx);
-                                            }
-                                        }
-                                    }
-                                    2 => {
-                                        let r = iter
-                                            .next()
-                                            .and_then(|s| s.first().copied())
-                                            .unwrap_or(0)
-                                            as u8;
-                                        let g = iter
-                                            .next()
-                                            .and_then(|s| s.first().copied())
-                                            .unwrap_or(0)
-                                            as u8;
-                                        let b = iter
-                                            .next()
-                                            .and_then(|s| s.first().copied())
-                                            .unwrap_or(0)
-                                            as u8;
-                                        let c = Color::rgb(r, g, b);
-                                        if is_fg {
-                                            self.current_fg = CellColor::Rgb(c);
-                                        } else {
-                                            self.current_bg = CellColor::Rgb(c);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        _ => {}
+                self.mark_dirty_all();
+            }
+            1000 | 1002 | 1003 => {
+                self.mouse_tracking = if !enabled {
+                    MouseTrackingMode::Off
+                } else {
+                    match mode {
+                        1000 => MouseTrackingMode::X10,
+                        1002 => MouseTrackingMode::ButtonEvent,
+                        _ => MouseTrackingMode::AnyMotion,
                     }
                 }
-                self.grid.set_erase_background(self.current_bg);
+            }
+            1006 => self.mouse_sgr = enabled,
+            2004 => self.bracketed_paste = enabled,
+            _ => {}
+        }
+    }
+
+    fn enter_alt_screen(&mut self) {
+        if !self.use_alt_screen {
+            self.active_link = None;
+            self.main_return = self.cursor_snapshot();
+            let cols = self.grid.cols;
+            let rows = self.grid.rows;
+            self.alt_grid.resize(cols, rows);
+            std::mem::swap(&mut self.grid, &mut self.alt_grid);
+            self.grid.set_erase_background(self.current_bg);
+            self.grid.erase_all();
+            self.home_cursor();
+            self.use_alt_screen = true;
+        }
+    }
+
+    fn exit_alt_screen(&mut self) {
+        if self.use_alt_screen {
+            self.active_link = None;
+            std::mem::swap(&mut self.grid, &mut self.alt_grid);
+            self.restore_snapshot(self.main_return);
+            self.grid.set_erase_background(self.current_bg);
+            self.use_alt_screen = false;
+        }
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    fn hex_value(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn parse_osc7_path(raw: &[u8]) -> Option<PathBuf> {
+    let s = std::str::from_utf8(raw).ok()?;
+    let rest = s.strip_prefix("file://")?;
+    let slash = rest.find('/')?;
+    let path = &rest[slash..];
+    Some(PathBuf::from(percent_decode(path)))
+}
+
+fn char_display_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(1)
+}
+
+impl Perform for Performer {
+    #[inline(always)]
+    fn print(&mut self, c: char) {
+        // Fast path for the overwhelmingly common case: printable ASCII with
+        // no pending wrap, landing strictly inside the row. One row_map lookup
+        // and one damage mark per character.
+        if !self.grid.pending_wrap && (c as u32) >= 0x20 && (c as u32) < 0x7f {
+            let col = self.grid.cursor_col;
+            let row = self.grid.cursor_row;
+            if col + 1 < self.grid.cols && row < self.grid.rows && self.active_link.is_none() {
+                let cell = self.make_cell(c);
+                self.grid.put_ascii(col, row, cell);
+                self.grid.cursor_col = col + 1;
+                self.mark_dirty_row(row);
+                return;
+            }
+        }
+
+        if self.grid.cols == 0 || self.grid.rows == 0 {
+            return;
+        }
+        let old_cursor_row = self.grid.cursor_row;
+        if !c.is_ascii() && self.extend_grapheme(c) {
+            return;
+        }
+        let intrinsic_width = char_display_width(c);
+        let mut width = intrinsic_width.min(self.grid.cols);
+        if width == 0 {
+            return;
+        }
+
+        // Deferred wrap: fire the pending wrap before placing the new character.
+        if self.grid.pending_wrap && self.autowrap {
+            self.grid.pending_wrap = false;
+            self.grid.set_row_soft_wrapped(self.grid.cursor_row, true);
+            self.grid.cursor_col = 0;
+            let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
+            self.grid.newline();
+            if will_scroll {
+                self.mark_dirty_range(self.grid.scroll_top, self.grid.scroll_bottom);
+            }
+        }
+
+        if width == 2 && self.grid.cursor_col + 1 >= self.grid.cols && self.autowrap {
+            let col = self.grid.cursor_col;
+            let row = self.grid.cursor_row;
+            self.grid.put_char(col, row, Cell::wrap_spacer());
+            self.grid.set_row_soft_wrapped(self.grid.cursor_row, true);
+            self.grid.cursor_col = 0;
+            let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
+            self.grid.newline();
+            if will_scroll {
+                self.mark_dirty_range(self.grid.scroll_top, self.grid.scroll_bottom);
+            }
+        }
+
+        let col = self.grid.cursor_col;
+        let row = self.grid.cursor_row;
+        width = width.min(self.grid.cols - col);
+        if col < self.grid.cols && row < self.grid.rows {
+            let mut cell = self.make_cell(c);
+            cell.set_wide(width == 2);
+            cell.set_clipped_wide(intrinsic_width == 2 && width == 1);
+            if let Some(link) = &self.active_link {
+                self.grid.link_cell(&mut cell, c, link);
+            }
+            self.grid.put_char(col, row, cell);
+            self.mark_dirty_row(row);
+        }
+
+        if width == 1 {
+            self.grid.advance_cursor();
+        } else if col + 2 >= self.grid.cols {
+            self.grid.pending_wrap = true;
+            self.grid.cursor_col = self.grid.cols.saturating_sub(1);
+        } else {
+            self.grid.cursor_col += 2;
+        }
+        // The written row is already marked; only mark extra rows if the
+        // cursor moved (wrap/scroll), avoiding a redundant per-char update.
+        if self.grid.cursor_row != old_cursor_row {
+            self.mark_cursor_row_change(old_cursor_row);
+        }
+    }
+
+    fn execute(&mut self, byte: u8) {
+        let old_cursor_row = self.grid.cursor_row;
+        // Only cursor controls cancel deferred wrap; BEL/NUL must not.
+        if matches!(byte, 0x08..=0x0d) {
+            self.grid.pending_wrap = false;
+        }
+        match byte {
+            0x08 => {
+                // BS
+                if self.grid.cursor_col > 0 {
+                    self.grid.cursor_col -= 1;
+                }
+                self.mark_cursor_row_change(old_cursor_row);
+            }
+            0x09 => {
+                // HT
+                let next = (self.grid.cursor_col / 8 + 1) * 8;
+                self.grid.cursor_col = next.min(self.grid.cols.saturating_sub(1));
+                self.mark_cursor_row_change(old_cursor_row);
+            }
+            0x0a..=0x0c => {
+                // LF/VT/FF
+                self.grid.set_row_soft_wrapped(self.grid.cursor_row, false);
+                let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
+                self.grid.newline();
+                if will_scroll {
+                    self.mark_dirty_range(self.grid.scroll_top, self.grid.scroll_bottom);
+                } else {
+                    self.mark_cursor_row_change(old_cursor_row);
+                }
+            }
+            0x0d => {
+                self.grid.cursor_col = 0; // CR
+                self.mark_cursor_row_change(old_cursor_row);
             }
             _ => {}
+        }
+    }
+
+    #[inline]
+    fn csi_dispatch(
+        &mut self,
+        params: &vte::Params,
+        intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
+        // Color-heavy output should not pay the large cursor/edit dispatch's
+        // register-save prologue. Keep protocol validation before the fast path.
+        if !ignore && intermediates.is_empty() && action == 'm' {
+            self.sgr(params);
+        } else {
+            self.csi_non_sgr(params, intermediates, ignore, action);
         }
     }
 
@@ -987,6 +1062,11 @@ impl Perform for Performer {
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         if params.is_empty() {
+            return;
+        }
+
+        if params[0] == b"8" {
+            self.active_link = Hyperlink::from_osc(params);
             return;
         }
 
@@ -1003,16 +1083,8 @@ impl Perform for Performer {
             return;
         }
 
-        if params.len() >= 2 && params[0] == b"133" && params[1] == b"D" {
-            let exit_code = params
-                .get(2)
-                .and_then(|code| std::str::from_utf8(code).ok())
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(0);
-            self.pending_events.push(CoreEvent::CommandFinished {
-                exit_code,
-                duration_ms: 0,
-            });
+        if params.len() >= 2 && params[0] == b"133" {
+            self.shell_integration(params);
         }
     }
 
@@ -1086,6 +1158,16 @@ mod tests {
             logical_lines.push(current);
         }
         logical_lines
+    }
+
+    #[test]
+    fn command_duration_uses_monotonic_clock() {
+        let mut p = Performer::new(10, 2);
+        p.command_started = Some(std::time::Instant::now() - std::time::Duration::from_millis(42));
+        feed(&mut p, b"\x1b]133;D;0\x07");
+        assert!(matches!(p.pending_events.last(),
+            Some(CoreEvent::CommandFinished { exit_code: 0, duration_ms }) if *duration_ms >= 42));
+        assert!(p.command_started.is_none());
     }
 
     #[test]

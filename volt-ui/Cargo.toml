@@ -27,3 +27,6 @@ raw-window-handle = "0.6"
 libc = "0.2"
 objc = "0.2"
 muda = { version = "0.17", default-features = false }
+
+[dev-dependencies]
+vte = "0.15"

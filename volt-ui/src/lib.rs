@@ -17,3 +17,7 @@ pub mod workspace_search;
 
 #[cfg(target_os = "macos")]
 mod native_text;
+
+mod keybindings;
+
+mod links;

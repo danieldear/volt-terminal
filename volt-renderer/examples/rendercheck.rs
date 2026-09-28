@@ -202,6 +202,25 @@ fn main() -> Result<()> {
                         h,
                         &full,
                     )?;
+                    // Link IDs must not change glyph choice, procedural cell symbols,
+                    // emoji shaping, spacing or cached geometry at any font/scale.
+                    let mut linked = Performer::new(cols, rows);
+                    feed(&mut linked, "\x1b]8;;https://example.test/render-proof\x07");
+                    fixture(&mut linked);
+                    feed(&mut linked, "\x1b]8;;\x07");
+                    draw(&mut renderer, &linked, false);
+                    anyhow::ensure!(
+                        full == renderer.read_offscreen_rgba()?,
+                        "linked/plain pixel mismatch: {family}/{scale}/{height}"
+                    );
+                    renderer.set_row_cache_enabled(true);
+                    draw(&mut renderer, &linked, false);
+                    draw(&mut renderer, &linked, false);
+                    anyhow::ensure!(
+                        full == renderer.read_offscreen_rgba()?,
+                        "linked cache mismatch"
+                    );
+
                     // Test row replacement, selection and atlas UV reuse, not only static output.
                     renderer.set_row_cache_enabled(true);
                     draw(&mut renderer, &p, false);
@@ -234,7 +253,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        println!("{tested} font/scale/line-height GPU fixtures passed cached/full pixel equality");
+        println!("{tested} font/scale/line-height GPU fixtures passed cached/full and linked/plain pixel equality");
     }
 
     if std::env::args().any(|arg| arg == "--fixtures-only") {

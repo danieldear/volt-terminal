@@ -150,6 +150,23 @@ impl Pty {
         Arc<Mutex<Performer>>,
         mpsc::UnboundedReceiver<CoreEvent>,
     )> {
+        Self::spawn_in(shell, args, cols, rows, None, on_data)
+    }
+
+    /// Set the child's working directory without writing a command into its shell.
+    /// An invalid explicit directory is an error, never silently substituted.
+    pub fn spawn_in(
+        shell: &str,
+        args: &[String],
+        cols: u16,
+        rows: u16,
+        cwd: Option<&std::path::Path>,
+        on_data: impl Fn() + Send + 'static,
+    ) -> anyhow::Result<(
+        Self,
+        Arc<Mutex<Performer>>,
+        mpsc::UnboundedReceiver<CoreEvent>,
+    )> {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let pty_system = native_pty_system();
@@ -161,6 +178,13 @@ impl Pty {
         })?;
 
         let mut cmd = CommandBuilder::new(shell);
+        if let Some(cwd) = cwd {
+            anyhow::ensure!(
+                cwd.is_absolute() && cwd.is_dir(),
+                "invalid shell working directory"
+            );
+            cmd.cwd(cwd);
+        }
         for arg in args {
             cmd.arg(arg);
         }
@@ -168,6 +192,8 @@ impl Pty {
         // full color and correct capabilities regardless of how Volt was launched.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "volt");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         // Ensure UTF-8 locale for Nerd Font / Unicode rendering
         if std::env::var("LANG").is_err() {
             cmd.env("LANG", "en_US.UTF-8");
@@ -582,6 +608,47 @@ mod tests {
                 assert!(std::time::Instant::now() < deadline, "worker leaked");
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
+        }
+    }
+
+    #[test]
+    fn spawn_in_uses_child_cwd_and_does_not_change_parent() {
+        let parent = std::env::current_dir().unwrap();
+        let cwd = std::env::temp_dir().canonicalize().unwrap();
+        let (pty, performer, mut rx) = Pty::spawn_in(
+            "/bin/sh",
+            &["-c".into(), "printf 'CWD:%s' \"$PWD\"".into()],
+            512,
+            2,
+            Some(&cwd),
+            || {},
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if matches!(rx.try_recv(), Ok(CoreEvent::PtyClosed)) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "child did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let p = performer.lock().unwrap();
+        assert!(p
+            .grid
+            .row_text(p.grid.row_cells(0))
+            .starts_with(&format!("CWD:{}", cwd.display())));
+        assert_eq!(std::env::current_dir().unwrap(), parent);
+        drop(p);
+        drop(pty);
+    }
+
+    #[test]
+    fn spawn_in_rejects_relative_or_missing_directories() {
+        for cwd in [
+            std::path::Path::new("relative"),
+            std::path::Path::new("/volt-definitely-missing-directory"),
+        ] {
+            assert!(Pty::spawn_in("/bin/sh", &[], 80, 24, Some(cwd), || {}).is_err());
         }
     }
 

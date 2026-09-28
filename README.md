@@ -143,6 +143,69 @@ to change its layout (no dedicated keyboard shortcut).
 Double-clicking empty tab-bar chrome (not a tab) maximizes/restores the
 window, matching Finder/Safari.
 
+### Custom shortcuts
+
+Add `[[keybindings]]` entries to `~/.config/volt/config.toml`, then reload
+with Cmd+Shift+R (or File → Reload Settings). These **override** matching
+built-in shortcuts; other defaults stay intact. Example:
+
+```toml
+[[keybindings]]
+key = "cmd+shift+l"
+action = "toggle_workspace_layout"
+
+[[keybindings]]
+key = "cmd+shift+s"
+action = "split_left"
+
+# Disable a default and let the terminal's normal key encoder handle it:
+[[keybindings]]
+key = "cmd+d"
+action = "unbind"
+```
+
+Use `ignore` instead of `unbind` to consume a key without sending it to the
+shell. Adding a new shortcut does not remove the old one; unbind it explicitly.
+Bindings are single physical-key chords, with **exact** modifiers; the last
+entry for a chord wins. Keys use `a`–`z`, `0`–`9`, `f1`–`f24`, named arrows,
+`enter`, `tab`, `escape`, `space`, `backspace`, `delete`, `home`, `end`,
+`pageup`, `pagedown`, or punctuation names such as `equal`, `minus`,
+`bracketleft`, `bracketright`, `comma`, `period`, `slash`, `backslash`,
+`semicolon`, `quote`, `backquote`. Modifiers are `ctrl`, `alt`/`option`,
+`shift`, `cmd`/`super`. For a shifted punctuation key, include `shift` explicitly.
+OS-reserved shortcuts may never reach Volt.
+
+Supported actions: `copy`, `paste`, `find`, `search_workspace`,
+`toggle_workspace`, `toggle_workspace_layout`, `new_tab`, `new_window`,
+`close_pane`, `next_tab`, `previous_tab`, `previous_prompt`, `next_prompt`, `split_right`, `split_left`,
+`split_down`, `split_up`, `focus_left`, `focus_right`, `focus_up`, `focus_down`,
+`increase_font_size`, `decrease_font_size`, `toggle_fullscreen`, `reload_config`,
+`open_config`, `quit`, `ignore`, `unbind`.
+
+Custom bindings do not override text editing in Find/title prompts, workspace
+search, or a focused workspace card. Paste continues to respect read-only panes.
+Invalid keys/actions and configurations with over 128 bindings are rejected.
+Key sequences, key tables and arbitrary shell-command bindings are not supported.
+
+### Links and working directories
+
+**Cmd-click** (macOS) or **Ctrl-click** (Linux) opens visible plain HTTP(S)
+URLs, including links soft-wrapped into scrollback. Explicit link clicks are
+consumed by Volt even inside mouse-aware TUIs; ordinary clicks still reach the
+TUI. No background URL scanning is performed. Schemes other than HTTP(S), URLs
+with credentials/control characters, and oversized logical lines are rejected.
+OSC 8 labeled links retain their destinations across wrapping, scrollback and
+reflow. Modifier-clicking one opens a **read-only destination confirmation**:
+Enter opens, Escape cancels, and Left/Right/Home/End inspect long URLs. Unsupported
+explicit schemes do not fall back to the visible label. See [OSC 8 details and
+limits](docs/osc8-links.md); run `sh scripts/validation/osc8-demo.sh` to test.
+
+New tabs, splits and windows inherit the focused pane's **local shell directory**
+on macOS/Linux. This uses the owned process's OS-reported CWD, not a `cd` command
+injected into the shell and not a possibly remote OSC 7 path. If the process CWD
+cannot be determined, the application's startup directory remains the fallback.
+It does not recreate SSH sessions or their remote working directories.
+
 ### Right-click context menu
 
 Right-click a pane for Copy/Paste, Split Right/Left/Down/Up,
@@ -180,3 +243,12 @@ volt-config/    # config parsing, themes
 ## License
 
 [MIT](LICENSE)
+
+### Prompt navigation (opt-in shell integration)
+
+Source the bundled Zsh/Bash integration to record shell prompts. Fish 4.9.3
+emits compatible OSC 133 markers by itself; do not source a Fish hook.
+`Cmd+Shift+Up` / `Cmd+Shift+Down` navigate prompt history without sending input
+to the shell. Custom actions: `previous_prompt` and `next_prompt`.
+Anchors are bounded and discarded on resize; command-output selection is not
+yet implemented. See [setup, compatibility and validation](docs/shell-integration.md).

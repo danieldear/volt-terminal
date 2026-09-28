@@ -75,6 +75,8 @@ PLIST_PATH="${CONTENTS_DIR}/Info.plist"
 echo "Creating app bundle at ${APP_DIR}..."
 rm -rf "${APP_DIR}"
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
+mkdir -p "${RESOURCES_DIR}/shell-integration"
+cp "${ROOT_DIR}/scripts/shell-integration/volt."* "${RESOURCES_DIR}/shell-integration/"
 
 cp "${BIN_PATH}" "${MACOS_DIR}/Volt"
 chmod +x "${MACOS_DIR}/Volt"

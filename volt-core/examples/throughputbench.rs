@@ -1,4 +1,5 @@
 //! Deterministic parser-only throughput. No PTY, GPU, shell, or output dropping.
+//! Set VOLT_BENCH_PROMPTS=1 to include the shell-anchor scroll bookkeeping.
 //! cargo run --release -p volt-core --example throughputbench -- [MiB=128] [cols=91] [rows=16]
 use std::{hint::black_box, time::Instant};
 use volt_core::performer::Performer;
@@ -13,6 +14,7 @@ fn main() {
     let mib = arg(0, 128);
     let cols = arg(1, 91);
     let rows = arg(2, 16);
+    let shell_seed = std::env::var_os("VOLT_BENCH_PROMPTS").is_some();
     assert!((1..=4096).contains(&mib) && cols > 0 && rows > 0);
     for (name, pattern) in [
         ("many", b"abcdefghijklmnopqrstuvwxyz\r\n".to_vec()),
@@ -27,6 +29,9 @@ fn main() {
             let mut parser = vte::Parser::new();
             if seeded_wide {
                 parser.advance(&mut p, "界\r\n".as_bytes());
+            }
+            if shell_seed {
+                parser.advance(&mut p, b"\x1b]133;A\x07");
             }
             let start = Instant::now();
             let mut bytes = 0;

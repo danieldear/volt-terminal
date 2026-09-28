@@ -1,4 +1,5 @@
 pub mod config;
+pub mod keybindings;
 pub mod theme;
 
 pub use config::{
