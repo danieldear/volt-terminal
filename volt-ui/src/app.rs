@@ -262,10 +262,7 @@ impl MainState {
             PhysicalKey::Code(KeyCode::ArrowDown | KeyCode::ArrowRight) if !naming => {
                 editor.next_field()
             }
-            _ => match text {
-                Some(text) => editor.type_text(text),
-                None => return None,
-            },
+            _ => editor.type_text(text?),
         };
         self.apply_editor_outcome(outcome)
     }
