@@ -51,8 +51,44 @@ pub enum VoltEvent {
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+const SELECTION_SCROLL_START_DELAY: Duration = Duration::from_millis(100);
+const SELECTION_SCROLL_INTERVAL: Duration = Duration::from_millis(40);
 /// Maximum delay between clicks for double/triple-click detection.
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(450);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionScrollDirection {
+    Up,
+    Down,
+}
+
+/// Move one retained row and extend the original anchor to the edge cell.
+/// Kept separate from the window/event loop so repeated ticks are testable.
+#[allow(clippy::too_many_arguments)]
+fn advance_drag_selection(
+    grid: &Grid,
+    offset: &mut usize,
+    selection: &mut Selection,
+    pane_id: usize,
+    alternate_screen: bool,
+    col: usize,
+    row: usize,
+    direction: SelectionScrollDirection,
+) -> bool {
+    let old_offset = *offset;
+    *offset = match direction {
+        SelectionScrollDirection::Up => offset.saturating_add(1).min(grid.scrollback_len()),
+        SelectionScrollDirection::Down => offset.saturating_sub(1),
+    };
+    if *offset == old_offset {
+        return false;
+    }
+    if !selection.extend_to(pane_id, alternate_screen, grid, *offset, col, row) {
+        *offset = old_offset;
+        return false;
+    }
+    true
+}
 
 #[derive(Debug, Clone, Copy)]
 struct DividerDrag {
@@ -95,6 +131,8 @@ struct MainState {
     keybindings: crate::keybindings::Bindings,
     mouse_pos: (f32, f32),
     is_drag_selecting: bool,
+    /// Armed only while a drag is held at the top/bottom of its originating pane.
+    selection_scroll_deadline: Option<(SelectionScrollDirection, Instant)>,
     selection: Option<Selection>,
     pressed_mouse_button: Option<MouseButton>,
     last_reported_mouse_cell: Option<(usize, usize)>,
@@ -165,6 +203,7 @@ impl MainState {
             self.search_dirty = false;
             self.search_target = None;
             self.is_drag_selecting = false;
+            self.selection_scroll_deadline = None;
             self.divider_drag = None;
             self.pressed_mouse_button = None;
             self.selection = None;
@@ -394,6 +433,11 @@ impl MainState {
     }
 
     fn resize_all_tabs_to_current_grid(&mut self) {
+        // Reflow can change logical row identities; a retained absolute-row
+        // selection must not silently point at different text afterward.
+        self.selection = None;
+        self.is_drag_selecting = false;
+        self.selection_scroll_deadline = None;
         self.sync_workspace_card();
         let (total_cols, total_rows) = self.current_grid_size();
         for tab in &mut self.tabs {
@@ -581,6 +625,8 @@ impl MainState {
         if idx < self.tabs.len() {
             self.active_tab = idx;
             self.selection = None;
+            self.is_drag_selecting = false;
+            self.selection_scroll_deadline = None;
             self.divider_drag = None;
             self.divider_hover_id = None;
             self.last_reported_mouse_cell = None;
@@ -1067,17 +1113,115 @@ impl MainState {
     }
 
     fn update_selection_end(&mut self, mx: f32, my: f32) {
-        let Some((pane_id, col, row)) = self.pane_cell_from_mouse(mx, my) else {
+        let Some((pane_id, col, row)) = self.pane_cell_from_mouse(mx, my).or_else(|| {
+            self.selection_scroll_target()
+                .map(|(_, pane_id, col, row)| (pane_id, col, row))
+        }) else {
+            return;
+        };
+        let Some(pane) = self.tabs[self.active_tab].tree.find_leaf(pane_id) else {
+            return;
+        };
+        let Some((absolute_row, origin, alternate_screen)) =
+            pane.performer.lock().ok().and_then(|p| {
+                let grid = &p.grid;
+                Some((
+                    grid.viewport_absolute_row(pane.scroll_view_offset, row)?,
+                    grid.scrollback_origin(),
+                    p.alternate_screen_active(),
+                ))
+            })
+        else {
             return;
         };
         if let Some(sel) = &mut self.selection {
-            if sel.pane_id != pane_id {
+            if sel.pane_id != pane_id
+                || sel.alternate_screen != alternate_screen
+                || sel.start_row < origin
+            {
                 return;
             }
             sel.end_col = col;
-            sel.end_row = row;
+            sel.end_row = absolute_row;
             self.begin_redraw();
         }
+    }
+
+    /// The pointer may be outside the terminal's vertical bounds during a
+    /// drag, so derive the edge from the selection's pane geometry rather than
+    /// requiring `pane_cell_from_mouse` to return a cell.
+    fn selection_scroll_target(&self) -> Option<(SelectionScrollDirection, usize, usize, usize)> {
+        if !self.is_drag_selecting {
+            return None;
+        }
+        let pane_id = self.selection?.pane_id;
+        let (cols, rows) = self.current_grid_size();
+        let rect = self
+            .active_tab()
+            .tree
+            .layout(cols, rows)
+            .into_iter()
+            .find(|rect| rect.id == pane_id)?;
+        let pad = self.renderer.padding * self.renderer.scale_factor;
+        let cell_width = self.renderer.cell_width;
+        let cell_height = self.renderer.cell_height;
+        let left = pad + rect.col as f32 * cell_width;
+        let right = left + rect.cols as f32 * cell_width;
+        let top = self.current_content_top_offset() + pad + rect.row as f32 * cell_height;
+        let bottom = top + rect.rows as f32 * cell_height;
+        let (mx, my) = self.mouse_pos;
+        if mx < left || mx >= right {
+            return None;
+        }
+        let direction = selection_scroll_direction(my, top, bottom, cell_height)?;
+        let col = ((mx - left) / cell_width).floor() as usize;
+        let row = match direction {
+            SelectionScrollDirection::Up => 0,
+            SelectionScrollDirection::Down => rect.rows - 1,
+        };
+        Some((direction, pane_id, col.min(rect.cols - 1), row))
+    }
+
+    /// The event loop calls this only while idle. No recurring wake-up is
+    /// scheduled outside an active drag at an edge.
+    fn tick_selection_auto_scroll(&mut self) -> Option<Instant> {
+        let Some((direction, pane_id, col, row)) = self.selection_scroll_target() else {
+            self.selection_scroll_deadline = None;
+            return None;
+        };
+        let now = Instant::now();
+        if self
+            .selection_scroll_deadline
+            .is_none_or(|(armed_direction, _)| armed_direction != direction)
+        {
+            self.selection_scroll_deadline = Some((direction, now + SELECTION_SCROLL_START_DELAY));
+        }
+        let (_, deadline) = self.selection_scroll_deadline?;
+        if now >= deadline {
+            let mut scrolled = false;
+            if let (Some(pane), Some(selection)) = (
+                self.tabs[self.active_tab].tree.find_leaf_mut(pane_id),
+                self.selection.as_mut(),
+            ) {
+                if let Ok(performer) = pane.performer.lock() {
+                    scrolled = advance_drag_selection(
+                        &performer.grid,
+                        &mut pane.scroll_view_offset,
+                        selection,
+                        pane_id,
+                        performer.alternate_screen_active(),
+                        col,
+                        row,
+                        direction,
+                    );
+                }
+            }
+            if scrolled {
+                self.begin_redraw();
+            }
+            self.selection_scroll_deadline = Some((direction, now + SELECTION_SCROLL_INTERVAL));
+        }
+        self.selection_scroll_deadline.map(|(_, deadline)| deadline)
     }
 
     /// Cell at a displayed (viewport) position, accounting for the pane's
@@ -1129,11 +1273,12 @@ impl MainState {
         }
         Some(Selection {
             pane_id,
+            alternate_screen: performer.alternate_screen_active(),
             mode: SelectionMode::Linear,
             start_col: start,
-            start_row: row,
+            start_row: grid.viewport_absolute_row(offset, row)?,
             end_col: end,
-            end_row: row,
+            end_row: grid.viewport_absolute_row(offset, row)?,
         })
     }
 
@@ -1142,69 +1287,29 @@ impl MainState {
         let tab = self.tabs.get(self.active_tab)?;
         let pane = tab.tree.find_leaf(pane_id)?;
         let performer = pane.performer.lock().ok()?;
-        let cols = performer.grid.cols;
+        let grid = &performer.grid;
+        let cols = grid.cols;
+        let absolute_row = grid.viewport_absolute_row(pane.scroll_view_offset, row)?;
         Some(Selection {
             pane_id,
+            alternate_screen: performer.alternate_screen_active(),
             mode: SelectionMode::Linear,
             start_col: 0,
-            start_row: row,
+            start_row: absolute_row,
             end_col: cols.saturating_sub(1),
-            end_row: row,
+            end_row: absolute_row,
         })
     }
 
     fn selected_text(&self) -> Option<String> {
-        let sel = self.selection?.normalized();
+        let sel = self.selection?;
         let tab = self.tabs.get(self.active_tab)?;
         let pane = tab.tree.find_leaf(sel.pane_id)?;
         let performer = pane.performer.lock().ok()?;
-        let grid = &performer.grid;
-        if sel.start_row >= grid.rows || sel.end_row >= grid.rows {
+        if sel.alternate_screen != performer.alternate_screen_active() {
             return None;
         }
-        let offset = pane.scroll_view_offset.min(grid.scrollback_len());
-        let mut out = String::new();
-        for row in sel.start_row..=sel.end_row {
-            let (start_col, end_col) = match sel.mode {
-                SelectionMode::Block => (
-                    sel.start_col.min(grid.cols.saturating_sub(1)),
-                    sel.end_col.min(grid.cols.saturating_sub(1)),
-                ),
-                SelectionMode::Linear => {
-                    let start_col = if row == sel.start_row {
-                        sel.start_col
-                    } else {
-                        0
-                    };
-                    let end_col = if row == sel.end_row {
-                        sel.end_col.min(grid.cols.saturating_sub(1))
-                    } else {
-                        grid.cols.saturating_sub(1)
-                    };
-                    (start_col, end_col)
-                }
-            };
-            if start_col > end_col || start_col >= grid.cols {
-                continue;
-            }
-            let mut line = String::new();
-            for col in start_col..=end_col {
-                if let Some(cell) = Self::displayed_cell(grid, offset, col, row) {
-                    grid.push_cell_text(&mut line, cell);
-                } else {
-                    line.push(' ');
-                }
-            }
-            if matches!(sel.mode, SelectionMode::Block) {
-                out.push_str(&line);
-            } else {
-                out.push_str(line.trim_end_matches(' '));
-            }
-            if row != sel.end_row {
-                out.push('\n');
-            }
-        }
-        Some(out)
+        sel.text(&performer.grid)
     }
 
     fn copy_selection(&mut self) -> bool {
@@ -1499,7 +1604,6 @@ impl MainState {
             _ => return,
         };
         pane.scroll_view_offset = offset;
-        self.selection = None;
         self.begin_redraw();
     }
 
@@ -1544,13 +1648,20 @@ impl MainState {
     }
 
     fn selection_tuple(&self) -> Option<((usize, usize), (usize, usize))> {
-        let sel = self.selection?.normalized();
+        let sel = self.selection?;
         let (total_cols, total_rows) = self.current_grid_size();
         let rects = self.active_tab().tree.layout(total_cols, total_rows);
         let rect = rects.iter().find(|r| r.id == sel.pane_id)?;
+        let pane = self.active_tab().tree.find_leaf(sel.pane_id)?;
+        let performer = pane.performer.lock().ok()?;
+        if sel.alternate_screen != performer.alternate_screen_active() {
+            return None;
+        }
+        let ((start_col, start_row), (end_col, end_row)) =
+            sel.visible_range(&performer.grid, pane.scroll_view_offset, rect.rows)?;
         Some((
-            (sel.start_col + rect.col, sel.start_row + rect.row),
-            (sel.end_col + rect.col, sel.end_row + rect.row),
+            (start_col + rect.col, start_row + rect.row),
+            (end_col + rect.col, end_row + rect.row),
         ))
     }
 
@@ -1741,7 +1852,7 @@ impl MainState {
         // If the active pane has mouse reporting enabled, forward the wheel
         // event to the PTY (e.g. vim, less). Shift bypasses so the user can
         // always reach the local scrollback view.
-        if !self.shift_down() {
+        if !self.shift_down() && !self.is_drag_selecting {
             if let Some((_mode, sgr)) = self.active_mouse_reporting() {
                 let steps = amount.abs().ceil().max(1.0) as usize;
                 let base = if amount > 0.0 { 64u8 } else { 65u8 };
@@ -1762,19 +1873,12 @@ impl MainState {
             .ok()
             .map(|p| p.grid.scrollback_len())
             .unwrap_or(0);
-        let old_offset = pane.scroll_view_offset;
         if amount > 0.0 {
             // Scroll up: reveal older lines.
             pane.scroll_view_offset = (pane.scroll_view_offset + steps).min(scrollback_len);
         } else {
             // Scroll down: return toward live output.
             pane.scroll_view_offset = pane.scroll_view_offset.saturating_sub(steps);
-        }
-        let new_offset = pane.scroll_view_offset;
-        if new_offset != old_offset && self.selection.is_some() {
-            // The view shifted under the selection; its coordinates no longer
-            // match what is displayed, so drop it.
-            self.selection = None;
         }
         true
     }
@@ -1935,6 +2039,7 @@ impl App {
             config: self.config.clone(),
             mouse_pos: (0.0, 0.0),
             is_drag_selecting: false,
+            selection_scroll_deadline: None,
             selection: None,
             pressed_mouse_button: None,
             last_reported_mouse_cell: None,
@@ -2370,6 +2475,8 @@ impl ApplicationHandler<VoltEvent> for App {
 
             WindowEvent::Focused(false) => {
                 state.workspace_panel.drag_offset = None;
+                state.is_drag_selecting = false;
+                state.selection_scroll_deadline = None;
                 state.left_shift_down = false;
                 state.right_shift_down = false;
                 state.left_control_down = false;
@@ -2495,6 +2602,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     if let Some((pane_id, col, row)) = cell {
                         if pane_id == state.active_tab().tree.active_id {
                             if !state.shift_down()
+                                && !state.is_drag_selecting
                                 && state.last_reported_mouse_cell != Some((col, row))
                             {
                                 let _ = state.report_mouse_motion(col, row);
@@ -2520,6 +2628,16 @@ impl ApplicationHandler<VoltEvent> for App {
                 if btn_state == ElementState::Released && state.search_mouse_capture == Some(button)
                 {
                     state.search_mouse_capture = None;
+                    return;
+                }
+                // Finish the drag before tab-bar / card hit testing. A release
+                // above the terminal must not leave edge scrolling armed.
+                if button == MouseButton::Left
+                    && btn_state == ElementState::Released
+                    && state.is_drag_selecting
+                {
+                    state.is_drag_selecting = false;
+                    state.selection_scroll_deadline = None;
                     return;
                 }
                 if state.workspace_search.visible {
@@ -2749,7 +2867,9 @@ impl ApplicationHandler<VoltEvent> for App {
                     state.active_tab_mut().tree.active_id = pane_id;
                     // Shift bypasses app mouse reporting so selection still works
                     // inside TUIs (standard xterm behaviour).
-                    if !state.shift_down() && state.report_mouse_button(button, btn_state, col, row)
+                    if !state.shift_down()
+                        && !state.is_drag_selecting
+                        && state.report_mouse_button(button, btn_state, col, row)
                     {
                         return;
                     }
@@ -2759,13 +2879,46 @@ impl ApplicationHandler<VoltEvent> for App {
                     if btn_state == ElementState::Pressed {
                         if let Some((pane_id, col, row)) = state.pane_cell_from_mouse(mx, my) {
                             state.active_tab_mut().tree.active_id = pane_id;
+                            // Shift-click extends the existing anchor. It is
+                            // not a double-click even if it lands quickly on
+                            // the same cell, and it may cross viewports.
+                            let shift_click = state.shift_down();
+                            if shift_click {
+                                let extended = {
+                                    let pane = state.tabs[state.active_tab].tree.find_leaf(pane_id);
+                                    match (pane, state.selection.as_mut()) {
+                                        (Some(pane), Some(sel)) => {
+                                            pane.performer.lock().ok().is_some_and(|p| {
+                                                sel.extend_to(
+                                                    pane_id,
+                                                    p.alternate_screen_active(),
+                                                    &p.grid,
+                                                    pane.scroll_view_offset,
+                                                    col,
+                                                    row,
+                                                )
+                                            })
+                                        }
+                                        _ => false,
+                                    }
+                                };
+                                if extended {
+                                    state.click_count = 1;
+                                    state.last_click = None;
+                                    state.is_drag_selecting = true;
+                                    state.selection_scroll_deadline = None;
+                                    state.begin_redraw();
+                                    return;
+                                }
+                            }
                             let now = Instant::now();
-                            let same_spot = state.last_click.is_some_and(|(t, p, c, r)| {
-                                now.duration_since(t) < MULTI_CLICK_INTERVAL
-                                    && p == pane_id
-                                    && c == col
-                                    && r == row
-                            });
+                            let same_spot = !shift_click
+                                && state.last_click.is_some_and(|(t, p, c, r)| {
+                                    now.duration_since(t) < MULTI_CLICK_INTERVAL
+                                        && p == pane_id
+                                        && c == col
+                                        && r == row
+                                });
                             state.click_count = if same_spot {
                                 (state.click_count % 3) + 1
                             } else {
@@ -2777,25 +2930,32 @@ impl ApplicationHandler<VoltEvent> for App {
                                 3 => state.line_selection(pane_id, row),
                                 _ => None,
                             };
-                            state.selection = Some(expanded.unwrap_or(Selection {
-                                pane_id,
-                                mode: if state.modifiers.alt_key() {
-                                    SelectionMode::Block
-                                } else {
-                                    SelectionMode::Linear
-                                },
-                                start_col: col,
-                                start_row: row,
-                                end_col: col,
-                                end_row: row,
-                            }));
+                            state.selection = expanded.or_else(|| {
+                                let pane = state.tabs[state.active_tab].tree.find_leaf(pane_id)?;
+                                let p = pane.performer.lock().ok()?;
+                                Selection::at_viewport(
+                                    pane_id,
+                                    p.alternate_screen_active(),
+                                    if state.modifiers.alt_key() {
+                                        SelectionMode::Block
+                                    } else {
+                                        SelectionMode::Linear
+                                    },
+                                    &p.grid,
+                                    pane.scroll_view_offset,
+                                    col,
+                                    row,
+                                )
+                            });
                             // Word/line selections stay fixed; only single clicks
                             // start a drag so trackpad jitter can't collapse them.
                             state.is_drag_selecting = state.click_count == 1;
+                            state.selection_scroll_deadline = None;
                             state.begin_redraw();
                         }
                     } else {
                         state.is_drag_selecting = false;
+                        state.selection_scroll_deadline = None;
                     }
                 }
             }
@@ -2893,6 +3053,11 @@ impl ApplicationHandler<VoltEvent> for App {
                 {
                     state.active_tab_mut().tree.active_id = pane_id;
                     if state.report_mouse_wheel(delta, col, row) {
+                        // A stationary pointer now covers a different history
+                        // row; while dragging, extend to that newly shown row.
+                        if state.is_drag_selecting {
+                            state.update_selection_end(state.mouse_pos.0, state.mouse_pos.1);
+                        }
                         state.begin_redraw();
                     }
                 }
@@ -3983,6 +4148,11 @@ impl ApplicationHandler<VoltEvent> for App {
                 state.next_cursor_blink = Instant::now() + CURSOR_BLINK_INTERVAL;
             }
 
+            if let Some(deadline) = state.tick_selection_auto_scroll() {
+                next_blink_deadline =
+                    Some(next_blink_deadline.map_or(deadline, |d| d.min(deadline)));
+            }
+
             if needs_redraw {
                 if needs_full_redraw {
                     state.begin_redraw();
@@ -4010,6 +4180,22 @@ impl ApplicationHandler<VoltEvent> for App {
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
+    }
+}
+
+fn selection_scroll_direction(
+    y: f32,
+    top: f32,
+    bottom: f32,
+    cell_height: f32,
+) -> Option<SelectionScrollDirection> {
+    let middle = (top + bottom) * 0.5;
+    if y < top + cell_height && y < middle {
+        Some(SelectionScrollDirection::Up)
+    } else if y >= bottom - cell_height && y >= middle {
+        Some(SelectionScrollDirection::Down)
+    } else {
+        None
     }
 }
 
@@ -4309,7 +4495,94 @@ fn set_app_icon() {
 mod tests {
     use super::create_sample_config_if_missing;
 
-    use super::{Grid, MainState};
+    use super::{
+        advance_drag_selection, selection_scroll_direction, Grid, MainState, Selection,
+        SelectionMode, SelectionScrollDirection,
+    };
+
+    #[test]
+    fn drag_edge_direction_uses_own_pane_not_window_middle() {
+        use SelectionScrollDirection::{Down, Up};
+        assert_eq!(
+            selection_scroll_direction(100.0, 100.0, 200.0, 10.0),
+            Some(Up)
+        );
+        assert_eq!(
+            selection_scroll_direction(205.0, 100.0, 200.0, 10.0),
+            Some(Down)
+        );
+        assert_eq!(selection_scroll_direction(150.0, 100.0, 200.0, 10.0), None);
+        assert_eq!(
+            selection_scroll_direction(104.0, 100.0, 110.0, 10.0),
+            Some(Up)
+        );
+        assert_eq!(
+            selection_scroll_direction(106.0, 100.0, 110.0, 10.0),
+            Some(Down)
+        );
+    }
+
+    #[test]
+    fn edge_drag_repeats_until_history_boundary_and_keeps_anchor() {
+        use SelectionScrollDirection::{Down, Up};
+        let mut grid = Grid::new(4, 3);
+        for _ in 0..6 {
+            grid.scroll_up(0, 2, 1);
+        }
+        let mut offset = 0;
+        let mut selection =
+            Selection::at_viewport(1, false, SelectionMode::Linear, &grid, offset, 2, 2).unwrap();
+        let anchor = (selection.start_col, selection.start_row);
+        for _ in 0..6 {
+            assert!(advance_drag_selection(
+                &grid,
+                &mut offset,
+                &mut selection,
+                1,
+                false,
+                0,
+                0,
+                Up,
+            ));
+        }
+        assert_eq!(offset, 6);
+        assert_eq!(selection.end_row, 0);
+        assert!(!advance_drag_selection(
+            &grid,
+            &mut offset,
+            &mut selection,
+            1,
+            false,
+            0,
+            0,
+            Up,
+        ));
+        for _ in 0..6 {
+            assert!(advance_drag_selection(
+                &grid,
+                &mut offset,
+                &mut selection,
+                1,
+                false,
+                3,
+                2,
+                Down,
+            ));
+        }
+        assert_eq!(offset, 0);
+        assert_eq!((selection.start_col, selection.start_row), anchor);
+        assert_eq!((selection.end_col, selection.end_row), (3, anchor.1));
+        assert!(!advance_drag_selection(
+            &grid,
+            &mut offset,
+            &mut selection,
+            1,
+            false,
+            3,
+            2,
+            Down,
+        ));
+    }
 
     #[test]
     fn native_text_respects_modal_input_and_read_only_panes() {

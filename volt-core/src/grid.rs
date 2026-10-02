@@ -32,6 +32,9 @@ pub struct Grid {
     history_enabled: bool,
     scrollback_start: usize, // index of the oldest row in the ring
     scrollback_count: usize, // number of rows currently stored
+    /// Absolute row number of the oldest retained scrollback row. This only
+    /// advances when history is evicted, so UI selections survive new output.
+    scrollback_origin: usize,
     /// Maximum number of scrollback lines to retain.
     pub scrollback_limit: usize,
     /// Blank-row template used for fast row clears (memcpy instead of
@@ -106,6 +109,7 @@ impl Grid {
             history_enabled: true,
             scrollback_start: 0,
             scrollback_count: 0,
+            scrollback_origin: 0,
             scrollback_limit: 10_000,
             blank_row: Vec::new(),
             erase_cell: Cell::default(),
@@ -141,6 +145,7 @@ impl Grid {
         self.scrollback_wrapped.clear();
         self.scrollback_start = 0;
         self.scrollback_count = 0;
+        self.scrollback_origin = 0;
         self.history_enabled = true;
         self.scrollback_limit = 10_000;
         self.blank_row.clear();
@@ -186,6 +191,7 @@ impl Grid {
         if let Some(marks) = &mut self.prompt_marks {
             marks.evict(skip);
         }
+        self.scrollback_origin = self.scrollback_origin.saturating_add(skip);
         self.scrollback_count -= skip;
         self.scrollback_start = 0;
         self.scrollback_buf = cells;
@@ -783,6 +789,8 @@ impl Grid {
             self.scrollback_wrapped = result.history_wrapped[skip..].to_vec();
             self.scrollback_count = history_count - skip;
             self.scrollback_start = 0;
+            // Reflow changes row identities; callers must discard selections.
+            self.scrollback_origin = 0;
             self.cells = result.cells;
             self.soft_wrapped = result.wrapped;
             self.cursor_col = result.cursor_col;
@@ -895,6 +903,7 @@ impl Grid {
                     self.scrollback_wrapped[self.scrollback_start] =
                         self.soft_wrapped[self.row_map[i]];
                     self.scrollback_start = (self.scrollback_start + 1) % self.scrollback_limit;
+                    self.scrollback_origin = self.scrollback_origin.saturating_add(1);
                 }
             }
         }
@@ -970,6 +979,21 @@ impl Grid {
     /// Number of lines stored in the scrollback buffer.
     pub fn scrollback_len(&self) -> usize {
         self.scrollback_count
+    }
+
+    /// Absolute number of the oldest retained row. A selection can use this
+    /// to distinguish the same ring slot before and after eviction.
+    pub fn scrollback_origin(&self) -> usize {
+        self.scrollback_origin
+    }
+
+    /// Map a displayed pane row to a stable row number in history + live grid.
+    /// The displayed rows are contiguous even when the viewport mixes both.
+    pub fn viewport_absolute_row(&self, offset: usize, row: usize) -> Option<usize> {
+        (row < self.rows).then(|| {
+            self.scrollback_origin
+                .saturating_add(self.scrollback_count - offset.min(self.scrollback_count) + row)
+        })
     }
 
     /// Returns the cell at `col` in a scrollback row.
@@ -1056,6 +1080,7 @@ impl Grid {
     /// Discard all scrollback history (e.g. Cmd+K clear).
     pub fn clear_scrollback(&mut self) {
         self.prompt_marks = None;
+        self.scrollback_origin = self.scrollback_origin.saturating_add(self.scrollback_count);
         self.scrollback_buf.clear();
         self.scrollback_wrapped.clear();
         self.scrollback_start = 0;
@@ -1141,6 +1166,7 @@ mod tests {
             history_enabled,
             scrollback_start,
             scrollback_count,
+            scrollback_origin,
             scrollback_limit,
             blank_row,
             erase_cell,
@@ -1156,6 +1182,30 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn absolute_rows_survive_scroll_and_track_history_eviction() {
+        let mut grid = Grid::new(3, 2);
+        grid.set_scrollback_limit(2);
+        assert_eq!(grid.viewport_absolute_row(0, 0), Some(0));
+        grid.scroll_up(0, 1, 1);
+        grid.scroll_up(0, 1, 1);
+        assert_eq!(grid.scrollback_origin(), 0);
+        assert_eq!(grid.viewport_absolute_row(2, 0), Some(0));
+        assert_eq!(grid.viewport_absolute_row(0, 0), Some(2));
+        assert_eq!(grid.viewport_absolute_row(0, 2), None);
+
+        grid.scroll_up(0, 1, 1);
+        assert_eq!(grid.scrollback_origin(), 1);
+        assert_eq!(grid.viewport_absolute_row(2, 0), Some(1));
+        assert_eq!(grid.viewport_absolute_row(0, 0), Some(3));
+        grid.set_scrollback_limit(1);
+        assert_eq!(grid.scrollback_origin(), 2);
+        assert_eq!(grid.viewport_absolute_row(1, 0), Some(2));
+        grid.clear_scrollback();
+        assert_eq!(grid.scrollback_origin(), 3);
+        assert_eq!(grid.viewport_absolute_row(0, 0), Some(3));
+    }
 
     #[test]
     fn long_unicode_overwrite_reclaims_intern_pool() {

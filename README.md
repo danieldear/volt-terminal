@@ -15,7 +15,7 @@
 - **GPU-accelerated rendering** — Metal-backed via `wgpu`, smooth at any size
 - **VTE-based parsing** — common ANSI/xterm sequences; advanced DCS and some OSC features remain unsupported
 - **Tabs + pane splits** — split right/left/up/down, drag-resizable dividers
-- **Full mouse support** — click, scroll, drag selection, double-click word / triple-click line select
+- **Full mouse support** — click, scroll, Shift-click extension, drag selection with edge auto-scroll through retained history, double-click word / triple-click line select
 - **Native macOS menu bar** — File/Edit/View/Window menus and a dynamic Services submenu; keyboard shortcuts are handled by Volt, not menu-item accelerators
 - **Native right-click context menu** — Copy/Paste, split in any direction, reset terminal, read-only toggle, rename tab/terminal
 - **Workspace Search** (`Cmd+Shift+P`) — floating local search for fuzzy file paths, saved text, retained output/current TUI screen, branches, worktrees, and task previews. [Scope and limits](docs/workspace-search.md).
