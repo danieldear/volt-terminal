@@ -130,6 +130,22 @@ pub struct Pty {
 }
 
 impl Pty {
+    /// A password-style prompt usually keeps canonical input on while
+    /// disabling terminal echo. Full-screen TUIs often disable both; treating
+    /// every raw-mode program as a password prompt would hold macOS Secure
+    /// Event Input for the entire editor session. This is only a heuristic:
+    /// callers must also offer a manual override for other prompt styles.
+    #[cfg(target_os = "macos")]
+    pub fn likely_password_prompt(&self) -> Option<bool> {
+        let fd = self.master.as_raw_fd()?;
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let termios = unsafe { termios.assume_init() };
+        Some(termios.c_lflag & libc::ECHO == 0 && termios.c_lflag & libc::ICANON != 0)
+    }
+
     /// Owned shell process identity for off-thread local workspace discovery.
     pub fn child_pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(|child| child.process_id())
@@ -488,6 +504,63 @@ impl Drop for Pty {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn canonical_no_echo_is_detected_without_treating_raw_tui_as_password() {
+        let (mut pty, _, _rx) = Pty::spawn(
+            "/bin/sh",
+            &["-c".into(), "stty -echo; read answer; stty echo".into()],
+            80,
+            24,
+            || {},
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while pty.likely_password_prompt() != Some(true) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no-echo prompt not observed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        pty.write(b"test\n").unwrap();
+        while pty.likely_password_prompt() == Some(true) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "echo was not restored"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let (pty, _, _rx_raw) = Pty::spawn(
+            "/bin/sh",
+            &["-c".into(), "stty raw -echo; read answer".into()],
+            80,
+            24,
+            || {},
+        )
+        .unwrap();
+        // Wait for the raw-mode setup before asserting; the initial shell
+        // state also returns false, so check ICANON directly on the master.
+        while pty
+            .master
+            .as_raw_fd()
+            .and_then(|fd| {
+                let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
+                (unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) } == 0)
+                    .then(|| unsafe { t.assume_init() })
+            })
+            .is_some_and(|t| t.c_lflag & libc::ICANON != 0)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "raw mode not observed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(pty.likely_password_prompt(), Some(false));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

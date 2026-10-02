@@ -9,6 +9,7 @@ pub mod symbols;
 pub mod workspace_card;
 
 pub mod search_palette;
+pub mod tab_color;
 
 pub mod theme_editor;
 

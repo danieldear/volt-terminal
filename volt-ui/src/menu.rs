@@ -5,6 +5,7 @@
 #![cfg(target_os = "macos")]
 
 use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use volt_renderer::tab_color::TabColor;
 
 /// Every action a menu-bar item or context-menu item can trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,10 +38,51 @@ pub enum MenuAction {
     SearchGoogle,
     CustomizeTheme,
     OpenThemesFolder,
+    ToggleSecureInput,
 }
 
 /// Menu ids of theme items are this prefix plus the theme id.
 const THEME_ID_PREFIX: &str = "volt.theme:";
+const TAB_COLOR_ID_PREFIX: &str = "volt.tab_color:";
+
+pub fn tab_color_menu_id(color: Option<TabColor>) -> String {
+    format!(
+        "{TAB_COLOR_ID_PREFIX}{}",
+        color.map_or("clear", TabColor::id)
+    )
+}
+
+/// `Some(None)` clears the accent; plain `None` means unrelated/invalid ID.
+pub fn tab_color_from_id(id: &str) -> Option<Option<TabColor>> {
+    let value = id.strip_prefix(TAB_COLOR_ID_PREFIX)?;
+    if value == "clear" {
+        Some(None)
+    } else {
+        TabColor::from_id(value).map(Some)
+    }
+}
+
+fn tab_color_submenu(selected: Option<TabColor>) -> Submenu {
+    let menu = Submenu::new("Tab Color", true);
+    let _ = menu.append(&CheckMenuItem::with_id(
+        tab_color_menu_id(None),
+        "No Color",
+        true,
+        selected.is_none(),
+        None,
+    ));
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    for color in TabColor::ALL {
+        let _ = menu.append(&CheckMenuItem::with_id(
+            tab_color_menu_id(Some(color)),
+            color.label(),
+            true,
+            selected == Some(color),
+            None,
+        ));
+    }
+    menu
+}
 
 /// The theme id a Volt ▸ Theme item stands for, if `id` is one.
 pub fn theme_from_id(id: &str) -> Option<&str> {
@@ -79,6 +121,7 @@ impl MenuAction {
             SearchGoogle => "volt.search_google",
             CustomizeTheme => "volt.customize_theme",
             OpenThemesFolder => "volt.open_themes_folder",
+            ToggleSecureInput => "volt.toggle_secure_input",
         }
     }
 
@@ -115,6 +158,7 @@ impl MenuAction {
             "volt.search_google" => SearchGoogle,
             "volt.customize_theme" => CustomizeTheme,
             "volt.open_themes_folder" => OpenThemesFolder,
+            "volt.toggle_secure_input" => ToggleSecureInput,
             _ => return None,
         })
     }
@@ -161,6 +205,13 @@ impl MenuAction {
 pub fn install_app_menu() -> AppMenu {
     let menu = Menu::new();
     let theme_menu = Submenu::new("Theme", true);
+    let secure_input_item = CheckMenuItem::with_id(
+        MenuAction::ToggleSecureInput.id(),
+        "Secure Keyboard Entry (manual)",
+        true,
+        false,
+        None,
+    );
 
     let app_menu = Submenu::new("Volt", true);
     let _ = app_menu.append_items(&[
@@ -169,6 +220,7 @@ pub fn install_app_menu() -> AppMenu {
         &MenuAction::OpenSettings.item("Settings…"),
         &MenuAction::ReloadSettings.item("Reload Settings"),
         &theme_menu,
+        &secure_input_item,
         &PredefinedMenuItem::separator(),
         &PredefinedMenuItem::services(None),
         &PredefinedMenuItem::separator(),
@@ -226,6 +278,7 @@ pub fn install_app_menu() -> AppMenu {
         _menu: menu,
         theme_menu,
         theme_items: Vec::new(),
+        secure_input_item,
     }
 }
 
@@ -235,9 +288,13 @@ pub struct AppMenu {
     _menu: Menu,
     theme_menu: Submenu,
     theme_items: Vec<(String, CheckMenuItem)>,
+    secure_input_item: CheckMenuItem,
 }
 
 impl AppMenu {
+    pub fn set_manual_secure_input(&self, enabled: bool) {
+        self.secure_input_item.set_checked(enabled);
+    }
     /// List `themes` (id, display name, built-in?) with `current` checked:
     /// built-ins, then user themes, then the editor and folder items. Only
     /// rebuilds when the list changed; otherwise just moves the check mark
@@ -302,8 +359,14 @@ impl AppMenu {
 ///   filtered to specific apps — the OS decides what's registered, not
 ///   Volt. It's kept on the main app menu (Volt ▸ Services) instead, where
 ///   it's discoverable without cluttering a menu about *this pane*.
-pub fn build_context_menu(read_only: bool, has_selection: bool) -> Menu {
+pub fn build_context_menu(
+    read_only: bool,
+    has_selection: bool,
+    tab_color: Option<TabColor>,
+    custom_tab_bar: bool,
+) -> Menu {
     let menu = Menu::new();
+    let color_menu = tab_color_submenu(tab_color);
     let _ = menu.append_items(&[
         &MenuAction::Copy.item_enabled("Copy", has_selection),
         &MenuAction::Paste.item("Paste"),
@@ -324,9 +387,42 @@ pub fn build_context_menu(read_only: bool, has_selection: bool) -> Menu {
         ),
         &PredefinedMenuItem::separator(),
         &MenuAction::ChangeTabTitle.item("Change Tab Title…"),
+    ]);
+    if custom_tab_bar {
+        let _ = menu.append(&color_menu);
+    }
+    let _ = menu.append_items(&[
         &MenuAction::ChangeTerminalTitle.item("Change Terminal Title…"),
         &PredefinedMenuItem::separator(),
         &MenuAction::SearchGoogle.item_enabled("Search With Google", has_selection),
     ]);
     menu
+}
+
+/// Right-clicking a tab edits that tab, including a background tab; it does
+/// not have to switch the active PTY first.
+pub fn build_tab_context_menu(tab_color: Option<TabColor>) -> Menu {
+    let menu = Menu::new();
+    let color_menu = tab_color_submenu(tab_color);
+    let _ = menu.append_items(&[
+        &MenuAction::ChangeTabTitle.item("Change Tab Title…"),
+        &color_menu,
+    ]);
+    menu
+}
+
+#[cfg(test)]
+mod tab_color_tests {
+    use super::*;
+
+    #[test]
+    fn every_tab_color_menu_id_round_trips_and_clear_is_distinct() {
+        for color in volt_renderer::tab_color::TabColor::ALL {
+            let id = tab_color_menu_id(Some(color));
+            assert_eq!(tab_color_from_id(&id), Some(Some(color)));
+        }
+        assert_eq!(tab_color_from_id(&tab_color_menu_id(None)), Some(None));
+        assert_eq!(tab_color_from_id("volt.theme:amber"), None);
+        assert_eq!(tab_color_from_id("volt.tab_color:not-a-color"), None);
+    }
 }

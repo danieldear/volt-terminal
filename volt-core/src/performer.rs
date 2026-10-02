@@ -10,6 +10,24 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use volt_config::Color;
 use vte::Perform;
 
+/// OSC 0/2 is untrusted output. It must not turn a terminal title into an
+/// unbounded allocation or put control/bidi formatters into native chrome.
+fn safe_terminal_title(raw: &[u8]) -> Option<String> {
+    if raw.len() > 512 {
+        return None;
+    }
+    let title = std::str::from_utf8(raw).ok()?;
+    Some(
+        title
+            .chars()
+            .filter(|c| {
+                !c.is_control() && !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            })
+            .take(128)
+            .collect(),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseTrackingMode {
     Off,
@@ -904,11 +922,36 @@ fn percent_decode(input: &str) -> String {
 }
 
 fn parse_osc7_path(raw: &[u8]) -> Option<PathBuf> {
+    // OSC 7 comes from the child process, and remote sessions may emit their
+    // own host's path. Never turn a remote/forged host into local workspace
+    // discovery or use an unbounded/control-containing path.
+    if raw.len() > 4096 {
+        return None;
+    }
     let s = std::str::from_utf8(raw).ok()?;
     let rest = s.strip_prefix("file://")?;
     let slash = rest.find('/')?;
-    let path = &rest[slash..];
-    Some(PathBuf::from(percent_decode(path)))
+    let host = &rest[..slash];
+    if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+        #[cfg(unix)]
+        {
+            let mut local = [0u8; 256];
+            if unsafe { libc::gethostname(local.as_mut_ptr().cast(), local.len()) } != 0 {
+                return None;
+            }
+            let end = local.iter().position(|b| *b == 0).unwrap_or(local.len());
+            if !host.eq_ignore_ascii_case(std::str::from_utf8(&local[..end]).ok()?) {
+                return None;
+            }
+        }
+        #[cfg(not(unix))]
+        return None;
+    }
+    let path = percent_decode(&rest[slash..]);
+    if path.chars().any(char::is_control) {
+        return None;
+    }
+    Some(PathBuf::from(path))
 }
 
 fn char_display_width(c: char) -> usize {
@@ -1071,8 +1114,9 @@ impl Perform for Performer {
         }
 
         if params.len() >= 2 && (params[0] == b"0" || params[0] == b"2") {
-            let title = String::from_utf8_lossy(params[1]).to_string();
-            self.pending_events.push(CoreEvent::TitleChanged(title));
+            if let Some(title) = safe_terminal_title(params[1]) {
+                self.pending_events.push(CoreEvent::TitleChanged(title));
+            }
             return;
         }
 
@@ -1598,6 +1642,16 @@ mod tests {
     }
 
     #[test]
+    fn terminal_titles_are_bounded_and_strip_chrome_controls() {
+        assert_eq!(
+            safe_terminal_title("okay\n\u{202e}bad".as_bytes()).as_deref(),
+            Some("okaybad")
+        );
+        assert!(safe_terminal_title(&vec![b'x'; 513]).is_none());
+        assert!(safe_terminal_title(&[0xff]).is_none());
+    }
+
+    #[test]
     fn test_osc7_cwd_event() {
         let mut p = Performer::new(80, 24);
         feed(&mut p, b"\x1b]7;file:///tmp/my%20dir\x07");
@@ -1605,6 +1659,16 @@ mod tests {
             Some(CoreEvent::CwdChanged(path)) => assert_eq!(path, PathBuf::from("/tmp/my dir")),
             other => panic!("expected cwd event, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn osc7_rejects_remote_hosts_and_control_paths() {
+        assert!(parse_osc7_path(b"file://remote.example/tmp/repo").is_none());
+        assert!(parse_osc7_path(b"file:///tmp/%00secret").is_none());
+        assert_eq!(
+            parse_osc7_path(b"file://localhost/tmp/repo"),
+            Some(PathBuf::from("/tmp/repo"))
+        );
     }
 
     #[test]

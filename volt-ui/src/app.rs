@@ -170,6 +170,8 @@ struct MainState {
     /// any. While `Some`, keyboard input is captured by the prompt instead
     /// of being sent to the terminal.
     active_prompt: Option<crate::prompt::TextPrompt>,
+    /// A tab-bar context menu may rename an inactive tab without switching it.
+    rename_tab_target: Option<usize>,
     search_dirty: bool,
     search_target: Option<(usize, usize)>,
     last_search_refresh: Instant,
@@ -1491,62 +1493,54 @@ impl MainState {
     }
 
     fn paste_clipboard(&mut self) {
-        // Clipboard access below is macOS-only, like the rest of paste.
         #[cfg(target_os = "macos")]
-        if self.theme_editor.is_some() {
-            match std::process::Command::new("pbpaste").output() {
-                Ok(output) if output.status.success() => {
-                    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-                    if let Some(editor) = self.theme_editor.as_mut() {
-                        let outcome = editor.paste(&text);
-                        self.apply_editor_outcome(outcome);
-                    }
-                }
-                Ok(output) => eprintln!("volt-ui: pbpaste exited with {}", output.status),
-                Err(err) => eprintln!("volt-ui: failed to launch pbpaste: {err}"),
+        {
+            if self.theme_editor.is_none()
+                && !self.workspace_search.visible
+                && self.workspace_panel.visible
+                && self.workspace_panel.focused
+            {
+                return;
             }
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        if !self.workspace_search.visible
-            && self.workspace_panel.visible
-            && self.workspace_panel.focused
-        {
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            match std::process::Command::new("pbpaste").output() {
-                Ok(output) => {
-                    if output.status.success() {
-                        if self.workspace_search.visible {
-                            self.workspace_search
-                                .edit(&String::from_utf8_lossy(&output.stdout));
-                            self.sync_search();
-                            return;
-                        }
-                        let bracketed = self
-                            .tabs
-                            .get(self.active_tab)
-                            .and_then(|t| t.active_pane().performer.lock().ok())
-                            .map(|p| p.bracketed_paste_mode())
-                            .unwrap_or(false);
-                        if bracketed {
-                            // Never let pasted bytes terminate bracketed-paste mode early.
-                            let data = strip_bracketed_paste_end(&output.stdout);
-                            let mut wrapped = Vec::with_capacity(data.len() + 12);
-                            wrapped.extend_from_slice(b"\x1b[200~");
-                            wrapped.extend_from_slice(&data);
-                            wrapped.extend_from_slice(b"\x1b[201~");
-                            self.send_pty_input(&wrapped);
-                        } else {
-                            self.send_pty_input(&output.stdout);
-                        }
-                    } else {
-                        eprintln!("volt-ui: pbpaste exited with {}", output.status);
-                    }
+            let data = match read_bounded_command_output(
+                &mut std::process::Command::new("/usr/bin/pbpaste"),
+                MAX_CLIPBOARD_BYTES,
+            ) {
+                Ok(data) => data,
+                Err(err) => {
+                    eprintln!("volt-ui: paste failed: {err}");
+                    self.renderer
+                        .set_top_alert(Some(format!("Paste unavailable: {err}")));
+                    self.begin_redraw();
+                    return;
                 }
-                Err(err) => eprintln!("volt-ui: failed to launch pbpaste: {err}"),
+            };
+            if let Some(editor) = self.theme_editor.as_mut() {
+                let outcome = editor.paste(&String::from_utf8_lossy(&data));
+                self.apply_editor_outcome(outcome);
+                return;
+            }
+            if self.workspace_search.visible {
+                self.workspace_search.edit(&String::from_utf8_lossy(&data));
+                self.sync_search();
+                return;
+            }
+            let bracketed = self
+                .tabs
+                .get(self.active_tab)
+                .and_then(|t| t.active_pane().performer.lock().ok())
+                .map(|p| p.bracketed_paste_mode())
+                .unwrap_or(false);
+            if bracketed {
+                // Never let pasted bytes terminate bracketed-paste mode early.
+                let data = strip_bracketed_paste_end(&data);
+                let mut wrapped = Vec::with_capacity(data.len() + 12);
+                wrapped.extend_from_slice(b"\x1b[200~");
+                wrapped.extend_from_slice(&data);
+                wrapped.extend_from_slice(b"\x1b[201~");
+                self.send_pty_input(&wrapped);
+            } else {
+                self.send_pty_input(&data);
             }
         }
     }
@@ -1569,7 +1563,7 @@ impl MainState {
     }
 
     #[cfg(target_os = "macos")]
-    fn open_rename_prompt(&mut self, kind: crate::prompt::PromptKind) {
+    fn open_rename_prompt(&mut self, kind: crate::prompt::PromptKind, tab: Option<usize>) {
         if self.theme_editor.is_some() {
             return;
         }
@@ -1577,8 +1571,12 @@ impl MainState {
         self.renderer.search_palette = None;
         self.search_dirty = false;
         self.search_target = None;
+        self.rename_tab_target = tab.filter(|&i| i < self.tabs.len());
         let custom = match kind {
-            crate::prompt::PromptKind::RenameTab => self.active_tab().custom_title.as_deref(),
+            crate::prompt::PromptKind::RenameTab => self
+                .tabs
+                .get(self.rename_tab_target.unwrap_or(self.active_tab))
+                .and_then(|tab| tab.custom_title.as_deref()),
             crate::prompt::PromptKind::RenameTerminal => {
                 self.active_tab().active_pane().custom_title.as_deref()
             }
@@ -1608,11 +1606,14 @@ impl MainState {
             }
             crate::prompt::PromptKind::RenameTab => {
                 let text = prompt.text();
-                self.active_tab_mut().custom_title = if text.trim().is_empty() {
-                    None
-                } else {
-                    Some(text)
-                };
+                let target = self.rename_tab_target.take().unwrap_or(self.active_tab);
+                if let Some(tab) = self.tabs.get_mut(target) {
+                    tab.custom_title = if text.trim().is_empty() {
+                        None
+                    } else {
+                        Some(text)
+                    };
+                }
             }
             crate::prompt::PromptKind::RenameTerminal => {
                 let text = prompt.text();
@@ -2019,6 +2020,16 @@ pub struct App {
     /// new-window CWD inheritance use this window on every platform.
     focused_window: Option<WindowId>,
     #[cfg(target_os = "macos")]
+    secure_input: crate::secure_input::SecureInput,
+    #[cfg(target_os = "macos")]
+    manual_secure_input: bool,
+    #[cfg(target_os = "macos")]
+    next_secure_input_poll: Instant,
+    /// Target of the most recently opened tab/terminal context menu. Native
+    /// menu events are delivered asynchronously, so the pointer is gone then.
+    #[cfg(target_os = "macos")]
+    context_tab_target: Option<(WindowId, usize)>,
+    #[cfg(target_os = "macos")]
     /// Must stay alive for the app's full lifetime — see the doc comment on
     /// `menu::install_app_menu`. Dropping this frees the Rust-side data
     /// every native `NSMenuItem`'s action handler reads via a raw pointer,
@@ -2045,6 +2056,14 @@ impl App {
             pty_wake_pending: Arc::new(AtomicBool::new(false)),
             rt,
             focused_window: None,
+            #[cfg(target_os = "macos")]
+            secure_input: crate::secure_input::SecureInput::default(),
+            #[cfg(target_os = "macos")]
+            manual_secure_input: false,
+            #[cfg(target_os = "macos")]
+            next_secure_input_poll: Instant::now(),
+            #[cfg(target_os = "macos")]
+            context_tab_target: None,
             #[cfg(target_os = "macos")]
             app_menu: None,
         })
@@ -2193,6 +2212,7 @@ impl App {
             last_native_title: String::new(),
             last_tab_bar_click: None,
             active_prompt: None,
+            rename_tab_target: None,
             search_dirty: false,
             search_target: None,
             last_search_refresh: Instant::now(),
@@ -2383,6 +2403,50 @@ impl App {
     }
 
     #[cfg(target_os = "macos")]
+    fn update_secure_input(&mut self) {
+        let focused = self
+            .focused_window
+            .filter(|id| self.windows.contains_key(id));
+        let likely_password = focused
+            .and_then(|id| self.windows.get(&id))
+            .and_then(|state| {
+                state
+                    .active_tab()
+                    .active_pane()
+                    .pty
+                    .likely_password_prompt()
+            })
+            .unwrap_or(false);
+        self.secure_input
+            .set(focused.is_some() && (self.manual_secure_input || likely_password));
+        let enabled = self.secure_input.enabled();
+        for (id, state) in &mut self.windows {
+            let visible = Some(*id) == focused && enabled;
+            if state.renderer.secure_input_active != visible {
+                state.renderer.secure_input_active = visible;
+                state.begin_redraw();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_tab_color(&mut self, color: Option<volt_renderer::tab_color::TabColor>) {
+        let target = self.context_tab_target.take().or_else(|| {
+            let id = self.target_window_id()?;
+            Some((id, self.windows.get(&id)?.active_tab))
+        });
+        let Some((window_id, tab_index)) = target else {
+            return;
+        };
+        if let Some(state) = self.windows.get_mut(&window_id) {
+            if let Some(tab) = state.tabs.get_mut(tab_index) {
+                tab.color = color;
+                state.begin_redraw();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     /// Route a native menu-bar or context-menu click to the same
     /// `MainState`/`App` methods the matching keyboard shortcut calls, so
     /// the two paths can never drift apart.
@@ -2392,6 +2456,17 @@ impl App {
         action: crate::menu::MenuAction,
     ) {
         use crate::menu::MenuAction as A;
+
+        let context_tab_target = self.context_tab_target.take();
+
+        if action == A::ToggleSecureInput {
+            self.manual_secure_input = !self.manual_secure_input;
+            if let Some(menu) = &self.app_menu {
+                menu.set_manual_secure_input(self.manual_secure_input);
+            }
+            self.update_secure_input();
+            return;
+        }
 
         match action {
             A::NewWindow => {
@@ -2409,7 +2484,13 @@ impl App {
             _ => {}
         }
 
-        let Some(window_id) = self.target_window_id() else {
+        let target_window = (action == A::ChangeTabTitle)
+            .then_some(context_tab_target)
+            .flatten()
+            .map(|(id, _)| id)
+            .filter(|id| self.windows.contains_key(id))
+            .or_else(|| self.target_window_id());
+        let Some(window_id) = target_window else {
             return;
         };
 
@@ -2523,9 +2604,14 @@ impl App {
                 pane.read_only = !pane.read_only;
                 state.begin_redraw();
             }
-            A::ChangeTabTitle => state.open_rename_prompt(crate::prompt::PromptKind::RenameTab),
+            A::ChangeTabTitle => state.open_rename_prompt(
+                crate::prompt::PromptKind::RenameTab,
+                context_tab_target
+                    .filter(|(id, _)| *id == window_id)
+                    .map(|(_, index)| index),
+            ),
             A::ChangeTerminalTitle => {
-                state.open_rename_prompt(crate::prompt::PromptKind::RenameTerminal)
+                state.open_rename_prompt(crate::prompt::PromptKind::RenameTerminal, None)
             }
             A::SearchGoogle => {
                 if let Some(text) = state.selected_text() {
@@ -2546,6 +2632,7 @@ impl App {
             | A::OpenThemesFolder => {
                 unreachable!("handled in the early-return blocks above")
             }
+            A::ToggleSecureInput => unreachable!("handled before window routing"),
         }
     }
 }
@@ -2621,11 +2708,15 @@ fn create_sample_config_if_missing(path: &std::path::Path) -> std::io::Result<()
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The user may later add [ai].api_key to this sample config.
+        options.mode(0o600);
+    }
+    match options.open(path) {
         Ok(mut file) => file.write_all(sample_config_toml().as_bytes()),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(err) => Err(err),
@@ -2635,6 +2726,25 @@ fn create_sample_config_if_missing(path: &std::path::Path) -> std::io::Result<()
 #[cfg(target_os = "macos")]
 fn should_show_context_menu(shift_down: bool, mouse_reporting: bool, read_only: bool) -> bool {
     shift_down || read_only || !mouse_reporting
+}
+
+#[cfg(target_os = "macos")]
+fn show_native_context_menu(window: &Window, menu: &muda::Menu) {
+    use muda::ContextMenu;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    if let Ok(handle) = window.window_handle() {
+        if let RawWindowHandle::AppKit(h) = handle.as_raw() {
+            // AppKit knows the actual click position, including Retina scale
+            // and NSView coordinate flipping; do not transform it ourselves.
+            unsafe {
+                menu.show_context_menu_for_nsview(
+                    h.ns_view.as_ptr() as *const std::ffi::c_void,
+                    None,
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2733,7 +2843,9 @@ impl ApplicationHandler<VoltEvent> for App {
             }
             #[cfg(target_os = "macos")]
             VoltEvent::Menu(id) => {
-                if let Some(theme) = crate::menu::theme_from_id(&id) {
+                if let Some(color) = crate::menu::tab_color_from_id(&id) {
+                    self.set_tab_color(color);
+                } else if let Some(theme) = crate::menu::theme_from_id(&id) {
                     self.select_theme(theme, None);
                 } else if let Some(action) = crate::menu::MenuAction::from_id(&id) {
                     self.handle_menu_action(_event_loop, action);
@@ -2808,6 +2920,17 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::Focused(false) => {
+                #[cfg(target_os = "macos")]
+                {
+                    if self.focused_window == Some(window_id) {
+                        self.focused_window = None;
+                        self.secure_input.set(false);
+                        if state.renderer.secure_input_active {
+                            state.renderer.secure_input_active = false;
+                            state.begin_redraw();
+                        }
+                    }
+                }
                 state.workspace_panel.drag_offset = None;
                 state.is_drag_selecting = false;
                 state.selection_scroll_deadline = None;
@@ -2826,6 +2949,10 @@ impl ApplicationHandler<VoltEvent> for App {
                     configure_macos_tab_chrome(state.window.as_ref(), native_tab_count);
                 }
                 self.focused_window = Some(window_id);
+                #[cfg(target_os = "macos")]
+                {
+                    self.next_secure_input_poll = Instant::now();
+                }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -3077,6 +3204,21 @@ impl ApplicationHandler<VoltEvent> for App {
                 let (mx, my) = state.mouse_pos;
                 let in_tab_bar = state.show_custom_tab_bar() && my < state.current_tab_bar_height();
                 if in_tab_bar {
+                    #[cfg(target_os = "macos")]
+                    if button == MouseButton::Right && btn_state == ElementState::Pressed {
+                        let layout = TabLayout::compute(
+                            state.window.inner_size().width as f32,
+                            state.current_tab_bar_height(),
+                            state.tabs.len(),
+                            state.renderer.scale_factor,
+                        );
+                        if let Some(index) = layout.hit_tab(mx, my, state.tabs.len()) {
+                            self.context_tab_target = Some((window_id, index));
+                            let menu = crate::menu::build_tab_context_menu(state.tabs[index].color);
+                            show_native_context_menu(state.window.as_ref(), &menu);
+                        }
+                        return;
+                    }
                     if button == MouseButton::Left && btn_state == ElementState::Pressed {
                         let hit_target = state.handle_click(mx, my);
                         if !hit_target {
@@ -3122,26 +3264,14 @@ impl ApplicationHandler<VoltEvent> for App {
                             // already selected instead of discarding it first.
                             let read_only = state.active_tab().active_pane().read_only;
                             let has_selection = state.selected_text().is_some();
-                            let context_menu =
-                                crate::menu::build_context_menu(read_only, has_selection);
-                            use muda::ContextMenu;
-                            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                            if let Ok(handle) = state.window.window_handle() {
-                                if let RawWindowHandle::AppKit(h) = handle.as_raw() {
-                                    // Passing `None` here (rather than a position we
-                                    // compute ourselves) asks muda to use AppKit's
-                                    // own `NSEvent.mouseLocation` directly — this
-                                    // sidesteps our own physical/logical + NSView
-                                    // coordinate-flip math, which was landing the
-                                    // menu away from the actual click point.
-                                    unsafe {
-                                        context_menu.show_context_menu_for_nsview(
-                                            h.ns_view.as_ptr() as *const std::ffi::c_void,
-                                            None,
-                                        );
-                                    }
-                                }
-                            }
+                            self.context_tab_target = Some((window_id, state.active_tab));
+                            let context_menu = crate::menu::build_context_menu(
+                                read_only,
+                                has_selection,
+                                state.active_tab().color,
+                                state.show_custom_tab_bar(),
+                            );
+                            show_native_context_menu(state.window.as_ref(), &context_menu);
                             state.begin_redraw();
                             return;
                         }
@@ -4287,6 +4417,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         .enumerate()
                         .map(|(i, title)| TabEntry {
                             title,
+                            color: state.tabs[i].color,
                             active: i == state.active_tab,
                             index: i + 1,
                             busy: state.tabs[i].is_busy(),
@@ -4376,6 +4507,11 @@ impl ApplicationHandler<VoltEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        if Instant::now() >= self.next_secure_input_poll {
+            self.update_secure_input();
+            self.next_secure_input_poll = Instant::now() + Duration::from_millis(150);
+        }
         // Drain any PTY events that arrived between redraws.
         // The EventLoopProxy already triggers user_event → request_redraw,
         // so this is just a safety drain for events that slipped through.
@@ -4601,6 +4737,15 @@ impl ApplicationHandler<VoltEvent> for App {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        if self.focused_window.is_some() {
+            next_blink_deadline = Some(
+                next_blink_deadline.map_or(self.next_secure_input_poll, |d| {
+                    d.min(self.next_secure_input_poll)
+                }),
+            );
+        }
+
         if let Some(deadline) = next_blink_deadline {
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else {
@@ -4635,6 +4780,50 @@ fn char_select_class(c: char) -> u8 {
     } else {
         2
     }
+}
+
+/// Upper bound for a single user-initiated paste into the terminal or editor.
+#[cfg(target_os = "macos")]
+const MAX_CLIPBOARD_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read at most one byte beyond the cap. On overflow, kill and reap the child
+/// before returning, so a large clipboard never grows memory without bound.
+#[cfg(target_os = "macos")]
+fn read_bounded_command_output(
+    command: &mut std::process::Command,
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut bytes = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() > max_bytes {
+        let _ = child.kill();
+        let _ = child.wait();
+        read?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "clipboard exceeds 8 MiB limit",
+        ));
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "clipboard helper exited with {status}"
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Remove any embedded bracketed-paste terminator so pasted content cannot
@@ -4920,11 +5109,31 @@ fn set_app_icon() {
 #[cfg(test)]
 mod tests {
     use super::create_sample_config_if_missing;
+    #[cfg(target_os = "macos")]
+    use super::{read_bounded_command_output, strip_bracketed_paste_end};
 
     use super::{
         advance_drag_selection, selection_scroll_direction, Grid, MainState, Selection,
         SelectionMode, SelectionScrollDirection,
     };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clipboard_reader_accepts_limit_and_rejects_oversize() {
+        let mut exact = std::process::Command::new("/usr/bin/printf");
+        exact.arg("1234567890abcdef");
+        assert_eq!(
+            read_bounded_command_output(&mut exact, 16).unwrap(),
+            b"1234567890abcdef"
+        );
+
+        let mut oversized = std::process::Command::new("/usr/bin/yes");
+        oversized.arg("x");
+        let err = read_bounded_command_output(&mut oversized, 16).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        assert_eq!(strip_bracketed_paste_end(b"a\x1b[201~b"), b"ab");
+    }
 
     #[test]
     fn drag_edge_direction_uses_own_pane_not_window_middle() {
@@ -5081,6 +5290,14 @@ mod tests {
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("# Volt Terminal"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

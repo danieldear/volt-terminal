@@ -892,7 +892,21 @@ pub(crate) fn safe_label(s: &str, max: usize) -> String {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     let clean: String = s
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        // Git names and rule previews are untrusted UI text. Directional
+        // formatting marks can visually reorder an otherwise safe label.
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{206f}'
+            )
+        })
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     if clean.width() <= max {
         return clean;
@@ -1229,6 +1243,12 @@ mod tests {
     fn truncation_is_unicode_safe_and_removes_controls() {
         assert_eq!(safe_label("a\nb\u{1b}c", 20), "a b c");
         assert_eq!(safe_label("日本語の長い名前", 4), "日…");
+        assert_eq!(
+            safe_label("branch\u{202e}txt.exe\u{202c}\u{2066}safe\u{2069}", 30),
+            "branchtxt.exesafe"
+        );
+        assert_eq!(safe_label("a\u{200e}b\u{200f}c\u{061c}d", 10), "abcd");
+        assert_eq!(safe_label("x\u{2028}y\u{2029}z\u{206a}w", 10), "x y zw");
     }
     #[test]
     fn only_one_section_is_expanded_at_a_time() {

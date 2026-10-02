@@ -10,6 +10,7 @@ use volt_core::events::CoreEvent;
 use volt_core::grid::Grid;
 use volt_core::performer::Performer;
 use volt_core::pty::Pty;
+use volt_renderer::tab_color::TabColor;
 
 use crate::app::VoltEvent;
 use crate::pane_tree::PaneTree;
@@ -42,6 +43,8 @@ pub struct TerminalTab {
     pub tree: PaneTree,
     /// Tab-scoped override; unlike a pane title it survives pane focus changes.
     pub custom_title: Option<String>,
+    /// User-selected accent, independent of running/idle state.
+    pub color: Option<TabColor>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -377,6 +380,7 @@ impl TerminalTab {
         Ok(Self {
             tree: PaneTree::new(primary),
             custom_title: None,
+            color: None,
         })
     }
 
