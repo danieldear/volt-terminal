@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -409,7 +410,9 @@ pub fn sample_config_toml() -> String {
 # All values shown are the defaults.
 
 # ── Theme ──────────────────────────────────────────────────────────────────────
-# Options: catppuccin  tokyo-night  gruvbox  nord  dracula
+# Built-in: catppuccin  tokyo-night  gruvbox  nord  dracula
+# Or the id (file name) of a theme in ~/.config/volt/themes/. Volt ▸ Theme
+# switches themes and updates this line.
 theme = "catppuccin"
 
 # ── Font ───────────────────────────────────────────────────────────────────────
@@ -541,6 +544,115 @@ impl Config {
     }
 }
 
+/// Point the root `theme` key at `id` without discarding comments or other
+/// settings. A missing file is created from the commented sample config.
+/// Follow a config symlink and atomically replace its target, not the link.
+pub fn set_theme_in_config_file(path: &Path, id: &str) -> std::io::Result<()> {
+    if !crate::themes::is_valid_id(id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid theme id {id:?}"),
+        ));
+    }
+    // canonicalize follows an existing symlink (including chains) so dotfile
+    // managers keep owning config.toml. A broken symlink is an error, not a
+    // missing file to replace with the sample.
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        Ok(_) => path.to_path_buf(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(err) => return Err(err),
+    };
+    let existing = std::fs::metadata(&target).ok();
+    let text = match std::fs::read_to_string(&target) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => sample_config_toml(),
+        Err(err) => return Err(err),
+    };
+    let updated = with_theme_line(&text, id)?;
+    // Reject any edit that fails Volt's actual config parser or fails to set
+    // the requested root value. Never replace a working file with bad TOML.
+    let parsed = parse_config_with_compat(&updated)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    if parsed.theme != id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "theme edit did not update the root theme",
+        ));
+    }
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    // create_new prevents following an attacker/stale symlink at the temp path.
+    // New configs start private because [ai].api_key may contain a secret.
+    for attempt in 0..32 {
+        let tmp = dir.join(format!(
+            ".config.toml.volt-{}-{}-{attempt}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_nanos())
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&tmp) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        };
+        let result = (|| {
+            file.write_all(updated.as_bytes())?;
+            if let Some(meta) = &existing {
+                file.set_permissions(meta.permissions())?;
+            }
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, &target)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return result;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a temporary config file",
+    ))
+}
+
+/// TOML-aware editing avoids mistaking a multiline string or quoted key for a
+/// root assignment. `toml_edit` retains layout and the theme line's comment.
+fn with_theme_line(text: &str, id: &str) -> io::Result<String> {
+    let mut doc: toml_edit::Document = text
+        .parse()
+        .or_else(|_| normalize_leading_dot_float_literals(text).parse())
+        .map_err(|err: toml_edit::TomlError| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let new_value = toml_edit::Value::from(id);
+    if let Some(old) = doc.get_mut("theme") {
+        let old = old.as_value_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "root theme must be a string value",
+            )
+        })?;
+        let mut new_value = new_value;
+        *new_value.decor_mut() = old.decor().clone();
+        *old = new_value;
+    } else {
+        doc["theme"] = toml_edit::Item::Value(new_value);
+    }
+    let out = doc.to_string();
+    if text.contains("\r\n") && !text.replace("\r\n", "").contains('\n') {
+        Ok(out.replace('\n', "\r\n"))
+    } else {
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +770,134 @@ mod tests {
         assert!(normalized.contains("opacity = 0.90"));
         assert!(normalized.contains("# keep .90 unchanged in comment"));
         assert!(normalized.contains(r#"note = ".90 should stay as text""#));
+    }
+
+    #[test]
+    fn theme_line_is_replaced_in_place_keeping_comments_and_tables() {
+        let text = "# my config\n# theme = \"old-comment\"\ntheme = \"nord\" # mine\n\n[workspace]\ntheme = \"not-root\"\n";
+        let out = with_theme_line(text, "midnight-clay").unwrap();
+        assert_eq!(
+            out,
+            "# my config\n# theme = \"old-comment\"\ntheme = \"midnight-clay\" # mine\n\n[workspace]\ntheme = \"not-root\"\n"
+        );
+        let parsed: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(parsed["theme"].as_str(), Some("midnight-clay"));
+    }
+
+    #[test]
+    fn theme_line_is_inserted_before_first_table_or_appended() {
+        assert_eq!(
+            with_theme_line("[font]\nsize = 13.0\n", "nord").unwrap(),
+            "theme = \"nord\"\n[font]\nsize = 13.0\n"
+        );
+        assert_eq!(
+            with_theme_line("# empty\nthemes = 1", "nord").unwrap(),
+            "# empty\nthemes = 1\ntheme = \"nord\"\n"
+        );
+        assert_eq!(
+            with_theme_line("theme = \"a\"\r\n", "nord").unwrap(),
+            "theme = \"nord\"\r\n"
+        );
+    }
+
+    #[test]
+    fn theme_edit_ignores_multiline_string_contents_and_quoted_root_key() {
+        let source =
+            "note = \"\"\"\ntheme = \"example\"\n[font]\n\"\"\"\n\"theme\" = \"nord\" # chosen\n";
+        let out = with_theme_line(source, "dracula").unwrap();
+        let parsed: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(parsed["theme"].as_str(), Some("dracula"));
+        assert_eq!(
+            parsed["note"].as_str(),
+            Some("theme = \"example\"\n[font]\n")
+        );
+        assert!(out.contains("# chosen"));
+    }
+
+    #[test]
+    fn theme_edit_accepts_legacy_leading_dot_floats() {
+        let source = "theme = \"nord\"\n[appearance]\nopacity = .90 # legacy value\n";
+        let out = with_theme_line(source, "dracula").unwrap();
+        let cfg = parse_config_with_compat(&out).unwrap();
+        assert_eq!(cfg.theme, "dracula");
+        assert!((cfg.appearance.opacity - 0.90).abs() < f32::EPSILON);
+        assert!(out.contains("# legacy value"));
+    }
+
+    #[test]
+    fn invalid_config_is_not_replaced() {
+        let dir =
+            std::env::temp_dir().join(format!("volt-invalid-theme-edit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original = "theme = \"nord\"\n[broken\n";
+        std::fs::write(&path, original).unwrap();
+        assert!(set_theme_in_config_file(&path, "dracula").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn theme_edit_preserves_private_mode_and_config_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir =
+            std::env::temp_dir().join(format!("volt-symlink-theme-edit-{}", std::process::id()));
+        let dotfiles = dir.join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("config.toml");
+        std::fs::write(&target, "theme = \"nord\"\n[ai]\napi_key = \"secret\"\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("config.toml");
+        symlink(&target, &link).unwrap();
+
+        set_theme_in_config_file(&link, "dracula").unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let saved = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(parse_config_with_compat(&saved).unwrap().theme, "dracula");
+        assert!(saved.contains("secret"));
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_config_starts_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("volt-new-private-config-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        set_theme_in_config_file(&path, "nord").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn set_theme_in_config_file_creates_from_sample_and_refuses_bad_ids() {
+        let dir = std::env::temp_dir().join(format!("volt-set-theme-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        set_theme_in_config_file(&path, "gruvbox").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# Volt Terminal"), "sample comments kept");
+        assert_eq!(parse_config_with_compat(&text).unwrap().theme, "gruvbox");
+        set_theme_in_config_file(&path, "dracula").unwrap();
+        let again = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(again.matches("theme = ").count(), 1);
+        assert_eq!(parse_config_with_compat(&again).unwrap().theme, "dracula");
+        assert!(set_theme_in_config_file(&path, "x\"\ninjected = 1").is_err());
+        assert!(!dir.join(".config.toml.volt-tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

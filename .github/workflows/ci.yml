@@ -93,6 +93,7 @@ jobs:
           cargo run --locked -p volt-renderer --example rendercheck -- target/rendercheck --fixtures-only
           cargo run --locked -p volt-renderer --example cardcheck
           cargo run --locked -p volt-renderer --example searchcheck
+          cargo run --locked -p volt-renderer --example themecheck
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always() && matrix.os == 'ubuntu-latest'
         with:
@@ -101,6 +102,7 @@ jobs:
             target/rendercheck
             target/cardcheck
             target/searchcheck
+            target/themecheck
           if-no-files-found: warn
 
   msrv:

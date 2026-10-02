@@ -6,6 +6,7 @@ pub mod pane_tree;
 pub mod prompt;
 pub mod tab;
 pub mod tab_layout;
+pub mod theme_editor;
 pub use app::App;
 
 pub mod workspace_panel;

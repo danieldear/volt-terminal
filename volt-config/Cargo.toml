@@ -7,4 +7,5 @@ rust-version.workspace = true
 [dependencies]
 serde = { workspace = true }
 toml = "0.8"
+toml_edit = "=0.20.2"
 dirs = "5"

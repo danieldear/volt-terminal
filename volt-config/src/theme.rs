@@ -1,3 +1,5 @@
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Color {
     pub r: u8,
@@ -8,6 +10,22 @@ pub struct Color {
 impl Color {
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
+    }
+
+    /// Parse `#rrggbb`. The leading `#` is optional and case is ignored;
+    /// anything else (shorthand `#rgb`, alpha, names) is rejected.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let hex = s.strip_prefix('#').unwrap_or(s);
+        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        Some(Self::rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
+    }
+
+    pub fn to_hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
     }
     pub fn to_f32(self) -> [f32; 4] {
         [
@@ -34,6 +52,31 @@ impl Default for Color {
     }
 }
 
+impl Serialize for Color {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for Color {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Color::from_hex(&raw).ok_or_else(|| {
+            serde::de::Error::custom(format!("expected a \"#rrggbb\" color, got {raw:?}"))
+        })
+    }
+}
+
+/// Built-in themes as `(config id, display name)`. These ids are reserved:
+/// a theme file in the themes folder can never shadow one of them.
+pub const BUILTIN_THEMES: [(&str, &str); 5] = [
+    ("catppuccin", "Catppuccin Mocha"),
+    ("tokyo-night", "Tokyo Night Storm"),
+    ("gruvbox", "Gruvbox Dark Hard"),
+    ("nord", "Nord"),
+    ("dracula", "Dracula"),
+];
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
     pub background: Color,
@@ -50,14 +93,22 @@ impl Theme {
         &["catppuccin", "tokyo-night", "gruvbox", "nord", "dracula"]
     }
 
-    pub fn by_name(name: &str) -> Self {
-        match name {
+    /// A built-in theme by its config id, or `None` for any other id.
+    pub fn builtin(id: &str) -> Option<Self> {
+        Some(match id {
+            "catppuccin" => Self::dark(),
             "tokyo-night" => Self::tokyo_night(),
             "gruvbox" => Self::gruvbox(),
             "nord" => Self::nord(),
             "dracula" => Self::dracula(),
-            _ => Self::dark(), // "catppuccin" or default
-        }
+            _ => return None,
+        })
+    }
+
+    /// A built-in theme by id, falling back to Catppuccin for unknown ids.
+    /// User theme files are resolved by `themes::ThemeRegistry`, not here.
+    pub fn by_name(name: &str) -> Self {
+        Self::builtin(name).unwrap_or_else(Self::dark)
     }
 
     /// Catppuccin Mocha
@@ -226,5 +277,40 @@ impl Theme {
                 Color::rgb(v, v, v)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_round_trips_and_rejects_malformed_input() {
+        let c = Color::from_hex("#1A2b3C").unwrap();
+        assert_eq!(c, Color::rgb(0x1a, 0x2b, 0x3c));
+        assert_eq!(c.to_hex(), "#1a2b3c");
+        assert_eq!(Color::from_hex("  ff8000 "), Some(Color::rgb(255, 128, 0)));
+        for bad in [
+            "",
+            "#",
+            "#fff",
+            "#12345",
+            "#1234567",
+            "#12345g",
+            "red",
+            "#ff80001",
+            "＃ff8000",
+        ] {
+            assert_eq!(Color::from_hex(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn every_builtin_id_resolves_and_unknown_ids_do_not() {
+        for (id, _) in BUILTIN_THEMES {
+            assert!(Theme::builtin(id).is_some(), "{id}");
+        }
+        assert!(Theme::builtin("midnight-clay").is_none());
+        assert_eq!(Theme::by_name("no-such-theme"), Theme::dark());
     }
 }

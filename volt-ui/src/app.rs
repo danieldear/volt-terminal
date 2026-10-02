@@ -11,7 +11,7 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::macos::{ActiveEventLoopExtMacOS, WindowExtMacOS};
 use winit::window::{Window, WindowId};
 
-use volt_config::{config_path_to_edit, sample_config_toml, Config, Theme};
+use volt_config::{config_path_to_edit, sample_config_toml, Config, Theme, ThemeRegistry};
 use volt_core::events::CoreEvent;
 use volt_core::grid::Grid;
 use volt_core::performer::MouseTrackingMode;
@@ -176,9 +176,100 @@ struct MainState {
     /// Debug overlay toggled by the context menu's "Toggle Terminal
     /// Inspector" — grid size, cursor position, scrollback length.
     show_inspector: bool,
+    /// Open theme editor. While `Some`, `theme` is its live working copy and
+    /// keyboard input goes to the editor.
+    theme_editor: Option<crate::theme_editor::ThemeEditor>,
 }
 
 impl MainState {
+    /// Push the editor's view to the renderer. A window too small for the
+    /// panel closes the editor instead of leaving an invisible modal.
+    fn sync_theme_editor(&mut self) {
+        self.renderer.theme_editor = self.theme_editor.as_ref().map(|e| e.view());
+        if self.theme_editor.is_some() && self.renderer.theme_editor_layout().is_none() {
+            self.cancel_theme_editor();
+        }
+        self.begin_redraw();
+    }
+
+    /// Close the editor and put back the theme it started from (or last saved).
+    fn cancel_theme_editor(&mut self) {
+        if let Some(editor) = self.theme_editor.take() {
+            self.theme = editor.original().clone();
+        }
+        self.renderer.theme_editor = None;
+        self.begin_redraw();
+    }
+
+    /// Apply an editor outcome to this window. A save needs the theme
+    /// registry, so it is returned to `App` as `(name, overwrite)`.
+    fn apply_editor_outcome(
+        &mut self,
+        outcome: crate::theme_editor::EditorOutcome,
+    ) -> Option<(String, Option<String>)> {
+        use crate::theme_editor::EditorOutcome as O;
+        match outcome {
+            O::Redraw => {}
+            O::ThemeChanged => {
+                if let Some(editor) = &self.theme_editor {
+                    self.theme = editor.working().clone();
+                }
+            }
+            O::Cancel => {
+                self.cancel_theme_editor();
+                return None;
+            }
+            O::Save { name, overwrite } => {
+                self.sync_theme_editor();
+                return Some((name, overwrite));
+            }
+        }
+        self.sync_theme_editor();
+        None
+    }
+
+    /// Keyboard input while the editor is open. Every key is consumed.
+    fn theme_editor_key(
+        &mut self,
+        key: PhysicalKey,
+        text: Option<&str>,
+        command: bool,
+        shift: bool,
+        ctrl: bool,
+    ) -> Option<(String, Option<String>)> {
+        if command && key == PhysicalKey::Code(KeyCode::KeyV) {
+            self.paste_clipboard();
+            return None;
+        }
+        let editor = self.theme_editor.as_mut()?;
+        let naming = editor.is_naming();
+        let outcome = match key {
+            PhysicalKey::Code(KeyCode::KeyS) if command => editor.save(shift),
+            PhysicalKey::Code(KeyCode::Backspace) if command => editor.clear(),
+            _ if command || ctrl => return None,
+            PhysicalKey::Code(KeyCode::Escape) => editor.escape(),
+            PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => editor.enter(),
+            PhysicalKey::Code(KeyCode::Tab) if shift => editor.prev_field(),
+            PhysicalKey::Code(KeyCode::Tab) => editor.next_field(),
+            PhysicalKey::Code(KeyCode::Backspace) => editor.backspace(),
+            PhysicalKey::Code(KeyCode::ArrowLeft) if naming => editor.move_cursor(-1),
+            PhysicalKey::Code(KeyCode::ArrowRight) if naming => editor.move_cursor(1),
+            PhysicalKey::Code(KeyCode::Home) => editor.cursor_to_edge(false),
+            PhysicalKey::Code(KeyCode::End) => editor.cursor_to_edge(true),
+            PhysicalKey::Code(KeyCode::ArrowUp | KeyCode::ArrowLeft) if !naming => {
+                editor.prev_field()
+            }
+            PhysicalKey::Code(KeyCode::ArrowDown | KeyCode::ArrowRight) if !naming => {
+                editor.next_field()
+            }
+            _ => match text {
+                Some(text) => editor.type_text(text),
+                None => return None,
+            },
+        };
+        self.apply_editor_outcome(outcome)
+    }
+
     fn sync_search(&mut self) {
         self.renderer.search_palette = self.workspace_search.view();
         if self.workspace_search.visible && self.renderer.search_layout().is_none() {
@@ -188,6 +279,9 @@ impl MainState {
         self.begin_redraw();
     }
     fn toggle_search(&mut self) {
+        if self.theme_editor.is_some() {
+            return;
+        }
         if self.workspace_search.visible {
             self.workspace_search.close();
         } else {
@@ -716,7 +810,7 @@ impl MainState {
             }
             A::OpenConfig => open_config_in_editor(),
             A::Ignore | A::Unbind => return,
-            A::NewWindow | A::ReloadConfig | A::Quit | A::ClosePane => {
+            A::NewWindow | A::ReloadConfig | A::Quit | A::ClosePane | A::CustomizeTheme => {
                 unreachable!("App-owned action")
             }
         }
@@ -979,8 +1073,9 @@ impl MainState {
         Some((out, active_cursor_visible))
     }
 
+    /// Apply settings other than the theme, which callers resolve through
+    /// the theme registry (font-size changes must not reset it).
     fn apply_config(&mut self, config: &Config) {
-        self.theme = Theme::by_name(&config.theme);
         self.config = config.clone();
         self.keybindings = crate::keybindings::Bindings::compile(&config.keybindings);
         self.window
@@ -995,6 +1090,9 @@ impl MainState {
         self.renderer.cursor_style = config.appearance.cursor_style;
         self.renderer.update_scale(sc, config.font.size);
         self.resize_all_tabs_to_current_grid();
+        if self.theme_editor.is_some() {
+            self.sync_theme_editor();
+        }
         self.begin_redraw();
     }
 
@@ -1365,6 +1463,11 @@ impl MainState {
         if text.is_empty() {
             return;
         }
+        if let Some(editor) = self.theme_editor.as_mut() {
+            let outcome = editor.type_text(text);
+            self.apply_editor_outcome(outcome);
+            return;
+        }
         match committed_text_target(
             self.workspace_search.visible,
             self.active_prompt.is_some(),
@@ -1391,6 +1494,22 @@ impl MainState {
     }
 
     fn paste_clipboard(&mut self) {
+        // Clipboard access below is macOS-only, like the rest of paste.
+        #[cfg(target_os = "macos")]
+        if self.theme_editor.is_some() {
+            match std::process::Command::new("pbpaste").output() {
+                Ok(output) if output.status.success() => {
+                    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+                    if let Some(editor) = self.theme_editor.as_mut() {
+                        let outcome = editor.paste(&text);
+                        self.apply_editor_outcome(outcome);
+                    }
+                }
+                Ok(output) => eprintln!("volt-ui: pbpaste exited with {}", output.status),
+                Err(err) => eprintln!("volt-ui: failed to launch pbpaste: {err}"),
+            }
+            return;
+        }
         #[cfg(target_os = "macos")]
         if !self.workspace_search.visible
             && self.workspace_panel.visible
@@ -1438,6 +1557,9 @@ impl MainState {
     // ── Find / rename overlay ────────────────────────────────────────────
 
     fn open_find_prompt(&mut self) {
+        if self.theme_editor.is_some() {
+            return;
+        }
         self.workspace_search.close();
         self.renderer.search_palette = None;
         self.search_dirty = false;
@@ -1451,6 +1573,9 @@ impl MainState {
 
     #[cfg(target_os = "macos")]
     fn open_rename_prompt(&mut self, kind: crate::prompt::PromptKind) {
+        if self.theme_editor.is_some() {
+            return;
+        }
         self.workspace_search.close();
         self.renderer.search_palette = None;
         self.search_dirty = false;
@@ -1902,7 +2027,9 @@ pub struct App {
     /// every native `NSMenuItem`'s action handler reads via a raw pointer,
     /// while AppKit's menu bar keeps running against those now-dangling
     /// pointers; the first click then reads freed memory and aborts.
-    app_menu: Option<muda::Menu>,
+    app_menu: Option<crate::menu::AppMenu>,
+    /// Built-in and user themes, reloaded on settings reload and after saves.
+    themes: ThemeRegistry,
 }
 
 impl App {
@@ -1910,9 +2037,12 @@ impl App {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let themes = ThemeRegistry::load();
+        let config_alert = with_theme_problems(config_alert, &themes);
         Ok(Self {
             config,
             config_alert,
+            themes,
             windows: HashMap::new(),
             proxy: None,
             pty_wake_pending: Arc::new(AtomicBool::new(false)),
@@ -2006,7 +2136,7 @@ impl App {
             Arc::clone(&self.pty_wake_pending),
             cwd.as_deref(),
         )?;
-        let theme = Theme::by_name(&self.config.theme);
+        let theme = self.themes.resolve(&self.config.theme);
         let id = window.id();
         #[cfg(target_os = "macos")]
         let display_link = match DisplayLinkScheduler::new(proxy.clone()) {
@@ -2070,6 +2200,7 @@ impl App {
             search_target: None,
             last_search_refresh: Instant::now(),
             show_inspector: false,
+            theme_editor: None,
         };
         state
             .window
@@ -2082,15 +2213,165 @@ impl App {
         Ok(id)
     }
 
-    /// Reload `config.toml` and apply it to `window_id`'s state. Shared by
-    /// the Cmd+Shift+R shortcut and the "Reload Settings" menu action.
-    fn reload_config(&mut self, window_id: WindowId) {
+    /// Reload settings and theme files in every window. The registry and menu
+    /// are app-wide, so leaving other windows on stale themes is inconsistent.
+    fn reload_config(&mut self) {
         let (new_cfg, config_alert) = Config::load_with_diagnostics();
+        self.themes = ThemeRegistry::load();
+        let config_alert = with_theme_problems(config_alert, &self.themes);
         self.config = new_cfg.clone();
         self.config_alert = config_alert.clone();
-        if let Some(state) = self.windows.get_mut(&window_id) {
-            state.renderer.set_top_alert(config_alert);
+        let theme = self.themes.resolve(&new_cfg.theme);
+        for state in self.windows.values_mut() {
+            state.renderer.set_top_alert(config_alert.clone());
+            state.cancel_theme_editor();
+            state.theme = theme.clone();
             state.apply_config(&new_cfg);
+        }
+        self.refresh_theme_menu();
+    }
+
+    /// Rebuild Volt ▸ Theme from the registry, checking the configured theme.
+    fn refresh_theme_menu(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(menu) = self.app_menu.as_mut() {
+            let themes: Vec<_> = self
+                .themes
+                .entries()
+                .iter()
+                .map(|e| (e.id.clone(), e.name.clone(), e.is_builtin()))
+                .collect();
+            menu.set_themes(&themes, &self.config.theme);
+        }
+    }
+
+    /// Switch every window to theme `id` and remember it in config.toml.
+    /// `saved_from` is the window whose editor just saved this theme; its
+    /// editor stays open. Any other open editor is closed first.
+    fn select_theme(&mut self, id: &str, saved_from: Option<WindowId>) {
+        let Some(theme) = self.themes.get(id).map(|e| e.theme.clone()) else {
+            return;
+        };
+        self.config.theme = id.to_string();
+        let alert = match config_path_to_edit() {
+            Some(path) => volt_config::set_theme_in_config_file(&path, id)
+                .err()
+                .map(|err| {
+                    format!(
+                        "Couldn't save the theme choice to {}: {err}",
+                        path.display()
+                    )
+                }),
+            None => Some("Couldn't find the config folder to save the theme choice".into()),
+        };
+        for (wid, state) in self.windows.iter_mut() {
+            if Some(*wid) != saved_from {
+                state.cancel_theme_editor();
+                state.theme = theme.clone();
+            }
+            state.config.theme = id.to_string();
+            if alert.is_some() {
+                state.renderer.set_top_alert(alert.clone());
+            }
+            state.begin_redraw();
+        }
+        self.refresh_theme_menu();
+    }
+
+    /// Open the editor on `window_id`'s current theme, or close it if open.
+    fn toggle_theme_editor(&mut self, window_id: WindowId) {
+        let Some(state) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        if state.theme_editor.is_some() {
+            state.cancel_theme_editor();
+            return;
+        }
+        // Unknown ids render as the Catppuccin fallback, so edit that.
+        let entry = self
+            .themes
+            .get(&state.config.theme)
+            .or_else(|| self.themes.get("catppuccin"));
+        let (name, target) = match entry {
+            Some(e) => (e.name.clone(), (!e.is_builtin()).then(|| e.id.clone())),
+            None => ("Theme".to_string(), None),
+        };
+        state.workspace_search.close();
+        state.renderer.search_palette = None;
+        state.active_prompt = None;
+        state.search_dirty = false;
+        state.search_target = None;
+        state.workspace_panel.focused = false;
+        state.theme_editor = Some(crate::theme_editor::ThemeEditor::new(
+            &name,
+            target,
+            state.theme.clone(),
+        ));
+        state.sync_theme_editor();
+        if state.theme_editor.is_none() {
+            eprintln!("volt-ui: the window is too small for the theme editor");
+        }
+    }
+
+    /// Write the editor's working theme and switch to it.
+    fn save_edited_theme(&mut self, window_id: WindowId, name: String, overwrite: Option<String>) {
+        let Some(working) = self
+            .windows
+            .get(&window_id)
+            .and_then(|s| s.theme_editor.as_ref())
+            .map(|e| e.working().clone())
+        else {
+            return;
+        };
+        let result = match volt_config::themes::themes_dir() {
+            Some(dir) => {
+                volt_config::themes::save_theme(&dir, &name, &working, overwrite.as_deref())
+            }
+            None => Err("Couldn't find the config folder".into()),
+        };
+        match result {
+            Ok(id) => {
+                self.themes = ThemeRegistry::load();
+                if !self
+                    .themes
+                    .get(&id)
+                    .is_some_and(|entry| entry.theme == working)
+                {
+                    if let Some(editor) = self
+                        .windows
+                        .get_mut(&window_id)
+                        .and_then(|s| s.theme_editor.as_mut())
+                    {
+                        editor.save_failed(format!(
+                            "Saved themes/{id}.toml, but it did not load; check the theme files"
+                        ));
+                    }
+                    if let Some(state) = self.windows.get_mut(&window_id) {
+                        state.sync_theme_editor();
+                    }
+                    return;
+                }
+                if let Some(editor) = self
+                    .windows
+                    .get_mut(&window_id)
+                    .and_then(|s| s.theme_editor.as_mut())
+                {
+                    editor.saved(id.clone(), name);
+                }
+                self.select_theme(&id, Some(window_id));
+            }
+            Err(err) => {
+                if let Some(editor) = self
+                    .windows
+                    .get_mut(&window_id)
+                    .and_then(|s| s.theme_editor.as_mut())
+                {
+                    editor.save_failed(err);
+                }
+            }
+        }
+        if let Some(state) = self.windows.get_mut(&window_id) {
+            state.sync_theme_editor();
         }
     }
 
@@ -2124,6 +2405,10 @@ impl App {
                 open_config_in_editor();
                 return;
             }
+            A::OpenThemesFolder => {
+                open_themes_folder();
+                return;
+            }
             _ => {}
         }
 
@@ -2133,7 +2418,11 @@ impl App {
 
         match action {
             A::ReloadSettings => {
-                self.reload_config(window_id);
+                self.reload_config();
+                return;
+            }
+            A::CustomizeTheme => {
+                self.toggle_theme_editor(window_id);
                 return;
             }
             A::CloseWindow => {
@@ -2252,7 +2541,12 @@ impl App {
                     }
                 }
             }
-            A::NewWindow | A::OpenSettings | A::ReloadSettings | A::CloseWindow => {
+            A::NewWindow
+            | A::OpenSettings
+            | A::ReloadSettings
+            | A::CloseWindow
+            | A::CustomizeTheme
+            | A::OpenThemesFolder => {
                 unreachable!("handled in the early-return blocks above")
             }
         }
@@ -2264,6 +2558,40 @@ impl App {
 fn configure_macos_tab_chrome(_window: &Window, _native_tab_count: usize) {
     // Keep macOS tab handling fully native for stability.
     // We only use winit's tabbing identifier / native APIs.
+}
+
+/// Note skipped theme files under the config alert, without hiding it.
+fn with_theme_problems(alert: Option<String>, themes: &ThemeRegistry) -> Option<String> {
+    let problems = themes.problems();
+    let Some(first) = problems.first() else {
+        return alert;
+    };
+    let note = if problems.len() == 1 {
+        format!("Skipped theme file {first}")
+    } else {
+        format!("Skipped {} theme files; first: {first}", problems.len())
+    };
+    for problem in problems {
+        eprintln!("volt-ui: skipped theme file {problem}");
+    }
+    Some(match alert {
+        Some(alert) => format!("{alert} · {note}"),
+        None => note,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn open_themes_folder() {
+    let Some(dir) = volt_config::themes::themes_dir() else {
+        return;
+    };
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        eprintln!("volt-ui: failed to create {}: {err}", dir.display());
+        return;
+    }
+    if let Err(err) = std::process::Command::new("open").arg(&dir).spawn() {
+        eprintln!("volt-ui: failed to open themes folder: {err}");
+    }
 }
 
 fn open_config_in_editor() {
@@ -2360,6 +2688,7 @@ impl ApplicationHandler<VoltEvent> for App {
             // pointers — confirmed via crash report as the cause of a
             // reproducible SIGABRT on the first menu click or accelerator.
             self.app_menu = Some(crate::menu::install_app_menu());
+            self.refresh_theme_menu();
             // NSApp.mainMenu is process-global — install once here, not per
             // window. Menu clicks arrive on muda's own dispatch, off the
             // winit event loop, so forward them through the same
@@ -2407,7 +2736,9 @@ impl ApplicationHandler<VoltEvent> for App {
             }
             #[cfg(target_os = "macos")]
             VoltEvent::Menu(id) => {
-                if let Some(action) = crate::menu::MenuAction::from_id(&id) {
+                if let Some(theme) = crate::menu::theme_from_id(&id) {
+                    self.select_theme(theme, None);
+                } else if let Some(action) = crate::menu::MenuAction::from_id(&id) {
                     self.handle_menu_action(_event_loop, action);
                 }
             }
@@ -2443,6 +2774,9 @@ impl ApplicationHandler<VoltEvent> for App {
                 if state.workspace_search.visible {
                     state.sync_search();
                 }
+                if state.theme_editor.is_some() {
+                    state.sync_theme_editor();
+                }
                 state.resize_all_tabs_to_current_grid();
                 #[cfg(target_os = "macos")]
                 {
@@ -2459,6 +2793,9 @@ impl ApplicationHandler<VoltEvent> for App {
                     .renderer
                     .update_scale(scale_factor as f32, state.config.font.size);
                 state.resize_all_tabs_to_current_grid();
+                if state.theme_editor.is_some() {
+                    state.sync_theme_editor();
+                }
                 #[cfg(target_os = "macos")]
                 {
                     let native_tab_count = state.window.num_tabs().max(1);
@@ -2639,6 +2976,36 @@ impl ApplicationHandler<VoltEvent> for App {
                     state.is_drag_selecting = false;
                     state.selection_scroll_deadline = None;
                     return;
+                }
+                // Clicks on the theme editor never reach the terminal below;
+                // clicks elsewhere do, so text can still be selected.
+                if btn_state == ElementState::Pressed {
+                    if let Some(l) = state.renderer.theme_editor_layout() {
+                        use volt_renderer::theme_editor::EditorHit;
+                        let naming = state.theme_editor.as_ref().is_some_and(|e| e.is_naming());
+                        let hit = l.hit(state.mouse_pos.0, state.mouse_pos.1, naming);
+                        if hit != EditorHit::Outside {
+                            state.search_mouse_capture = Some(button);
+                            let outcome = match (button, state.theme_editor.as_mut()) {
+                                (MouseButton::Left, Some(editor)) => match hit {
+                                    EditorHit::Field(i) => Some(editor.focus(i)),
+                                    EditorHit::Close => {
+                                        Some(crate::theme_editor::EditorOutcome::Cancel)
+                                    }
+                                    EditorHit::Revert => Some(editor.revert()),
+                                    EditorHit::Save => Some(editor.save(false)),
+                                    EditorHit::Body | EditorHit::Outside => None,
+                                },
+                                _ => None,
+                            };
+                            if let Some((name, overwrite)) =
+                                outcome.and_then(|o| state.apply_editor_outcome(o))
+                            {
+                                self.save_edited_theme(window_id, name, overwrite);
+                            }
+                            return;
+                        }
+                    }
                 }
                 if state.workspace_search.visible {
                     if btn_state == ElementState::Pressed {
@@ -2961,6 +3328,12 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                if state.renderer.theme_editor_layout().is_some_and(|l| {
+                    l.hit(state.mouse_pos.0, state.mouse_pos.1, false)
+                        != volt_renderer::theme_editor::EditorHit::Outside
+                }) {
+                    return;
+                }
                 if state.workspace_search.visible {
                     let dy = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y,
@@ -3104,9 +3477,61 @@ impl ApplicationHandler<VoltEvent> for App {
                 let super_key = state.super_down();
                 let shift = state.shift_down();
                 let alt = state.modifiers.alt_key();
+                // The theme editor owns the keyboard. App-level Cmd shortcuts
+                // (quit, windows, tabs, font size, reload) still work.
+                if state.theme_editor.is_some() {
+                    if state
+                        .keybindings
+                        .lookup(physical_key, ctrl, alt, shift, super_key)
+                        == Some(volt_config::keybindings::Action::CustomizeTheme)
+                    {
+                        state.cancel_theme_editor();
+                        return;
+                    }
+                    let app_shortcut = super_key
+                        && !ctrl
+                        && match physical_key {
+                            PhysicalKey::Code(code) => {
+                                matches!(
+                                    code,
+                                    KeyCode::KeyQ
+                                        | KeyCode::KeyN
+                                        | KeyCode::KeyW
+                                        | KeyCode::KeyT
+                                        | KeyCode::Comma
+                                        | KeyCode::Equal
+                                        | KeyCode::Minus
+                                        | KeyCode::NumpadAdd
+                                        | KeyCode::NumpadSubtract
+                                        | KeyCode::Digit1
+                                        | KeyCode::Digit2
+                                        | KeyCode::Digit3
+                                        | KeyCode::Digit4
+                                        | KeyCode::Digit5
+                                        | KeyCode::Digit6
+                                        | KeyCode::Digit7
+                                        | KeyCode::Digit8
+                                        | KeyCode::Digit9
+                                ) || (shift && code == KeyCode::KeyR)
+                            }
+                            _ => false,
+                        };
+                    if !app_shortcut {
+                        if let Some((name, overwrite)) = state.theme_editor_key(
+                            physical_key,
+                            text.as_ref().map(|t| t.as_str()),
+                            super_key,
+                            shift,
+                            ctrl,
+                        ) {
+                            self.save_edited_theme(window_id, name, overwrite);
+                        }
+                        return;
+                    }
+                }
                 // Local text fields and inspector navigation own their keys.
                 let custom = if crate::keybindings::terminal_owns_keys(
-                    state.active_prompt.is_some(),
+                    state.active_prompt.is_some() || state.theme_editor.is_some(),
                     state.workspace_search.visible,
                     state.workspace_panel.visible,
                     state.workspace_panel.focused,
@@ -3126,7 +3551,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         A::Quit => event_loop.exit(),
                         A::ReloadConfig => {
                             let _ = state;
-                            self.reload_config(window_id);
+                            self.reload_config();
                         }
                         A::NewWindow => {
                             let _ = state;
@@ -3144,6 +3569,10 @@ impl ApplicationHandler<VoltEvent> for App {
                         A::IncreaseFontSize | A::DecreaseFontSize => {
                             state.run_keybinding(action);
                             self.config.font.size = state.config.font.size;
+                        }
+                        A::CustomizeTheme => {
+                            let _ = state;
+                            self.toggle_theme_editor(window_id);
                         }
                         _ => state.run_keybinding(action),
                     }
@@ -3452,7 +3881,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     && reload_modifier
                 {
                     let _ = state;
-                    self.reload_config(window_id);
+                    self.reload_config();
                     return;
                 }
 

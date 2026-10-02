@@ -10,4 +10,6 @@ pub mod workspace_card;
 
 pub mod search_palette;
 
+pub mod theme_editor;
+
 mod prompt_viewport;

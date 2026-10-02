@@ -35,6 +35,16 @@ pub enum MenuAction {
     ChangeTabTitle,
     ChangeTerminalTitle,
     SearchGoogle,
+    CustomizeTheme,
+    OpenThemesFolder,
+}
+
+/// Menu ids of theme items are this prefix plus the theme id.
+const THEME_ID_PREFIX: &str = "volt.theme:";
+
+/// The theme id a Volt ▸ Theme item stands for, if `id` is one.
+pub fn theme_from_id(id: &str) -> Option<&str> {
+    id.strip_prefix(THEME_ID_PREFIX)
 }
 
 impl MenuAction {
@@ -67,6 +77,8 @@ impl MenuAction {
             ChangeTabTitle => "volt.change_tab_title",
             ChangeTerminalTitle => "volt.change_terminal_title",
             SearchGoogle => "volt.search_google",
+            CustomizeTheme => "volt.customize_theme",
+            OpenThemesFolder => "volt.open_themes_folder",
         }
     }
 
@@ -101,6 +113,8 @@ impl MenuAction {
             "volt.change_tab_title" => ChangeTabTitle,
             "volt.change_terminal_title" => ChangeTerminalTitle,
             "volt.search_google" => SearchGoogle,
+            "volt.customize_theme" => CustomizeTheme,
+            "volt.open_themes_folder" => OpenThemesFolder,
             _ => return None,
         })
     }
@@ -132,7 +146,7 @@ impl MenuAction {
 /// **Must be kept alive by the caller.** Every native `NSMenuItem` muda
 /// creates stores a raw pointer back into its Rust-side `MenuChild`; a
 /// parent's `append_items` clones an `Rc` to keep children alive, but
-/// nothing keeps the *returned* `Menu` itself alive. If the caller lets the
+/// nothing keeps the *returned* root `Menu` itself alive. If the caller lets the
 /// return value drop, every `Rc` in the whole tree hits zero, the Rust-side
 /// backing data is freed, and AppKit's native menu bar — which is retained
 /// separately and keeps working visually — is left holding dangling
@@ -140,12 +154,13 @@ impl MenuAction {
 /// reproducibly aborted the app (SIGABRT inside `CFStringCreate`, confirmed
 /// via crash report) the first time it happened here, when this function
 /// returned `()` and the caller had nowhere to keep the tree alive. The
-/// caller must store the returned `Menu` for the app's full lifetime (e.g.
+/// caller must store the returned `AppMenu` for the app's full lifetime (e.g.
 /// as an `App` field) — dropping it after this call reintroduces the bug.
 #[must_use = "dropping this frees the menu bar's Rust-side backing data \
               while AppKit's native menu keeps running — see doc comment"]
-pub fn install_app_menu() -> Menu {
+pub fn install_app_menu() -> AppMenu {
     let menu = Menu::new();
+    let theme_menu = Submenu::new("Theme", true);
 
     let app_menu = Submenu::new("Volt", true);
     let _ = app_menu.append_items(&[
@@ -153,6 +168,7 @@ pub fn install_app_menu() -> Menu {
         &PredefinedMenuItem::separator(),
         &MenuAction::OpenSettings.item("Settings…"),
         &MenuAction::ReloadSettings.item("Reload Settings"),
+        &theme_menu,
         &PredefinedMenuItem::separator(),
         &PredefinedMenuItem::services(None),
         &PredefinedMenuItem::separator(),
@@ -206,7 +222,65 @@ pub fn install_app_menu() -> Menu {
     let _ = menu.append_items(&[&app_menu, &file_menu, &edit_menu, &view_menu, &window_menu]);
 
     menu.init_for_nsapp();
-    menu
+    AppMenu {
+        _menu: menu,
+        theme_menu,
+        theme_items: Vec::new(),
+    }
+}
+
+/// The installed menu bar plus the handles needed to refresh Volt ▸ Theme.
+pub struct AppMenu {
+    /// Never read, only kept alive — see `install_app_menu`.
+    _menu: Menu,
+    theme_menu: Submenu,
+    theme_items: Vec<(String, CheckMenuItem)>,
+}
+
+impl AppMenu {
+    /// List `themes` (id, display name, built-in?) with `current` checked:
+    /// built-ins, then user themes, then the editor and folder items. Only
+    /// rebuilds when the list changed; otherwise just moves the check mark
+    /// (AppKit also toggles a clicked item itself, so always resync it).
+    pub fn set_themes(&mut self, themes: &[(String, String, bool)], current: &str) {
+        let same = self.theme_items.len() == themes.len()
+            && self
+                .theme_items
+                .iter()
+                .zip(themes)
+                .all(|((id, item), (tid, name, _))| id == tid && item.text() == *name);
+        if !same {
+            while self.theme_menu.remove_at(0).is_some() {}
+            self.theme_items = themes
+                .iter()
+                .map(|(id, name, _)| {
+                    let item = CheckMenuItem::with_id(
+                        format!("{THEME_ID_PREFIX}{id}"),
+                        name,
+                        true,
+                        false,
+                        None,
+                    );
+                    (id.clone(), item)
+                })
+                .collect();
+            let builtins = themes.iter().filter(|(_, _, builtin)| *builtin).count();
+            for (i, (_, item)) in self.theme_items.iter().enumerate() {
+                if i == builtins && i > 0 {
+                    let _ = self.theme_menu.append(&PredefinedMenuItem::separator());
+                }
+                let _ = self.theme_menu.append(item);
+            }
+            let _ = self.theme_menu.append_items(&[
+                &PredefinedMenuItem::separator(),
+                &MenuAction::CustomizeTheme.item("Customize Theme…"),
+                &MenuAction::OpenThemesFolder.item("Open Themes Folder"),
+            ]);
+        }
+        for (id, item) in &self.theme_items {
+            item.set_checked(id == current);
+        }
+    }
 }
 
 /// Build a fresh right-click context menu for the terminal view. Built fresh
