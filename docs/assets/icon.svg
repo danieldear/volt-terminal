@@ -1,0 +1,78 @@
+<!--
+  Apple macOS icon spec:
+  - Canvas:    1024×1024 px (transparent outside squircle)
+  - Safe zone: 824×824 px, offset (100, 100) — 10% margin on all sides
+  - Corner rx: 824 × 22.4% ≈ 185 px (relative to the 824 shape)
+  - System adds drop shadow in the 100px margin — do NOT bake one in
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <!-- Background: dark Catppuccin Mocha -->
+    <linearGradient id="bg" x1="100" y1="100" x2="924" y2="924"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0%" style="stop-color:#313244"/>
+      <stop offset="100%" style="stop-color:#1e1e2e"/>
+    </linearGradient>
+
+    <!-- Bolt gradient -->
+    <linearGradient id="bolt" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   style="stop-color:#cba6f7"/>
+      <stop offset="50%"  style="stop-color:#89b4fa"/>
+      <stop offset="100%" style="stop-color:#74c7ec"/>
+    </linearGradient>
+
+    <!-- Glass specular: subtle top-down white highlight -->
+    <linearGradient id="glassshine" x1="0" y1="100" x2="0" y2="924"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   style="stop-color:#ffffff; stop-opacity:0.16"/>
+      <stop offset="50%"  style="stop-color:#ffffff; stop-opacity:0.03"/>
+      <stop offset="100%" style="stop-color:#ffffff; stop-opacity:0.00"/>
+    </linearGradient>
+
+    <!-- Soft glow for bolt -->
+    <filter id="glow" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="14" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!--
+      Squircle lives in the 824×824 safe zone at offset (100,100).
+      rx=185 is 22.4% of 824 — matches Apple HIG.
+    -->
+    <clipPath id="squircle">
+      <rect x="100" y="100" width="824" height="824" rx="185" ry="185"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#squircle)">
+    <!-- 1. Background fills the 824×824 safe zone -->
+    <rect x="100" y="100" width="824" height="824" fill="url(#bg)"/>
+
+    <!--
+      2. Lightning bolt — original proportions, scaled to 824×824 safe zone.
+         Scale factor = 824/1024; translate +100 on both axes.
+         Original: 594,155  265,555  512,555  430,870  759,470  512,470
+         Scaled:   579,225  313,547  512,547  446,800  711,478  512,478
+    -->
+    <polygon
+      points="579,225  313,547  512,547  446,800  711,478  512,478"
+      fill="url(#bolt)"
+      filter="url(#glow)"
+    />
+
+    <!-- 3. Glass specular overlay -->
+    <rect x="100" y="100" width="824" height="824" fill="url(#glassshine)"/>
+
+    <!--
+      4. Inner border ring (glass rim) — 3px inset from squircle edge.
+         rx=183 keeps it inside the rx=185 clip.
+    -->
+    <rect x="103" y="103" width="818" height="818" rx="183" ry="183"
+          fill="none"
+          stroke="rgba(255,255,255,0.20)"
+          stroke-width="5"/>
+  </g>
+</svg>

@@ -12,6 +12,8 @@ use volt_config::{CursorStyle, Theme};
 use volt_core::cell::CellColor;
 use volt_core::grid::Grid;
 
+use crate::tab_color::TabColor;
+
 const ATLAS_SIZE: u32 = 2048;
 const INITIAL_BG_VERT_CAPACITY: usize = 16_384;
 const INITIAL_GLYPH_VERT_CAPACITY: usize = 32_768;
@@ -56,6 +58,24 @@ fn glyph_bitmap_origin(
     (
         (physical_x + bitmap_left) as f32,
         line_y + (physical_y - bitmap_top) as f32,
+    )
+}
+
+/// Count the glyphs that fit before an ellipsis. `None` means the complete
+/// title fits; this uses the shaped advances, not a character-count guess, so
+/// narrow tabs and non-ASCII titles do not cut through UTF-8 or clip the mark.
+fn tab_title_prefix_len<I>(glyphs: I, max_width: f32, ellipsis_width: f32) -> Option<usize>
+where
+    I: Iterator<Item = (f32, f32)> + Clone,
+{
+    if !glyphs.clone().any(|(x, width)| x + width > max_width) {
+        return None;
+    }
+    let available = (max_width - ellipsis_width).max(0.0);
+    Some(
+        glyphs
+            .take_while(|(x, width)| x + width <= available)
+            .count(),
     )
 }
 
@@ -242,6 +262,7 @@ fn default_symbol_font_family(font_system: &FontSystem, primary_family: &str) ->
 /// One entry for the tab bar
 pub struct TabEntry<'a> {
     pub title: &'a str,
+    pub color: Option<TabColor>,
     pub active: bool,
     pub index: usize,
     pub busy: bool,
@@ -359,6 +380,8 @@ pub struct Renderer {
     extended_shape_cache: HashMap<(String, bool, bool), Vec<CachedGlyph>>,
     symbol_font_family: Option<String>,
     top_alert: Option<String>,
+    /// True only when macOS confirmed Secure Event Input is enabled.
+    pub secure_input_active: bool,
     bg_vertex_buffer: wgpu::Buffer,
     bg_vertex_capacity: usize,
     glyph_vertex_buffer: wgpu::Buffer,
@@ -724,6 +747,7 @@ impl Renderer {
             extended_shape_cache: HashMap::new(),
             symbol_font_family,
             top_alert: None,
+            secure_input_active: false,
             bg_vertex_buffer,
             bg_vertex_capacity: INITIAL_BG_VERT_CAPACITY,
             glyph_vertex_buffer,
@@ -1182,6 +1206,90 @@ impl Renderer {
                 color,
             },
         ]);
+    }
+
+    /// Append a rounded rectangle to the existing background batch. This is
+    /// only used by small HUD elements, so a few corner triangles are cheaper
+    /// than introducing another render pipeline or texture.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_rounded_rect(
+        &self,
+        bg: &mut Vec<BgVertex>,
+        px: f32,
+        py: f32,
+        pw: f32,
+        ph: f32,
+        radius: f32,
+        color: [f32; 4],
+    ) {
+        if pw <= 0.0 || ph <= 0.0 {
+            return;
+        }
+        let r = radius.clamp(0.0, pw.min(ph) * 0.5);
+        if r == 0.0 {
+            self.draw_rect(bg, px, py, pw, ph, color);
+            return;
+        }
+
+        let sw = self.config.width as f32;
+        let sh = self.config.height as f32;
+        let center = [
+            (px + pw * 0.5) / sw * 2.0 - 1.0,
+            1.0 - (py + ph * 0.5) / sh * 2.0,
+        ];
+        let corners = [
+            (px + r, py + r),
+            (px + pw - r, py + r),
+            (px + pw - r, py + ph - r),
+            (px + r, py + ph - r),
+        ];
+        // Unit quarter-circle samples. Keeping these constant avoids trig on
+        // every frame while Secure Event Input is active.
+        const ARC: [(f32, f32); 7] = [
+            (1.0, 0.0),
+            (0.965_925_8, 0.258_819_04),
+            (0.866_025_4, 0.5),
+            (
+                std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2,
+            ),
+            (0.5, 0.866_025_4),
+            (0.258_819_04, 0.965_925_8),
+            (0.0, 1.0),
+        ];
+        let mut first = None;
+        let mut previous = None;
+        for (corner, (cx, cy)) in corners.into_iter().enumerate() {
+            for (c, s) in ARC {
+                let (dx, dy) = match corner {
+                    0 => (-c, -s), // top-left: left to top
+                    1 => (s, -c),  // top-right: top to right
+                    2 => (c, s),   // bottom-right: right to bottom
+                    _ => (-s, c),  // bottom-left: bottom to left
+                };
+                let point = [
+                    (cx + r * dx) / sw * 2.0 - 1.0,
+                    1.0 - (cy + r * dy) / sh * 2.0,
+                ];
+                if let Some(prev) = previous {
+                    bg.extend_from_slice(&[
+                        BgVertex { pos: center, color },
+                        BgVertex { pos: prev, color },
+                        BgVertex { pos: point, color },
+                    ]);
+                } else {
+                    first = Some(point);
+                }
+                previous = Some(point);
+            }
+        }
+        if let (Some(last), Some(first)) = (previous, first) {
+            bg.extend_from_slice(&[
+                BgVertex { pos: center, color },
+                BgVertex { pos: last, color },
+                BgVertex { pos: first, color },
+            ]);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1884,6 +1992,9 @@ impl Renderer {
             let text_top = tab_y + (tab_h - tab_font * ui_line_height) * 0.5;
             let icon_top = tab_y + (tab_h - info_font * ui_line_height) * 0.5;
             let close_top = tab_y + (tab_h - close_font * ui_line_height) * 0.5;
+            let title_metrics = Metrics::new(tab_font, tab_font * ui_line_height);
+            // Lazily shape once per frame, even if several tab titles overflow.
+            let mut ellipsis_buf: Option<Buffer> = None;
 
             for (i, tab) in tabs.iter().enumerate() {
                 let tx = left_pad + i as f32 * (tab_w + tab_gap);
@@ -1898,6 +2009,27 @@ impl Renderer {
                     theme.background.to_f32_alpha(0.30)
                 };
                 self.draw_rect(&mut bg_verts, tx, tab_y, tab_w, tab_h, tab_bg);
+                if let Some(color) = tab.color {
+                    let [r, g, b] = color.rgb();
+                    self.draw_rect(
+                        &mut bg_verts,
+                        tx,
+                        tab_y,
+                        tab_w,
+                        tab_h,
+                        [r, g, b, if active { 0.12 } else { 0.07 }],
+                    );
+                    // A stable edge remains visible even when the title is
+                    // shortened; the busy/idle dot keeps its own semantics.
+                    self.draw_rect(
+                        &mut bg_verts,
+                        tx,
+                        tab_y,
+                        (3.0 * sc).max(2.0),
+                        tab_h,
+                        [r, g, b, if active { 1.0 } else { 0.75 }],
+                    );
+                }
                 self.draw_rect(
                     &mut bg_verts,
                     tx,
@@ -1933,13 +2065,20 @@ impl Renderer {
                     tab_edge,
                 );
                 if active {
+                    let highlight = tab.color.map_or_else(
+                        || theme.foreground.to_f32_alpha(0.56),
+                        |color| {
+                            let [r, g, b] = color.rgb();
+                            [r, g, b, 0.90]
+                        },
+                    );
                     self.draw_rect(
                         &mut bg_verts,
                         tx,
                         tab_y,
                         tab_w,
                         (1.5 * sc).max(1.0),
-                        theme.foreground.to_f32_alpha(0.56),
+                        highlight,
                     );
                 }
 
@@ -1980,9 +2119,11 @@ impl Renderer {
                     theme.foreground.to_f32_alpha(0.66)
                 };
                 {
-                    let metrics = Metrics::new(tab_font, tab_font * ui_line_height);
-                    let mut buf = Buffer::new(&mut self.font_system, metrics);
-                    buf.set_size(&mut self.font_system, max_text_w, tab_font * 2.0);
+                    let mut buf = Buffer::new(&mut self.font_system, title_metrics);
+                    // Shape on one line before deciding where to ellipsize.
+                    // Sizing the buffer to the tab width would wrap a title
+                    // onto a second line and silently clip its last glyph.
+                    buf.set_size(&mut self.font_system, 10_000.0, tab_font * 2.0);
                     buf.set_text(
                         &mut self.font_system,
                         title,
@@ -1993,7 +2134,43 @@ impl Renderer {
                     let bx = title_left;
                     let by = text_top;
                     for run in buf.layout_runs() {
-                        for glyph in run.glyphs.iter() {
+                        let overflow = run
+                            .glyphs
+                            .iter()
+                            .any(|glyph| glyph.x + glyph.w > max_text_w);
+                        if overflow && ellipsis_buf.is_none() {
+                            let mut ellipsis = Buffer::new(&mut self.font_system, title_metrics);
+                            ellipsis.set_size(&mut self.font_system, 64.0 * sc, tab_font * 2.0);
+                            ellipsis.set_text(
+                                &mut self.font_system,
+                                "…",
+                                Attrs::new().family(Family::Monospace),
+                                Shaping::Advanced,
+                            );
+                            ellipsis.shape_until_scroll(&mut self.font_system, false);
+                            ellipsis_buf = Some(ellipsis);
+                        }
+                        let ellipsis = if overflow {
+                            ellipsis_buf.as_ref()
+                        } else {
+                            None
+                        };
+                        let ellipsis_width = ellipsis
+                            .and_then(|buffer| buffer.layout_runs().next())
+                            .and_then(|line| line.glyphs.first())
+                            .map_or(0.0, |glyph| glyph.w);
+                        let prefix_len = tab_title_prefix_len(
+                            run.glyphs.iter().map(|glyph| (glyph.x, glyph.w)),
+                            max_text_w,
+                            ellipsis_width,
+                        )
+                        .unwrap_or(run.glyphs.len());
+                        let text_limit = if overflow {
+                            max_text_w - ellipsis_width
+                        } else {
+                            max_text_w
+                        };
+                        for glyph in run.glyphs.iter().take(prefix_len) {
                             let physical = glyph.physical((0.0, 0.0), 1.0);
                             let Some(region) = self.atlas.get_or_rasterize(
                                 physical.cache_key,
@@ -2014,50 +2191,48 @@ impl Renderer {
                                 region.offset_x,
                                 region.offset_y,
                             );
-                            if rel_x + region.width as f32 > max_text_w {
+                            if rel_x + region.width as f32 > text_limit {
                                 break;
                             }
-                            let gx = bx + rel_x;
-                            let gy = by + rel_y;
-                            let gw = region.width as f32;
-                            let gh = region.height as f32;
-                            let x0 = (gx / sw) * 2.0 - 1.0;
-                            let x1 = ((gx + gw) / sw) * 2.0 - 1.0;
-                            let y0 = 1.0 - (gy / sh) * 2.0;
-                            let y1 = 1.0 - ((gy + gh) / sh) * 2.0;
-                            let [u0, v0, u1, v1] = [region.u0, region.v0, region.u1, region.v1];
-                            glyph_verts.extend_from_slice(&[
-                                GlyphVertex {
-                                    pos: [x0, y0],
-                                    uv: [u0, v0],
-                                    color: title_color,
-                                },
-                                GlyphVertex {
-                                    pos: [x1, y0],
-                                    uv: [u1, v0],
-                                    color: title_color,
-                                },
-                                GlyphVertex {
-                                    pos: [x0, y1],
-                                    uv: [u0, v1],
-                                    color: title_color,
-                                },
-                                GlyphVertex {
-                                    pos: [x1, y0],
-                                    uv: [u1, v0],
-                                    color: title_color,
-                                },
-                                GlyphVertex {
-                                    pos: [x1, y1],
-                                    uv: [u1, v1],
-                                    color: title_color,
-                                },
-                                GlyphVertex {
-                                    pos: [x0, y1],
-                                    uv: [u0, v1],
-                                    color: title_color,
-                                },
-                            ]);
+                            append_glyph_quad(
+                                &mut glyph_verts,
+                                sw,
+                                sh,
+                                bx + rel_x,
+                                by + rel_y,
+                                region,
+                                title_color,
+                            );
+                        }
+                        if let Some(ellipsis) = ellipsis {
+                            for line in ellipsis.layout_runs() {
+                                for glyph in line.glyphs.iter() {
+                                    let physical = glyph.physical((0.0, 0.0), 1.0);
+                                    let Some(region) = self.atlas.get_or_rasterize(
+                                        physical.cache_key,
+                                        &mut self.font_system,
+                                        &mut self.swash_cache,
+                                    ) else {
+                                        continue;
+                                    };
+                                    let (rel_x, rel_y) = glyph_bitmap_origin(
+                                        physical.x,
+                                        physical.y,
+                                        line.line_y,
+                                        region.offset_x,
+                                        region.offset_y,
+                                    );
+                                    append_glyph_quad(
+                                        &mut glyph_verts,
+                                        sw,
+                                        sh,
+                                        bx + (max_text_w - ellipsis_width).max(0.0) + rel_x,
+                                        by + rel_y,
+                                        region,
+                                        title_color,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -2177,6 +2352,92 @@ impl Renderer {
         let hud_start = (bg_verts.len(), glyph_verts.len());
         // ── overlays: read-only badge, inspector, Find/rename prompt ─────────
         // Drawn last so they sit on top of the terminal content and dividers.
+        if self.secure_input_active {
+            let sc = self.scale_factor;
+            let w = 151.0 * sc;
+            let h = 34.0 * sc;
+            let x = sw - w - 12.0 * sc;
+            let y = content_top + 8.0 * sc;
+            let amber = [0.97, 0.76, 0.34, 1.0];
+            let shell = [0.31, 0.28, 0.21, 0.96];
+            let surface = [0.10, 0.13, 0.14, 0.97];
+            let icon_surface = [0.23, 0.20, 0.15, 1.0];
+
+            // Subtle one-pixel outline and a dark, fully rounded capsule.
+            self.draw_rounded_rect(&mut bg_verts, x, y, w, h, 12.0 * sc, shell);
+            self.draw_rounded_rect(
+                &mut bg_verts,
+                x + sc,
+                y + sc,
+                w - 2.0 * sc,
+                h - 2.0 * sc,
+                11.0 * sc,
+                surface,
+            );
+
+            let icon_x = x + 7.0 * sc;
+            let icon_y = y + 5.0 * sc;
+            self.draw_rounded_rect(
+                &mut bg_verts,
+                icon_x,
+                icon_y,
+                24.0 * sc,
+                24.0 * sc,
+                7.0 * sc,
+                icon_surface,
+            );
+            // Vector lock: rounded shackle, open center, body and keyhole.
+            // Unlike a font symbol, this is stable across font families.
+            self.draw_rounded_rect(
+                &mut bg_verts,
+                icon_x + 6.5 * sc,
+                icon_y + 4.0 * sc,
+                11.0 * sc,
+                13.0 * sc,
+                5.5 * sc,
+                amber,
+            );
+            self.draw_rounded_rect(
+                &mut bg_verts,
+                icon_x + 8.5 * sc,
+                icon_y + 6.0 * sc,
+                7.0 * sc,
+                10.0 * sc,
+                3.5 * sc,
+                icon_surface,
+            );
+            self.draw_rounded_rect(
+                &mut bg_verts,
+                icon_x + 5.0 * sc,
+                icon_y + 12.0 * sc,
+                14.0 * sc,
+                9.5 * sc,
+                2.5 * sc,
+                amber,
+            );
+            self.draw_rounded_rect(
+                &mut bg_verts,
+                icon_x + 11.1 * sc,
+                icon_y + 15.0 * sc,
+                1.8 * sc,
+                3.3 * sc,
+                0.9 * sc,
+                icon_surface,
+            );
+
+            let font_size = 11.5 * sc;
+            let ui_line_height = 1.15;
+            let text_y = y + (h - font_size * ui_line_height) * 0.5;
+            self.draw_text_with_line_height(
+                &mut glyph_verts,
+                "Secure input",
+                x + 40.0 * sc,
+                text_y,
+                font_size,
+                ui_line_height,
+                [0.98, 0.86, 0.63, 1.0],
+            );
+        }
         if read_only {
             let font_sz = 11.0 * self.scale_factor;
             let pad = 5.0 * self.scale_factor;
@@ -2387,6 +2648,14 @@ mod workspace_card_draw;
 #[cfg(test)]
 mod placement_tests {
     use super::*;
+
+    #[test]
+    fn tab_title_fit_reserves_room_for_a_real_ellipsis() {
+        let glyphs = [(0.0, 8.0), (8.0, 8.0), (16.0, 8.0), (24.0, 8.0)];
+        assert_eq!(tab_title_prefix_len(glyphs.into_iter(), 32.0, 8.0), None);
+        assert_eq!(tab_title_prefix_len(glyphs.into_iter(), 25.0, 8.0), Some(2));
+        assert_eq!(tab_title_prefix_len(glyphs.into_iter(), 7.0, 8.0), Some(0));
+    }
 
     #[test]
     fn physical_glyph_offsets_and_bitmap_bearings_are_preserved() {

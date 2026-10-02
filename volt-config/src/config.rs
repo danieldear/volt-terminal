@@ -536,54 +536,33 @@ impl Config {
         let Some(dir) = config_dir() else {
             return;
         };
-        let _ = std::fs::create_dir_all(&dir);
         let path = config_path().unwrap_or_else(|| dir.join("config.toml"));
-        if let Ok(s) = toml::to_string_pretty(self) {
-            let _ = std::fs::write(path, s);
+        if let Err(err) = self.save_to(&path) {
+            eprintln!("volt-config: failed to save config: {err}");
         }
+    }
+
+    fn save_to(&self, path: &Path) -> io::Result<()> {
+        let text = toml::to_string_pretty(self).map_err(io::Error::other)?;
+        write_config_atomically(&config_write_target(path)?, &text)
     }
 }
 
-/// Point the root `theme` key at `id` without discarding comments or other
-/// settings. A missing file is created from the commented sample config.
-/// Follow a config symlink and atomically replace its target, not the link.
-pub fn set_theme_in_config_file(path: &Path, id: &str) -> std::io::Result<()> {
-    if !crate::themes::is_valid_id(id) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("invalid theme id {id:?}"),
-        ));
+/// Follow a managed dotfile symlink while refusing to replace a broken one.
+fn config_write_target(path: &Path) -> io::Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path),
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(err) => Err(err),
     }
-    // canonicalize follows an existing symlink (including chains) so dotfile
-    // managers keep owning config.toml. A broken symlink is an error, not a
-    // missing file to replace with the sample.
-    let target = match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)?,
-        Ok(_) => path.to_path_buf(),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
-        Err(err) => return Err(err),
-    };
-    let existing = std::fs::metadata(&target).ok();
-    let text = match std::fs::read_to_string(&target) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => sample_config_toml(),
-        Err(err) => return Err(err),
-    };
-    let updated = with_theme_line(&text, id)?;
-    // Reject any edit that fails Volt's actual config parser or fails to set
-    // the requested root value. Never replace a working file with bad TOML.
-    let parsed = parse_config_with_compat(&updated)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    if parsed.theme != id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "theme edit did not update the root theme",
-        ));
-    }
+}
+
+/// Config may contain [ai].api_key. Every replacement starts and stays private;
+/// never copy a pre-existing world-readable mode onto secret-bearing data.
+fn write_config_atomically(target: &Path, text: &str) -> io::Result<()> {
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
-    // create_new prevents following an attacker/stale symlink at the temp path.
-    // New configs start private because [ai].api_key may contain a secret.
     for attempt in 0..32 {
         let tmp = dir.join(format!(
             ".config.toml.volt-{}-{}-{attempt}.tmp",
@@ -605,13 +584,15 @@ pub fn set_theme_in_config_file(path: &Path, id: &str) -> std::io::Result<()> {
             Err(err) => return Err(err),
         };
         let result = (|| {
-            file.write_all(updated.as_bytes())?;
-            if let Some(meta) = &existing {
-                file.set_permissions(meta.permissions())?;
+            file.write_all(text.as_bytes())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             }
             file.sync_all()?;
             drop(file);
-            std::fs::rename(&tmp, &target)
+            std::fs::rename(&tmp, target)
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -622,6 +603,39 @@ pub fn set_theme_in_config_file(path: &Path, id: &str) -> std::io::Result<()> {
         io::ErrorKind::AlreadyExists,
         "could not allocate a temporary config file",
     ))
+}
+
+/// Point the root `theme` key at `id` without discarding comments or other
+/// settings. A missing file is created from the commented sample config.
+/// Follow a config symlink and atomically replace its target, not the link.
+pub fn set_theme_in_config_file(path: &Path, id: &str) -> std::io::Result<()> {
+    if !crate::themes::is_valid_id(id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid theme id {id:?}"),
+        ));
+    }
+    // canonicalize follows an existing symlink (including chains) so dotfile
+    // managers keep owning config.toml. A broken symlink is an error, not a
+    // missing file to replace with the sample.
+    let target = config_write_target(path)?;
+    let text = match std::fs::read_to_string(&target) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => sample_config_toml(),
+        Err(err) => return Err(err),
+    };
+    let updated = with_theme_line(&text, id)?;
+    // Reject any edit that fails Volt's actual config parser or fails to set
+    // the requested root value. Never replace a working file with bad TOML.
+    let parsed = parse_config_with_compat(&updated)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    if parsed.theme != id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "theme edit did not update the root theme",
+        ));
+    }
+    write_config_atomically(&target, &updated)
 }
 
 /// TOML-aware editing avoids mistaking a multiline string or quoted key for a
@@ -880,6 +894,35 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_and_theme_edit_never_expose_api_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "volt-private-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("config.toml");
+        let mut config = Config::default();
+        config.ai.api_key = "test-only-key".into();
+        config.save_to(&path).unwrap();
+        let mode = || std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(), 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        set_theme_in_config_file(&path, "dracula").unwrap();
+        assert_eq!(mode(), 0o600);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("test-only-key"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

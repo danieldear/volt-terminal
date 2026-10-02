@@ -14,10 +14,10 @@
 
 - **GPU-accelerated rendering** — Metal-backed via `wgpu`, smooth at any size
 - **VTE-based parsing** — common ANSI/xterm sequences; advanced DCS and some OSC features remain unsupported
-- **Tabs + pane splits** — split right/left/up/down, drag-resizable dividers
+- **Tabs + pane splits** — per-tab color accents, split right/left/up/down, drag-resizable dividers
 - **Full mouse support** — click, scroll, Shift-click extension, drag selection with edge auto-scroll through retained history, double-click word / triple-click line select
 - **Native macOS menu bar** — File/Edit/View/Window menus and a dynamic Services submenu; keyboard shortcuts are handled by Volt, not menu-item accelerators
-- **Native right-click context menu** — Copy/Paste, split in any direction, reset terminal, read-only toggle, rename tab/terminal
+- **Native right-click context menu** — Copy/Paste, split in any direction, reset terminal, read-only toggle, rename tab/terminal, and choose a tab color
 - **Workspace Search** (`Cmd+Shift+P`) — floating local search for fuzzy file paths, saved text, retained output/current TUI screen, branches, worktrees, and task previews. [Scope and limits](docs/workspace-search.md).
 - **In-terminal Find** (`Cmd+F`) — search scrollback + visible output, jump between matches (navigation is capped at 100,000 matches)
 - **Alternate screen buffer** — vim, htop, etc. work correctly
@@ -42,6 +42,24 @@ including the dynamic Services submenu, is genuine.
 | macOS 13+ | ✅ Primary target |
 | Linux | 🚧 Compiles, UI layer in progress |
 | Windows | ❌ Not planned |
+
+---
+
+## Security and privacy
+
+On macOS, Volt enables **Secure Event Input** while a focused pane looks like a
+canonical, no-echo password prompt. You can also toggle it manually from the
+Volt menu for prompts that use other terminal modes. The lock indicator appears
+only when macOS accepts the request. This reduces ordinary keyboard-event
+eavesdropping by other apps; it **does not** authenticate the prompt, hide
+terminal output, or protect clipboard contents. Treat unexpected password
+prompts as untrusted.
+
+Volt does not implement OSC 52 clipboard writes from terminal output. Pasting
+is user-initiated and limited to 8 MiB per operation; oversized pastes are
+rejected. Volt-created `config.toml` files use owner-only permissions on Unix
+because configuration may contain an API key. Existing files are made
+owner-only when Volt saves or changes the selected theme.
 
 ---
 
@@ -266,6 +284,12 @@ active), and Change Tab Title…/Change Terminal Title… (overrides the
 OSC-reported title until cleared). When a terminal app has enabled mouse
 reporting, ordinary right-click goes to that app; use **Shift+right-click**
 for Volt's context menu.
+
+With the custom tab bar, right-click a tab (including an inactive one) to
+change its title or choose **Tab Color**. The color adds a narrow accent and
+subtle tint; the running/idle dot remains separate. **No Color** clears it.
+You can also choose Tab Color from the terminal context menu for the active
+tab. Tab colors are session-local and are not shown by native macOS tabs.
 
 ---
 

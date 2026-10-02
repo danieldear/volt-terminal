@@ -18,6 +18,8 @@ pub mod workspace_search;
 
 #[cfg(target_os = "macos")]
 mod native_text;
+#[cfg(target_os = "macos")]
+mod secure_input;
 
 mod keybindings;
 
