@@ -317,6 +317,9 @@ pub struct Renderer {
     search_palette_cache: Option<search_palette_draw::SearchGeometry>,
     pub workspace_card: Option<crate::workspace_card::WorkspaceCard>,
     workspace_card_cache: Option<workspace_card_draw::CardGeometry>,
+    /// Theme editor panel; drawn in the top layer, above the search palette.
+    pub theme_editor: Option<crate::theme_editor::ThemeEditorView>,
+    theme_editor_cache: Option<theme_editor_draw::EditorGeometry>,
     row_cache: Vec<CachedRow>,
     cache_context: Option<([f32; 8], Theme, CursorStyle)>,
     row_cache_enabled: bool,
@@ -703,6 +706,8 @@ impl Renderer {
             search_palette_cache: None,
             workspace_card: None,
             workspace_card_cache: None,
+            theme_editor: None,
+            theme_editor_cache: None,
             tab_bar_height,
             custom_tab_bar: true,
             scale_factor,
@@ -890,6 +895,7 @@ impl Renderer {
         self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
         self.workspace_card_cache = None;
         self.search_palette_cache = None;
+        self.theme_editor_cache = None;
         self.shape_cache.clear();
         self.extended_shape_cache.clear();
         self.row_cache.clear();
@@ -1443,6 +1449,7 @@ impl Renderer {
             self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
             self.workspace_card_cache = None;
             self.search_palette_cache = None;
+            self.theme_editor_cache = None;
             self.row_cache.clear();
         }
         if self.extended_shape_cache.len() > 4096 {
@@ -2350,6 +2357,9 @@ impl Renderer {
                 tab_top_h + alert_h,
             );
         }
+        if let Some(editor) = self.theme_editor.clone() {
+            self.draw_theme_editor(&mut bg_verts, &mut glyph_verts, &editor);
+        }
         self.submit_frame(
             view,
             output,
@@ -2442,3 +2452,6 @@ mod placement_tests {
 
 #[path = "search_palette_draw.rs"]
 mod search_palette_draw;
+
+#[path = "theme_editor_draw.rs"]
+mod theme_editor_draw;

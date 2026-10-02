@@ -22,7 +22,7 @@
 - **In-terminal Find** (`Cmd+F`) — search scrollback + visible output, jump between matches (navigation is capped at 100,000 matches)
 - **Alternate screen buffer** — vim, htop, etc. work correctly
 - **Config reload** — edit `config.toml`, press `Cmd+Shift+R`
-- **Built-in themes** — Catppuccin, Tokyo Night, Gruvbox, Nord, Dracula
+- **Themes** — built-in Catppuccin, Tokyo Night, Gruvbox, Nord, Dracula, plus your own; switch from Volt ▸ Theme and edit colors live with **Customize Theme…** ([details](#themes))
 - **Nerd Font support** — powerline / icon glyphs with automatic fallback
 - **macOS CVDisplayLink** — tear-free rendering locked to display refresh rate
 - **Transparent + blur** — compositor effects on macOS
@@ -85,7 +85,8 @@ fully-commented defaults the first time you do this. Press **`Cmd+Shift+R`**
 ```toml
 # Volt Terminal — Configuration
 
-# Options: catppuccin  tokyo-night  gruvbox  nord  dracula
+# Built-in: catppuccin  tokyo-night  gruvbox  nord  dracula
+# Or the id (file name) of a theme in ~/.config/volt/themes/.
 theme = "catppuccin"
 
 [font]
@@ -103,6 +104,53 @@ opacity = 1.0
 cursor_style = "block"   # block | underline | beam
 cursor_blink = true
 ```
+
+### Themes
+
+**Volt ▸ Theme** lists the built-in themes, then your own. Picking one
+switches every window immediately and rewrites only the `theme = "…"` line
+of `config.toml` (comments and other settings are kept).
+
+**Volt ▸ Theme ▸ Customize Theme…** opens an editor panel over the top-right
+of the window. The terminal behind it is the live preview.
+
+- Six base colors (background, foreground, cursor, cursor text, selection,
+  selection text) and the 16 ANSI colors. Click a row or swatch, or use
+  `Tab`/`Shift+Tab` (or the arrow keys) to move between them.
+- Type a hex color — the first digit replaces the shown value, and it
+  applies as soon as six digits are entered. A red border means the text
+  isn't a complete `#rrggbb` color yet. `Cmd+V` pastes a color,
+  `Cmd+Backspace` clears the field.
+- **Revert** goes back to the theme as it was opened (or last saved).
+  `Esc` or **×** closes the editor and restores it.
+- **Save** (`Cmd+S`) overwrites the user theme you're editing. Built-in
+  themes can't be overwritten, so their button is **Save as…**, which asks
+  for a name; `Cmd+Shift+S` always asks. Saving switches to the saved theme.
+
+Saved themes are TOML files in `~/.config/volt/themes/` (**Open Themes
+Folder** in the same menu). The file name is the theme's id — the value used
+in `theme = "…"`:
+
+```toml
+# ~/.config/volt/themes/nord-custom.toml
+name = "Nord Custom"
+background = "#2e3440"
+foreground = "#d8dee9"
+cursor = "#d8dee9"
+cursor_text = "#2e3440"
+selection_background = "#4c566a"
+selection_foreground = "#eceff4"
+ansi = [
+  "#3b4252", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#88c0d0", "#e5e9f0",
+  "#4c566a", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#8fbcbb", "#eceff4",
+]
+```
+
+All fields are required and unknown fields are rejected. Ids are lowercase
+letters, digits and dashes, and can't reuse a built-in id. Files that fail
+these checks, symlinks, files over 64 KiB, and anything past the first 256
+files are skipped; the reason shows in the alert bar. Themes are re-read on
+Reload Settings and after each save.
 
 ---
 
@@ -180,10 +228,11 @@ Supported actions: `copy`, `paste`, `find`, `search_workspace`,
 `close_pane`, `next_tab`, `previous_tab`, `previous_prompt`, `next_prompt`, `split_right`, `split_left`,
 `split_down`, `split_up`, `focus_left`, `focus_right`, `focus_up`, `focus_down`,
 `increase_font_size`, `decrease_font_size`, `toggle_fullscreen`, `reload_config`,
-`open_config`, `quit`, `ignore`, `unbind`.
+`open_config`, `customize_theme`, `quit`, `ignore`, `unbind`. `customize_theme`
+has no default shortcut; bind it to open or close the theme editor.
 
 Custom bindings do not override text editing in Find/title prompts, workspace
-search, or a focused workspace card. Paste continues to respect read-only panes.
+search, the theme editor, or a focused workspace card. Paste continues to respect read-only panes.
 Invalid keys/actions and configurations with over 128 bindings are rejected.
 Key sequences, key tables and arbitrary shell-command bindings are not supported.
 

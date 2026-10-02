@@ -30,6 +30,9 @@ pub enum Action {
     ToggleFullscreen,
     ReloadConfig,
     OpenConfig,
+    /// Open the theme editor on the current theme. Unbound by default; on
+    /// macOS it's also in Volt ▸ Theme ▸ Customize Theme….
+    CustomizeTheme,
     Quit,
     Ignore,
     Unbind,
