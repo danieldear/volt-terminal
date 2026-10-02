@@ -89,10 +89,6 @@ pub struct Theme {
 }
 
 impl Theme {
-    pub fn names() -> &'static [&'static str] {
-        &["catppuccin", "tokyo-night", "gruvbox", "nord", "dracula"]
-    }
-
     /// A built-in theme by its config id, or `None` for any other id.
     pub fn builtin(id: &str) -> Option<Self> {
         Some(match id {
