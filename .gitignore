@@ -26,6 +26,17 @@ AGENT007*.md
 AGENTS.agent007.generated.md
 /*.patch
 
+# Local credentials and overrides must not enter source control.
+.env
+.env.*
+!.env.example
+*.pem
+*.p8
+*.p12
+*.key
+*.local.toml
+.secrets/
+
 # Python validation bytecode
 __pycache__/
 *.pyc
