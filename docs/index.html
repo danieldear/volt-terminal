@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta name="description" content="Volt is a fast, GPU-rendered terminal for macOS, built in Rust. Explore its features, downloads, documentation, and roadmap.">
+  <meta name="description" content="Volt keeps your terminal front and center while Git changes, worktrees, search, and project actions stay one click away. Explore the public macOS preview.">
   <link rel="icon" type="image/svg+xml" href="assets/icon.svg">
-  <title>Volt — a terminal with room to work</title>
+  <title>Volt — stay in the terminal, keep your project in view</title>
   <style>
     :root {
       --ink: #e2e2ea;
@@ -41,20 +41,21 @@
     nav a:hover, footer a:hover, .text-link:hover { color: var(--amber-bright); }
     .nav-download { padding: 11px 15px; border: 1px solid rgba(245,158,11,.48); border-radius: 5px; color: var(--amber); font-weight: 650; }
     .nav-download:hover { border-color: var(--amber); background: rgba(245,158,11,.08); }
-    .hero { position: relative; padding: 104px 0 76px; display: grid; grid-template-columns: minmax(0, .84fr) minmax(0, 1.16fr); align-items: center; gap: 64px; }
+    .hero { position: relative; padding: 76px 0 64px; display: grid; grid-template-columns: minmax(0, .95fr) minmax(0, 1.05fr); align-items: center; gap: 54px; }
     .hero::before { content: ""; position: absolute; z-index: 0; width: 720px; height: 540px; left: 28%; top: 4%; pointer-events: none; background: radial-gradient(ellipse, rgba(245,158,11,.12), transparent 65%); }
-    .hero-copy { position: relative; z-index: 1; max-width: 550px; }
-    .eyebrow { color: var(--amber); font-size: 13px; font-weight: 650; letter-spacing: .02em; }
+    .hero-copy { position: relative; z-index: 1; max-width: 600px; }
+    .eyebrow { color: var(--amber); font-size: 13px; font-weight: 650; }
     h1, h2, h3, p { margin-top: 0; }
-    h1 { font-size: clamp(44px, 4.6vw, 66px); font-weight: 700; letter-spacing: -.07em; line-height: 1.12; margin: 19px 0 25px; }
-    .hero-copy > p { color: var(--muted); font-size: 18px; line-height: 1.65; max-width: 510px; }
-    .hero-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 34px; }
+    h1 { font-size: clamp(42px, 4vw, 56px); font-weight: 700; letter-spacing: -.065em; line-height: 1.15; margin: 18px 0 23px; }
+    .hero-copy > p { color: var(--muted); font-size: 16px; line-height: 1.6; max-width: 510px; }
+    .hero-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 29px; }
     .button { display: inline-flex; justify-content: center; align-items: center; min-height: 46px; padding: 0 19px; border-radius: 5px; font-weight: 650; font-size: 14px; transition: transform .16s ease, background-color .16s ease; }
     .button:hover { transform: translateY(-2px); }
     .button.primary { background: var(--amber); color: #08080b; }
     .button.primary:hover { background: var(--amber-bright); }
     .button.secondary { border: 1px solid #38383f; color: var(--ink); background: rgba(20,20,25,.72); }
     .button.secondary:hover { border-color: rgba(245,158,11,.55); }
+    .security-card a, .notice a { color: var(--amber-bright); text-decoration: underline; text-underline-offset: 3px; }
     .hero-note { display: block; margin-top: 23px; color: var(--quiet); font-size: 12px; line-height: 1.5; }
     .terminal-frame { position: relative; z-index: 1; min-width: 0; border: 1px solid #3d3426; border-radius: 10px; background: #111116; box-shadow: 0 30px 80px rgba(0,0,0,.52), 0 0 0 7px rgba(245,158,11,.025); overflow: hidden; }
     .terminal-head { height: 42px; display: flex; align-items: center; padding: 0 18px; border-bottom: 1px solid #292930; background: #18181d; gap: 7px; }
@@ -77,12 +78,16 @@
     .section-head { display: grid; grid-template-columns: minmax(0, .75fr) minmax(0, 1fr); gap: 40px; align-items: end; margin-bottom: 34px; }
     h2 { font-size: clamp(32px, 3vw, 43px); line-height: 1.18; letter-spacing: -.065em; font-weight: 700; margin: 0; }
     .section-head p { color: var(--muted); max-width: 570px; line-height: 1.6; font-size: 16px; margin: 0; }
-    .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: rgba(20,20,25,.57); }
-    .feature { padding: 30px 28px 33px; min-height: 200px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-    .feature:nth-child(3n) { border-right: 0; } .feature:nth-last-child(-n+3) { border-bottom: 0; }
-    .feature-icon { width: 31px; height: 31px; display: grid; place-items: center; margin-bottom: 23px; border: 1px solid rgba(245,158,11,.42); border-radius: 5px; background: rgba(245,158,11,.07); color: var(--amber); font-size: 16px; }
+    .benefit-list { border-top: 1px solid var(--line); }
+    .benefit { display: grid; grid-template-columns: 48px minmax(0, .75fr) minmax(0, 1fr); align-items: start; column-gap: 27px; padding: 25px 0 27px; border-bottom: 1px solid var(--line); }
+    .benefit-icon { width: 39px; height: 39px; display: grid; place-items: center; color: var(--amber); border: 1px solid rgba(245,158,11,.34); border-radius: 6px; background: rgba(245,158,11,.06); }
+    .benefit-icon svg { width: 22px; height: 22px; stroke: currentColor; stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
     h3 { font-size: 17px; margin-bottom: 10px; letter-spacing: -.02em; }
-    .feature p { color: var(--muted); font-size: 14px; line-height: 1.58; margin: 0; }
+    .benefit h3 { margin: 8px 0 0; }
+    .benefit p { color: var(--muted); font-size: 14px; line-height: 1.65; margin: 4px 0 0; }
+    .security-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .security-card { padding: 28px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+    .security-card p { color: var(--muted); font-size: 14px; line-height: 1.65; margin: 0; }
     .roadmap { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
     .roadmap-column { padding: 25px 26px 27px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
     .roadmap-column h3 { display: flex; align-items: center; gap: 9px; font-size: 16px; }
@@ -104,10 +109,7 @@
       .hero { grid-template-columns: 1fr; padding-top: 74px; gap: 46px; }
       .hero-copy { max-width: 750px; }
       .section-head { grid-template-columns: 1fr; gap: 17px; }
-      .feature-grid { grid-template-columns: repeat(2, 1fr); }
-      .feature:nth-child(3n) { border-right: 1px solid var(--line); }
-      .feature:nth-child(2n) { border-right: 0; }
-      .feature:nth-last-child(3) { border-bottom: 1px solid var(--line); }
+      .benefit { grid-template-columns: 48px minmax(0, .9fr) minmax(0, 1fr); column-gap: 18px; }
       .roadmap { grid-template-columns: 1fr; }
       .install { grid-template-columns: 1fr; gap: 30px; }
     }
@@ -120,9 +122,9 @@
       .terminal-body { min-height: 380px; padding: 23px 15px; font-size: 11px; }
       .inspector { right: 10px; top: 169px; width: 196px; }
       .section { padding-block: 60px; }
-      .feature-grid { grid-template-columns: 1fr; }
-      .feature, .feature:nth-child(3n), .feature:nth-child(2n) { min-height: 0; border-right: 0; border-bottom: 1px solid var(--line); }
-      .feature:last-child { border-bottom: 0; }
+      .benefit { grid-template-columns: 42px minmax(0, 1fr); row-gap: 7px; }
+      .benefit p { grid-column: 2; margin-top: 0; }
+      .security-grid { grid-template-columns: 1fr; }
       .button { width: 100%; }
       .hero-actions, .install-actions { width: 100%; }
     }
@@ -135,67 +137,74 @@
       <a class="brand" href="#top" aria-label="Volt home"><img class="brand-mark" src="assets/icon.svg" width="36" height="36" alt="">Volt</a>
       <nav aria-label="Main navigation">
         <a class="nav-optional" href="#features">Features</a>
+        <a class="nav-optional" href="#security">Security</a>
         <a class="nav-optional" href="#roadmap">Roadmap</a>
         <a href="#install">Install</a>
-        <a class="nav-download" href="https://github.com/danieldear/volt-terminal/releases">Releases</a>
+        <a class="nav-download" href="#install">Get Volt</a>
       </nav>
     </div>
   </header>
   <main id="top">
     <section class="wrap hero" aria-labelledby="hero-heading">
       <div class="hero-copy">
-        <span class="eyebrow">Built in Rust. At home on macOS.</span>
-        <h1 id="hero-heading">A terminal with room to work.</h1>
-        <p>Volt keeps the terminal fast and puts useful workspace context within reach. A native-feeling app, GPU-rendered text, and just enough context to stay in flow.</p>
+        <span class="eyebrow">Volt for macOS · public preview</span>
+        <h1 id="hero-heading">The terminal, with your project in view.</h1>
+        <p>Volt brings Git changes, worktrees, search, and project actions to a compact card. Dock it beside the shell or float it over a full-width editor.</p>
         <div class="hero-actions">
-          <a class="button primary" href="https://github.com/danieldear/volt-terminal/releases/latest">Download latest release</a>
+          <a class="button primary" href="#install">Explore the preview</a>
           <a class="button secondary" href="https://github.com/danieldear/volt-terminal">View source on GitHub</a>
         </div>
-        <small class="hero-note">Early development · macOS 13+ primary · Linux UI is experimental · MIT licensed</small>
+        <small class="hero-note">Version 0.1.8 · macOS 13+ · Early public preview</small>
       </div>
       <div class="terminal-frame" role="img" aria-label="Illustration of Volt showing a terminal prompt and a compact workspace card">
         <div class="terminal-head"><span class="traffic red"></span><span class="traffic yellow"></span><span class="traffic green"></span><span class="terminal-title">Volt — workspace</span></div>
         <div class="terminal-body">
-          <p><span class="term-amber">➜</span> <span class="term-green">volt-terminal</span> <span class="term-dim">git:(</span><span class="term-red">main</span><span class="term-dim">)</span> cargo test --workspace</p>
+          <p><span class="term-amber">➜</span> <span class="term-green">workspace</span> <span class="term-dim">git:(</span><span class="term-red">main</span><span class="term-dim">)</span> git status --short</p>
           <div class="term-gap"></div>
-          <p><span class="term-dim">   Compiling</span> volt-core v0.1.8</p>
-          <p><span class="term-dim">   Compiling</span> volt-renderer v0.1.8</p>
-          <p><span class="term-dim">   Compiling</span> volt-ui v0.1.8</p>
-          <p><span class="term-green">   Finished</span> test profile</p>
-          <p><span class="term-green">   Running</span> unit tests</p>
-          <p><span class="term-green">   test result:</span> ok</p>
+          <p><span class="term-red"> M</span> src/app.rs</p>
+          <p><span class="term-red"> M</span> tests/selection.rs</p>
+          <p><span class="term-green">??</span> docs/notes.md</p>
           <div class="term-gap"></div>
-          <p><span class="term-amber">➜</span> <span class="term-green">volt-terminal</span> <span class="term-dim">git:(</span><span class="term-red">main</span><span class="term-dim">)</span> <span class="cursor" aria-hidden="true"></span></p>
+          <p><span class="term-amber">➜</span> <span class="term-green">workspace</span> <span class="term-dim">git:(</span><span class="term-red">main</span><span class="term-dim">)</span> <span class="cursor" aria-hidden="true"></span></p>
         </div>
         <div class="inspector" aria-hidden="true">
-          <div class="inspector-head"><b>volt-terminal</b><span>● Changed</span></div>
-          <div class="inspector-row"><span>⌁ &nbsp; Changes</span><em>+18 &nbsp;<span class="term-red">−4</span></em></div>
-          <div class="inspector-row"><span>⑂ &nbsp; Branch</span><span>main</span></div>
-          <div class="inspector-row"><span>⌘ &nbsp; Workflows</span><span class="purple">3 found</span></div>
-          <div class="inspector-foot">Context when you want it. Space when you don't.</div>
+          <div class="inspector-head"><b>workspace</b><span>● Changed</span></div>
+          <div class="inspector-row"><span>Changes</span><em>+18 &nbsp;<span class="term-red">−4</span></em></div>
+          <div class="inspector-row"><span>Branch</span><span>main</span></div>
+          <div class="inspector-row"><span>Worktrees</span><span>2</span></div>
+          <div class="inspector-row"><span>Workflows</span><span class="purple">3 found</span></div>
+          <div class="inspector-foot">Dock it. Float it. Close it.</div>
         </div>
       </div>
     </section>
 
     <section class="section" id="features" aria-labelledby="features-heading">
       <div class="wrap">
-        <div class="section-head"><h2 id="features-heading">The terminal comes first.</h2><p>Volt’s workspace tools sit beside the shell, not in its way. Close or float the card when your editor needs every column.</p></div>
-        <div class="feature-grid">
-          <article class="feature"><span class="feature-icon" aria-hidden="true">▦</span><h3>GPU-rendered text</h3><p>Metal-backed rendering on macOS, with Nerd Font fallback and configurable font and line height.</p></article>
-          <article class="feature"><span class="feature-icon" aria-hidden="true">⌘</span><h3>Native workflow</h3><p>macOS menus, tabs, pane splits, text selection, Find, and familiar keyboard controls.</p></article>
-          <article class="feature"><span class="feature-icon" aria-hidden="true">⌁</span><h3>Workspace context</h3><p>A compact card for Git changes, branches, worktrees, workflows, and local tooling when available.</p></article>
-          <article class="feature"><span class="feature-icon" aria-hidden="true">⌕</span><h3>Search in place</h3><p>Find retained terminal output, or search workspace paths, text, branches, and worktrees.</p></article>
-          <article class="feature"><span class="feature-icon" aria-hidden="true">◈</span><h3>Make it yours</h3><p>Switch built-in themes or edit and save custom themes with a live preview.</p></article>
-          <article class="feature"><span class="feature-icon" aria-hidden="true">♧</span><h3>Built in the open</h3><p>MIT-licensed Rust source, reproducible CI checks, and a public roadmap with honest platform status.</p></article>
+        <div class="section-head"><h2 id="features-heading">The work stays in one place.</h2><p>Volt gives you project context without turning the terminal into a dashboard. Open what you need; leave the rest of the screen to your tools.</p></div>
+        <div class="benefit-list">
+          <article class="benefit"><span class="benefit-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="6" cy="4" r="2"/><circle cx="6" cy="20" r="2"/><circle cx="18" cy="6" r="2"/><path d="M6 6v12M18 8a8 8 0 0 1-8 8H6"/></svg></span><h3>Know what changed.</h3><p>Check Git changes, your current branch, worktrees, and available project workflows from a single compact card.</p></article>
+          <article class="benefit"><span class="benefit-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2.5" y="3.5" width="19" height="17" rx="2"/><path d="M16 3.5v17M4 7h10M4 10h7"/></svg></span><h3>Give your editor the window.</h3><p>Dock the card beside the terminal, or float it over the window so Neovim and other full-screen tools keep every column.</p></article>
+          <article class="benefit"><span class="benefit-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg></span><h3>Find it without leaving.</h3><p>Search visible and retained terminal output, then use workspace search for files, text, branches, and worktrees.</p></article>
+          <article class="benefit"><span class="benefit-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="16" rx="2"/><path d="M2.5 9h19M9 9v11M7 6.5h.01M11 6.5h.01"/></svg></span><h3>Keep sessions legible.</h3><p>Color and rearrange tabs, split panes, and tune the font, line height, and theme to suit long working sessions.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="security" aria-labelledby="security-heading">
+      <div class="wrap">
+        <div class="section-head"><h2 id="security-heading">Security, stated plainly.</h2><p>Volt is early software. Its safeguards are useful, but none is a substitute for reviewing what you run or reporting a flaw privately.</p></div>
+        <div class="security-grid">
+          <div class="security-card"><h3>Secure input has limits.</h3><p>On macOS, Volt can request Secure Event Input for a focused no-echo prompt, with a manual toggle for other cases. It does not hide terminal output, erase shell history, or protect the clipboard. <a href="https://github.com/danieldear/volt-terminal/blob/main/SECURITY.md">Read the security policy</a>.</p></div>
+          <div class="security-card"><h3>Public code, checked changes.</h3><p>The public repository requires a pull request and passing CI on main, including tests, dependency audit, and secret scanning. GitHub push protection and private vulnerability reporting are enabled. These checks cannot guarantee that Volt has no vulnerabilities. <a href="https://github.com/danieldear/volt-terminal/blob/main/docs/publication-security.md">See the publication review</a>.</p></div>
         </div>
       </div>
     </section>
 
     <section class="section" id="roadmap" aria-labelledby="roadmap-heading">
       <div class="wrap">
-        <div class="section-head"><h2 id="roadmap-heading">What comes next.</h2><p>Direction, not a promise of dates. Terminal correctness and safety stay ahead of extra features.</p></div>
+        <div class="section-head"><h2 id="roadmap-heading">What we're working on.</h2><p>Our priorities are simple: make the terminal dependable, make the public release easier to trust, then build on top of that foundation.</p></div>
         <div class="roadmap">
-          <div class="roadmap-column"><h3><span class="status-dot"></span> Now</h3><ul><li>Security review and secure input behavior</li><li>Public-release readiness and documentation</li><li>Rendering and input regression testing</li></ul></div>
+          <div class="roadmap-column"><h3><span class="status-dot"></span> Now</h3><ul><li>Public feedback on the early preview</li><li>Terminal correctness and secure input hardening</li><li>Rendering and input regression testing</li></ul></div>
           <div class="roadmap-column"><h3><span class="status-dot"></span> Next</h3><ul><li>Developer ID signing and notarization</li><li>Terminal protocol compatibility</li><li>More repeatable performance comparisons</li></ul></div>
           <div class="roadmap-column"><h3><span class="status-dot"></span> Exploring</h3><ul><li>Optional AI context and local-model workflows</li><li>Deeper project-aware actions</li><li>Broader platform support after macOS matures</li></ul></div>
         </div>
@@ -205,7 +214,7 @@
 
     <section class="section" id="install" aria-labelledby="install-heading">
       <div class="wrap install">
-        <div><h2 id="install-heading">Try Volt.</h2><p>Download the macOS build, or build from source. Volt is still early software; the current macOS release archive is ad-hoc signed, not notarized. Read the release notes before installing.</p><div class="install-actions"><a class="button primary" href="https://github.com/danieldear/volt-terminal/releases/latest">Get the macOS build</a><a class="button secondary" href="https://github.com/danieldear/volt-terminal/blob/main/README.md">Read the guide</a></div></div>
+        <div><h2 id="install-heading">Get Volt.</h2><p>Explore the v0.1.8 public preview or build it locally. The release includes a macOS app ZIP and a Linux binary archive. The macOS build is <strong>ad-hoc signed, not notarized</strong>, so Gatekeeper may block it; a notarized build is planned.</p><div class="install-actions"><a class="button primary" href="https://github.com/danieldear/volt-terminal/releases/tag/v0.1.8">View v0.1.8 release</a><a class="button secondary" href="https://github.com/danieldear/volt-terminal/blob/main/README.md#building-from-source">Build from source</a></div></div>
         <div><div class="code"><div class="code-label">Build from source · Rust 1.87+</div><pre><span>$</span> git clone https://github.com/danieldear/volt-terminal.git
 <span>$</span> cd volt-terminal
 <span>$</span> cargo build --release

@@ -46,14 +46,21 @@ Protect release tags and review workflow changes before creating a release.
 notes reflect it. Packaging runs only after validation succeeds. Setting mode
 `notarized` with any missing credentials is an error, not an unsigned release.
 
-## Current validation / external gate
+## Current public release / external gate
 
-A locally available Developer ID Application identity successfully signed the
-validation bundle with hardened runtime and a secure timestamp; strict signature
-verification passed. This is **not** a notarization result. No GitHub signing
-secrets were configured and no notarytool profile was supplied during this pass.
-No private signing material was exported or uploaded. The existing v0.1.2 release
-has not been modified or relabelled and remains ad-hoc signed.
+The public [v0.1.8 release](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.8)
+is **ad-hoc signed, not Developer ID signed or notarized**. Its release notes
+and `macos-signing-status.txt` say so explicitly. Gatekeeper may prevent the
+downloaded macOS app from opening. A locally available Developer ID Application
+identity has signed a validation bundle with hardened runtime and a secure
+timestamp, and strict signature verification passed. That local test is **not**
+a notarization result and does not change the published v0.1.8 artifact.
+
+The new public repository does not yet have the Apple signing and notarization
+credentials configured. The workflow's real notarization path still needs an
+end-to-end run and an install test using the downloaded artifact before a
+future release can be described as notarized. Do not relabel an older ad-hoc
+release as notarized.
 
 References:
 - [Apple notarization documentation](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)

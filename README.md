@@ -1,12 +1,22 @@
 <div align="center">
   <img src="assets/icon.svg" width="96" height="96" alt="Volt icon" />
   <h1>Volt</h1>
-  <p>A fast, GPU-accelerated terminal emulator for macOS — built in Rust.</p>
+  <p>Stay in the terminal. Keep your project in view.</p>
 </div>
 
 <br/>
 
+Volt keeps the shell at the center of your workflow. Git changes, branches,
+worktrees, search, and project actions are within reach in a compact workspace
+card that can sit beside the terminal or float over it.
+
 > ⚠️ **Early development.** Volt is functional on macOS, but it has not been validated as a daily driver; APIs and config formats may change before v1.0.
+
+**Public preview (October 2026):** [Volt v0.1.8](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.8)
+is available with macOS and Linux archives and SHA-256 checksums. The macOS
+archive is **ad-hoc signed, not Developer ID signed or notarized**. macOS
+Gatekeeper may prevent it from opening; a notarized public build is planned,
+not yet released. You can also [build from source](#building-from-source).
 
 ---
 
@@ -61,6 +71,13 @@ rejected. Volt-created `config.toml` files use owner-only permissions on Unix
 because configuration may contain an API key. Existing files are made
 owner-only when Volt saves or changes the selected theme.
 
+The public repository requires pull requests and passing CI checks on `main`,
+including tests, a dependency audit, and a full-history secret scan. GitHub
+secret scanning and push protection are enabled. These controls do not prove
+that Volt is free of vulnerabilities. Please use [private vulnerability
+reporting](SECURITY.md) rather than a public issue for security findings; see
+the [publication review](docs/publication-security.md) for the audit's limits.
+
 ---
 
 ## Building from source
@@ -86,10 +103,12 @@ Pushing a `v*` tag runs the release workflow. It builds and uploads:
 - a macOS `Volt.app` zip archive
 - `SHA256SUMS.txt`
 
-By default the macOS archive is ad-hoc signed. The release workflow also supports
-credential-gated Developer ID signing and notarization; see [distribution setup](docs/distribution.md).
-Release notes and `macos-signing-status.txt` identify the actual mode. Existing
-v0.1.2 downloads remain ad-hoc signed.
+The public [v0.1.8 release](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.8)
+is ad-hoc signed on macOS, **not notarized**. The workflow defaults to that
+mode until Apple credentials are configured; it never silently substitutes an
+ad-hoc build for a requested notarized build. See [distribution setup](docs/distribution.md).
+Release notes and `macos-signing-status.txt` identify the actual mode for each
+release. Verify downloads against the accompanying `SHA256SUMS.txt`.
 
 ---
 
