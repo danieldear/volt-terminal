@@ -14,7 +14,7 @@
 
 - **GPU-accelerated rendering** — Metal-backed via `wgpu`, smooth at any size
 - **VTE-based parsing** — common ANSI/xterm sequences; advanced DCS and some OSC features remain unsupported
-- **Tabs + pane splits** — per-tab color accents, split right/left/up/down, drag-resizable dividers
+- **Tabs + pane splits** — per-tab color accents, drag-to-reorder custom tabs, split right/left/up/down, drag-resizable dividers
 - **Full mouse support** — click, scroll, Shift-click extension, drag selection with edge auto-scroll through retained history, double-click word / triple-click line select
 - **Native macOS menu bar** — File/Edit/View/Window menus and a dynamic Services submenu; keyboard shortcuts are handled by Volt, not menu-item accelerators
 - **Native right-click context menu** — Copy/Paste, split in any direction, reset terminal, read-only toggle, rename tab/terminal, and choose a tab color
@@ -188,6 +188,7 @@ commands, but not every shortcut or its key-equivalent hint.
 | `Cmd+Tab` / `Ctrl+Tab` | Next tab |
 | `Cmd+Shift+Tab` | Previous tab |
 | `Cmd+Shift+[` / `Cmd+Shift+]` | Previous / next tab |
+| `Cmd+Shift+Left` / `Cmd+Shift+Right` | Move active custom tab one position left / right |
 | `Cmd+1`…`9` | Switch to tab N |
 | `Cmd+Alt+Arrow` / `Ctrl+Alt+Arrow` | Move focus between panes |
 | `Cmd+C` / `Ctrl+Shift+C` | Copy selection |
@@ -208,6 +209,11 @@ to change its layout (no dedicated keyboard shortcut).
 
 Double-clicking empty tab-bar chrome (not a tab) maximizes/restores the
 window, matching Finder/Safari.
+
+Drag a tab by its title to rearrange custom tabs. A normal click selects the
+tab on release; dragging an inactive tab leaves the current terminal active.
+The keyboard move stops at the first/last tab rather than wrapping. Native
+macOS tabs are managed by AppKit and are not reordered by these Volt commands.
 
 ### Custom shortcuts
 
@@ -243,7 +249,8 @@ OS-reserved shortcuts may never reach Volt.
 
 Supported actions: `copy`, `paste`, `find`, `search_workspace`,
 `toggle_workspace`, `toggle_workspace_layout`, `new_tab`, `new_window`,
-`close_pane`, `next_tab`, `previous_tab`, `previous_prompt`, `next_prompt`, `split_right`, `split_left`,
+`close_pane`, `next_tab`, `previous_tab`, `move_tab_left`, `move_tab_right`,
+`previous_prompt`, `next_prompt`, `split_right`, `split_left`,
 `split_down`, `split_up`, `focus_left`, `focus_right`, `focus_up`, `focus_down`,
 `increase_font_size`, `decrease_font_size`, `toggle_fullscreen`, `reload_config`,
 `open_config`, `customize_theme`, `quit`, `ignore`, `unbind`. `customize_theme`
