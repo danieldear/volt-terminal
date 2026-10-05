@@ -5,9 +5,9 @@ older versions may not receive backports.
 
 Please do **not** put vulnerabilities, credentials, or reproduction data
 containing secrets in public issues or pull requests. Use GitHub's private
-vulnerability reporting for this repository once it is enabled. If that option
-is unavailable, contact the maintainer through an existing private channel
-before disclosing details publicly.
+vulnerability reporting for this repository. If that option is unavailable,
+contact the maintainer through an existing private channel before disclosing
+details publicly.
 
 Volt's macOS Secure Event Input indicator means the OS accepted a request to
 limit ordinary keyboard event monitoring. It does **not** mask text printed by
