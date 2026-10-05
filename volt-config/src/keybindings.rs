@@ -15,6 +15,8 @@ pub enum Action {
     ClosePane,
     NextTab,
     PreviousTab,
+    MoveTabLeft,
+    MoveTabRight,
     PreviousPrompt,
     NextPrompt,
     SplitRight,
@@ -165,6 +167,9 @@ mod tests {
             toml::from_str("[[keybindings]]\nkey='cmd+shift+s'\naction='search_workspace'")
                 .unwrap();
         assert_eq!(c.keybindings[0].action, Action::SearchWorkspace);
+        let move_tab: crate::Config =
+            toml::from_str("[[keybindings]]\nkey='ctrl+alt+left'\naction='move_tab_left'").unwrap();
+        assert_eq!(move_tab.keybindings[0].action, Action::MoveTabLeft);
         assert!(toml::from_str::<crate::Config>(
             "[[keybindings]]\nkey='cmd+s'\naction='run_shell'"
         )

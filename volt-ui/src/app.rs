@@ -101,6 +101,80 @@ struct DividerDrag {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct TabDrag {
+    current_index: usize,
+    start_x: f32,
+    dragging: bool,
+}
+
+impl TabDrag {
+    fn target_at(&mut self, mx: f32, layout: &TabLayout, count: usize) -> Option<usize> {
+        if !self.dragging && (mx - self.start_x).abs() >= 6.0 * layout.sc {
+            self.dragging = true;
+        }
+        self.dragging
+            .then(|| layout.reorder_target(mx, self.current_index, count))
+            .flatten()
+    }
+}
+
+/// Reordering shifts indices, but must never change which logical tab is
+/// active (or which tab an open prompt/search refers to).
+fn remap_tab_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < index && index <= to {
+        index - 1
+    } else if to <= index && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
+fn remap_tab_index_after_removal(index: usize, removed: usize) -> Option<usize> {
+    if index == removed {
+        None
+    } else if index > removed {
+        Some(index - 1)
+    } else {
+        Some(index)
+    }
+}
+
+fn move_tab_preserving_active<T>(
+    tabs: &mut Vec<T>,
+    active: &mut usize,
+    from: usize,
+    to: usize,
+) -> bool {
+    if from >= tabs.len() || to >= tabs.len() || from == to || *active >= tabs.len() {
+        return false;
+    }
+    let tab = tabs.remove(from);
+    tabs.insert(to, tab);
+    *active = remap_tab_index(*active, from, to);
+    true
+}
+
+fn tab_move_shortcut(
+    key: PhysicalKey,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    super_key: bool,
+) -> Option<i8> {
+    if !super_key || !shift || ctrl || alt {
+        return None;
+    }
+    match key {
+        PhysicalKey::Code(KeyCode::ArrowLeft) => Some(-1),
+        PhysicalKey::Code(KeyCode::ArrowRight) => Some(1),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 enum PaneFocusDirection {
     Left,
     Right,
@@ -150,6 +224,9 @@ struct MainState {
     proxy: EventLoopProxy<VoltEvent>,
     pty_wake_pending: Arc<AtomicBool>,
     divider_drag: Option<DividerDrag>,
+    /// Armed by a tab press; a plain click selects on release, a horizontal
+    /// drag moves the whole tab without changing the active terminal.
+    tab_drag: Option<TabDrag>,
     /// ID of the divider the mouse is currently hovering over (for visual highlight).
     divider_hover_id: Option<usize>,
     /// AI Chat Panel sidebar state.
@@ -746,6 +823,32 @@ impl MainState {
         self.switch_tab(prev);
     }
 
+    fn reorder_tab(&mut self, from: usize, to: usize) -> bool {
+        if !self.show_custom_tab_bar()
+            || !move_tab_preserving_active(&mut self.tabs, &mut self.active_tab, from, to)
+        {
+            return false;
+        }
+        self.rename_tab_target = self
+            .rename_tab_target
+            .map(|index| remap_tab_index(index, from, to));
+        self.search_target = self
+            .search_target
+            .map(|(index, pane)| (remap_tab_index(index, from, to), pane));
+        true
+    }
+
+    fn move_active_tab(&mut self, direction: i8) -> bool {
+        self.tab_drag = None;
+        let from = self.active_tab;
+        let to = match direction {
+            -1 => from.checked_sub(1),
+            1 => from.checked_add(1).filter(|&index| index < self.tabs.len()),
+            _ => None,
+        };
+        to.is_some_and(|to| self.reorder_tab(from, to))
+    }
+
     fn run_keybinding(&mut self, action: volt_config::keybindings::Action) {
         use volt_config::keybindings::Action as A;
         match action {
@@ -767,6 +870,12 @@ impl MainState {
             }
             A::NextTab => self.cycle_tab_next(),
             A::PreviousTab => self.cycle_tab_prev(),
+            A::MoveTabLeft => {
+                self.move_active_tab(-1);
+            }
+            A::MoveTabRight => {
+                self.move_active_tab(1);
+            }
             A::PreviousPrompt => self.jump_prompt(true),
             A::NextPrompt => self.jump_prompt(false),
             A::SplitRight | A::SplitLeft => {
@@ -834,13 +943,19 @@ impl MainState {
     }
 
     fn close_tab(&mut self, idx: usize) {
-        if self.tabs.len() <= 1 {
+        if self.tabs.len() <= 1 || idx >= self.tabs.len() {
             return;
         }
+        self.tab_drag = None;
         self.tabs.remove(idx);
-        if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
-        }
+        self.active_tab = remap_tab_index_after_removal(self.active_tab, idx)
+            .unwrap_or_else(|| idx.min(self.tabs.len() - 1));
+        self.rename_tab_target = self
+            .rename_tab_target
+            .and_then(|index| remap_tab_index_after_removal(index, idx));
+        self.search_target = self.search_target.and_then(|(index, pane)| {
+            remap_tab_index_after_removal(index, idx).map(|index| (index, pane))
+        });
         self.resize_all_tabs_to_current_grid();
     }
 
@@ -1095,8 +1210,10 @@ impl MainState {
         self.begin_redraw();
     }
 
-    /// Handle a left-click within the tab bar. Returns `true` if it hit a
-    /// real target (a tab, its close button, or the + button); `false`
+    /// Handle a left press within the tab bar. Tabs arm a click/drag; the
+    /// click selects on release so moving an inactive tab keeps its pane and
+    /// the currently active terminal unchanged. Returns `true` for a real
+    /// target (a tab, its close button, or the + button); `false`
     /// means it landed on empty chrome, which the caller treats as a
     /// double-click-to-maximize candidate.
     fn handle_click(&mut self, mx: f32, my: f32) -> bool {
@@ -1110,7 +1227,11 @@ impl MainState {
             if tl.hit_close(mx, my, i) {
                 self.close_tab(i);
             } else {
-                self.switch_tab(i);
+                self.tab_drag = Some(TabDrag {
+                    current_index: i,
+                    start_x: mx,
+                    dragging: false,
+                });
             }
             true
         } else if tl.hit_plus(mx, my) {
@@ -2202,6 +2323,7 @@ impl App {
             proxy,
             pty_wake_pending: Arc::clone(&self.pty_wake_pending),
             divider_drag: None,
+            tab_drag: None,
             divider_hover_id: None,
             workspace_panel: WorkspacePanel::default(),
             workspace_search: crate::workspace_search::SearchPalette::default(),
@@ -2932,6 +3054,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     }
                 }
                 state.workspace_panel.drag_offset = None;
+                state.tab_drag = None;
                 state.is_drag_selecting = false;
                 state.selection_scroll_deadline = None;
                 state.left_shift_down = false;
@@ -2955,9 +3078,36 @@ impl ApplicationHandler<VoltEvent> for App {
                 }
             }
 
+            WindowEvent::CursorLeft { .. } => {
+                // A release outside our window may never arrive. Don't let a
+                // later click inherit an old tab drag candidate.
+                state.tab_drag = None;
+                state.window.set_cursor(winit::window::CursorIcon::Default);
+            }
+
             WindowEvent::CursorMoved { position, .. } => {
                 let pointer_moved = state.mouse_pos != (position.x as f32, position.y as f32);
                 state.mouse_pos = (position.x as f32, position.y as f32);
+                if let Some(mut drag) = state.tab_drag {
+                    let mx = state.mouse_pos.0;
+                    let layout = TabLayout::compute(
+                        state.window.inner_size().width as f32,
+                        state.current_tab_bar_height(),
+                        state.tabs.len(),
+                        state.renderer.scale_factor,
+                    );
+                    if let Some(target) = drag.target_at(mx, &layout, state.tabs.len()) {
+                        if state.reorder_tab(drag.current_index, target) {
+                            drag.current_index = target;
+                            state.begin_redraw();
+                        }
+                    }
+                    if drag.dragging {
+                        state.window.set_cursor(winit::window::CursorIcon::Grabbing);
+                    }
+                    state.tab_drag = Some(drag);
+                    return;
+                }
                 if state.workspace_search.visible || state.search_mouse_capture.is_some() {
                     return;
                 }
@@ -2988,6 +3138,33 @@ impl ApplicationHandler<VoltEvent> for App {
                         });
                         return;
                     }
+                }
+
+                if state.show_custom_tab_bar()
+                    && state.mouse_pos.1 < state.current_tab_bar_height()
+                    && !state.is_drag_selecting
+                    && state.divider_drag.is_none()
+                {
+                    let layout = TabLayout::compute(
+                        state.window.inner_size().width as f32,
+                        state.current_tab_bar_height(),
+                        state.tabs.len(),
+                        state.renderer.scale_factor,
+                    );
+                    let (mx, my) = state.mouse_pos;
+                    let cursor = if let Some(index) = layout.hit_tab(mx, my, state.tabs.len()) {
+                        if layout.hit_close(mx, my, index) {
+                            winit::window::CursorIcon::Pointer
+                        } else {
+                            winit::window::CursorIcon::Grab
+                        }
+                    } else if layout.hit_plus(mx, my) {
+                        winit::window::CursorIcon::Pointer
+                    } else {
+                        winit::window::CursorIcon::Default
+                    };
+                    state.window.set_cursor(cursor);
+                    return;
                 }
                 if let Some(drag) = state.divider_drag {
                     // Absolute ratio: start_ratio + total_delta / local_span.
@@ -3086,6 +3263,26 @@ impl ApplicationHandler<VoltEvent> for App {
                 button,
                 ..
             } => {
+                if button == MouseButton::Left && btn_state == ElementState::Released {
+                    if let Some(drag) = state.tab_drag.take() {
+                        if !drag.dragging {
+                            let (mx, my) = state.mouse_pos;
+                            let layout = TabLayout::compute(
+                                state.window.inner_size().width as f32,
+                                state.current_tab_bar_height(),
+                                state.tabs.len(),
+                                state.renderer.scale_factor,
+                            );
+                            if layout.hit_tab(mx, my, state.tabs.len()) == Some(drag.current_index)
+                            {
+                                state.switch_tab(drag.current_index);
+                                state.begin_redraw();
+                            }
+                        }
+                        state.window.set_cursor(winit::window::CursorIcon::Default);
+                        return;
+                    }
+                }
                 if btn_state == ElementState::Released && state.search_mouse_capture == Some(button)
                 {
                     state.search_mouse_capture = None;
@@ -3221,6 +3418,9 @@ impl ApplicationHandler<VoltEvent> for App {
                     }
                     if button == MouseButton::Left && btn_state == ElementState::Pressed {
                         let hit_target = state.handle_click(mx, my);
+                        if state.tab_drag.is_some() {
+                            state.window.set_cursor(winit::window::CursorIcon::Grab);
+                        }
                         if !hit_target {
                             // Empty chrome — double-click here maximizes, like
                             // Finder/Safari's tab-bar convention.
@@ -4014,6 +4214,14 @@ impl ApplicationHandler<VoltEvent> for App {
 
                 // ── global shortcuts ─────────────────────────────────────────
                 if defaults && super_key {
+                    if let Some(direction) =
+                        tab_move_shortcut(physical_key, ctrl, alt, shift, super_key)
+                    {
+                        if state.move_active_tab(direction) {
+                            state.begin_redraw();
+                        }
+                        return;
+                    }
                     match physical_key {
                         PhysicalKey::Code(KeyCode::Tab) => {
                             if shift {
@@ -5113,9 +5321,99 @@ mod tests {
     use super::{read_bounded_command_output, strip_bracketed_paste_end};
 
     use super::{
-        advance_drag_selection, selection_scroll_direction, Grid, MainState, Selection,
-        SelectionMode, SelectionScrollDirection,
+        advance_drag_selection, move_tab_preserving_active, remap_tab_index,
+        remap_tab_index_after_removal, selection_scroll_direction, tab_move_shortcut, Grid,
+        MainState, Selection, SelectionMode, SelectionScrollDirection, TabDrag, TabLayout,
     };
+
+    #[test]
+    fn only_plain_cmd_shift_horizontal_arrows_move_tabs() {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+        let left = PhysicalKey::Code(KeyCode::ArrowLeft);
+        let right = PhysicalKey::Code(KeyCode::ArrowRight);
+        assert_eq!(tab_move_shortcut(left, false, false, true, true), Some(-1));
+        assert_eq!(tab_move_shortcut(right, false, false, true, true), Some(1));
+        assert_eq!(tab_move_shortcut(left, false, false, false, true), None);
+        assert_eq!(tab_move_shortcut(left, false, true, true, true), None);
+        assert_eq!(tab_move_shortcut(right, true, false, true, true), None);
+        assert_eq!(tab_move_shortcut(left, false, false, true, false), None);
+        assert_eq!(
+            tab_move_shortcut(
+                PhysicalKey::Code(KeyCode::ArrowUp),
+                false,
+                false,
+                true,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn tab_drag_ignores_click_jitter_then_moves_across_centers() {
+        let layout = TabLayout::compute(900.0, 36.0, 3, 2.0);
+        let start_x = layout.tab_x(0) + layout.tab_w * 0.5;
+        let mut drag = TabDrag {
+            current_index: 0,
+            start_x,
+            dragging: false,
+        };
+        assert_eq!(drag.target_at(start_x + 11.0, &layout, 3), None);
+        assert!(!drag.dragging);
+        assert_eq!(drag.target_at(start_x + 12.0, &layout, 3), Some(0));
+        assert!(drag.dragging);
+        assert_eq!(
+            drag.target_at(layout.tab_x(2) + layout.tab_w * 0.5, &layout, 3),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn moving_any_tab_preserves_active_identity_and_other_index_targets() {
+        for from in 0..4 {
+            for to in 0..4 {
+                for active in 0..4 {
+                    let mut tabs = vec!["A", "B", "C", "D"];
+                    let selected = tabs[active];
+                    let mut active_index = active;
+                    let moved = move_tab_preserving_active(&mut tabs, &mut active_index, from, to);
+                    assert_eq!(moved, from != to);
+                    assert_eq!(tabs[active_index], selected);
+                    assert_eq!(tabs[to], ["A", "B", "C", "D"][from]);
+                    for old_index in 0..4 {
+                        assert_eq!(
+                            tabs[remap_tab_index(old_index, from, to)],
+                            ["A", "B", "C", "D"][old_index]
+                        );
+                    }
+                }
+            }
+        }
+        let mut tabs = vec!["A", "B"];
+        let mut active = 1;
+        assert!(!move_tab_preserving_active(&mut tabs, &mut active, 0, 2));
+        assert!(!move_tab_preserving_active(&mut tabs, &mut active, 2, 0));
+        assert_eq!(tabs, ["A", "B"]);
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn closing_an_inactive_tab_preserves_active_identity() {
+        for removed in 0..4 {
+            for active in 0..4 {
+                let mut tabs = vec!["A", "B", "C", "D"];
+                let selected = tabs[active];
+                tabs.remove(removed);
+                let active_after = remap_tab_index_after_removal(active, removed)
+                    .unwrap_or_else(|| removed.min(tabs.len() - 1));
+                if active != removed {
+                    assert_eq!(tabs[active_after], selected);
+                } else {
+                    assert_eq!(active_after, removed.min(tabs.len() - 1));
+                }
+            }
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

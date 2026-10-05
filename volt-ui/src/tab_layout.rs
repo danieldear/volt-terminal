@@ -1,7 +1,7 @@
 /// Tab bar geometry and hit-testing.
 ///
-/// `TabLayout` is computed once per resize / tab-count change and then queried
-/// for per-pixel hit-testing during mouse events.
+/// `TabLayout` is cheap to compute for the current window and tab count;
+/// pointer handlers use it for hit-testing and drag targets.
 pub struct TabLayout {
     pub sc: f32,
     pub left_pad: f32,
@@ -82,5 +82,40 @@ impl TabLayout {
     pub fn hit_plus(&self, mx: f32, my: f32) -> bool {
         let (x, y, w, h) = self.plus_rect();
         mx >= x && mx < x + w && my >= y && my < y + h
+    }
+
+    /// Move only after the pointer crosses a neighboring tab's center. This
+    /// keeps a dragged tab stable in its own slot, including over the gaps,
+    /// while allowing a single motion to cross several tabs or window edges.
+    pub fn reorder_target(&self, mx: f32, current: usize, count: usize) -> Option<usize> {
+        if current >= count {
+            return None;
+        }
+        let mut target = current;
+        while target + 1 < count && mx >= self.tab_x(target + 1) + self.tab_w * 0.5 {
+            target += 1;
+        }
+        while target > 0 && mx <= self.tab_x(target - 1) + self.tab_w * 0.5 {
+            target -= 1;
+        }
+        Some(target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TabLayout;
+
+    #[test]
+    fn drag_crosses_neighbor_centers_and_clamps_at_edges() {
+        let layout = TabLayout::compute(900.0, 36.0, 4, 1.0);
+        let center = |i| layout.tab_x(i) + layout.tab_w * 0.5;
+        assert_eq!(layout.reorder_target(center(1) - 1.0, 0, 4), Some(0));
+        assert_eq!(layout.reorder_target(center(1), 0, 4), Some(1));
+        assert_eq!(layout.reorder_target(center(3) + 500.0, 0, 4), Some(3));
+        assert_eq!(layout.reorder_target(center(2) + 1.0, 3, 4), Some(3));
+        assert_eq!(layout.reorder_target(center(2), 3, 4), Some(2));
+        assert_eq!(layout.reorder_target(-500.0, 3, 4), Some(0));
+        assert_eq!(layout.reorder_target(center(0), 4, 4), None);
     }
 }
