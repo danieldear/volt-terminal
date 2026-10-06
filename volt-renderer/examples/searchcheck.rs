@@ -23,6 +23,47 @@ fn draw(r: &mut Renderer, g: &Grid) {
         false,
     );
 }
+fn row(kind: &str, title: &str, detail: &str, hits: &[(usize, usize)]) -> SearchRow {
+    SearchRow {
+        kind: kind.into(),
+        title: title.into(),
+        detail: detail.into(),
+        hits: hits.to_vec(),
+    }
+}
+fn sample_view() -> SearchView {
+    SearchView {
+        query: "invoice".into(),
+        query_selected: false,
+        cursor: 7,
+        scope: 0,
+        selected: 0,
+        rows: vec![
+            row(
+                "File",
+                "src/lib/invoice.ts",
+                "Modified 2 hours ago",
+                &[(8, 15)],
+            ),
+            row(
+                "Text",
+                "const invoice = await createInvoice(order)",
+                "src/routes/billing.ts:42",
+                &[(6, 13), (28, 35)],
+            ),
+            row(
+                "Output",
+                "PASS src/lib/invoice.test.ts",
+                "Terminal output, line 812",
+                &[(13, 20)],
+            ),
+            row("Branch", "fix/invoice-rounding", "Local branch", &[(4, 11)]),
+        ],
+        status: "4 results, searched locally".into(),
+        hint: "Enter to open".into(),
+        root: "~/code/atlas".into(),
+    }
+}
 fn main() -> Result<()> {
     std::fs::create_dir_all("target/searchcheck")?;
     let mut cases = 0;
@@ -43,33 +84,7 @@ fn main() -> Result<()> {
             }
             draw(&mut r, &filled);
             let baseline = r.read_offscreen_rgba()?;
-            r.search_palette = Some(SearchView {
-                query: "workspace".into(),
-                query_selected: false,
-                cursor: 9,
-                scope: 2,
-                selected: 0,
-                rows: vec![
-                    SearchRow {
-                        kind: "FILE".into(),
-                        title: "src/workspace_search.rs".into(),
-                        detail: "Saved file · read-only preview".into(),
-                    },
-                    SearchRow {
-                        kind: "TEXT".into(),
-                        title: "fn search_workspace()".into(),
-                        detail: "src/main.rs:42".into(),
-                    },
-                ],
-                preview: vec![
-                    "  42  fn search_workspace() {".into(),
-                    "  43      // Local, cancellable search".into(),
-                    "  44  }".into(),
-                ],
-                status: "2 results · local only".into(),
-                root: "/example/project".into(),
-                action: "Enter: read-only preview".into(),
-            });
+            r.search_palette = Some(sample_view());
             anyhow::ensure!(r.grid_size() == size, "search resized terminal grid");
             draw(&mut r, &empty);
             let overlay = r.read_offscreen_rgba()?;
@@ -149,6 +164,39 @@ fn main() -> Result<()> {
             }
             cases += 1;
         }
+    }
+    // The panel takes its colors from the active theme.
+    {
+        let (w, h) = (1050, 720);
+        let mut r = pollster::block_on(Renderer::new_offscreen(w, h, 14., 1., "SF Mono", 1.2))?;
+        let size = r.grid_size();
+        r.search_palette = Some(sample_view());
+        let grid = Grid::new(size.0, size.1);
+        let mut shots = Vec::new();
+        for name in ["gruvbox", "nord"] {
+            r.render_frame(
+                &grid,
+                &Theme::by_name(name),
+                &[],
+                false,
+                None,
+                false,
+                None,
+                &[],
+                None,
+                None,
+                None,
+                false,
+            );
+            let pixels = r.read_offscreen_rgba()?;
+            let f = std::fs::File::create(format!("target/searchcheck/search-theme-{name}.png"))?;
+            let mut png = png::Encoder::new(f, w, h);
+            png.set_color(png::ColorType::Rgba);
+            png.set_depth(png::BitDepth::Eight);
+            png.write_header()?.write_image_data(&pixels)?;
+            shots.push(pixels);
+        }
+        anyhow::ensure!(shots[0] != shots[1], "search panel ignores the theme");
     }
     println!("PASS: {cases} search GPU cases (grid, two underlying layers, cache, clean hide, Find handoff)");
     Ok(())

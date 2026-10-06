@@ -60,7 +60,7 @@ const MARKERS: &[&str] = &[
     "go.work",
     "Package.swift",
 ];
-fn marked(path: &Path) -> bool {
+pub(crate) fn marked(path: &Path) -> bool {
     MARKERS.iter().any(|m| path.join(m).is_file())
 }
 impl Project {

@@ -1,65 +1,133 @@
 use super::{BgVertex, GlyphVertex, Renderer, Theme};
-use crate::search_palette::{SearchLayout, SearchView};
+use crate::search_palette::{
+    SearchLayout, SearchRow, SearchView, FOOTER_H, PILL_H, PILL_TEXT, QUERY_H, ROW_H, SCOPES,
+};
+
 pub(super) struct SearchGeometry {
     view: SearchView,
-    size: (u32, u32),
-    scale: f32,
-    top: f32,
-    colors: ([f32; 4], [f32; 4]),
+    layout: SearchLayout,
+    colors: Colors,
     bg: Vec<BgVertex>,
     glyphs: Vec<GlyphVertex>,
 }
+
+/// Panel colors derived from the active terminal theme: surfaces are the
+/// background nudged toward the foreground, and the theme's yellow is the
+/// accent (amber in Gruvbox, soft gold in Nord, and so on).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Colors {
+    pub(super) shadow: [f32; 4],
+    pub(super) border: [f32; 4],
+    pub(super) panel: [f32; 4],
+    pub(super) line: [f32; 4],
+    pub(super) selected: [f32; 4],
+    pub(super) text: [f32; 4],
+    pub(super) muted: [f32; 4],
+    pub(super) quiet: [f32; 4],
+    pub(super) accent: [f32; 4],
+    pub(super) accent_bright: [f32; 4],
+    pub(super) accent_dim: [f32; 4],
+}
+
+impl Colors {
+    pub(super) fn from_theme(theme: &Theme) -> Self {
+        let bg = theme.background.to_f32();
+        let fg = theme.foreground.to_f32();
+        let mix = |t: f32| {
+            [
+                bg[0] + (fg[0] - bg[0]) * t,
+                bg[1] + (fg[1] - bg[1]) * t,
+                bg[2] + (fg[2] - bg[2]) * t,
+                1.,
+            ]
+        };
+        let accent = theme.ansi[3].to_f32();
+        Self {
+            shadow: [0., 0., 0., 0.45],
+            border: mix(0.22),
+            panel: mix(0.04),
+            line: mix(0.11),
+            selected: mix(0.10),
+            text: fg,
+            muted: mix(0.66),
+            quiet: mix(0.48),
+            accent,
+            accent_bright: theme.ansi[11].to_f32(),
+            accent_dim: [accent[0], accent[1], accent[2], 0.18],
+        }
+    }
+}
+
+/// Truncate to the columns that fit `width` at `size`, ending in `…`.
 fn fit(text: &str, width: f32, size: f32) -> String {
-    let cap = (width / (size * 0.65)).max(0.) as usize;
+    let cap = (width / (size * 0.6)).max(0.) as usize;
+    let cw = |c: char| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+    let clean = text.chars().filter(|c| !c.is_control());
+    if clean.clone().map(cw).sum::<usize>() <= cap {
+        return clean.collect();
+    }
     let mut out = String::new();
-    let mut n = 0;
-    for c in text.chars().filter(|c| !c.is_control()) {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if n + w > cap.saturating_sub(1) {
-            out.push('…');
+    let mut used = 0;
+    for c in clean {
+        if used + cw(c) > cap.saturating_sub(1) {
             break;
         }
         out.push(c);
-        n += w;
+        used += cw(c);
     }
+    out.push('…');
     out
 }
+
+/// Char ranges → byte ranges of `text`, for per-glyph coloring.
+fn byte_ranges(text: &str, hits: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let offsets: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let at = |c: usize| offsets[c.min(offsets.len() - 1)];
+    hits.iter()
+        .filter(|(a, b)| a < b)
+        .map(|&(a, b)| (at(a), at(b)))
+        .collect()
+}
+
 impl Renderer {
     pub fn search_layout(&self) -> Option<SearchLayout> {
-        self.search_palette.as_ref()?;
+        let view = self.search_palette.as_ref()?;
         SearchLayout::new(
             self.config.width as f32,
             self.config.height as f32,
             self.workspace_card_top_offset(),
             self.scale_factor,
+            view.rows.len(),
         )
     }
+
     pub(super) fn draw_search_palette(
         &mut self,
         bg: &mut Vec<BgVertex>,
         glyphs: &mut Vec<GlyphVertex>,
         view: &SearchView,
         theme: &Theme,
-        top: f32,
     ) {
-        let colors = (theme.background.to_f32(), theme.foreground.to_f32());
-        let size = (self.config.width, self.config.height);
-        let hit = self.search_palette_cache.as_ref().is_some_and(|c| {
-            c.view == *view
-                && c.size == size
-                && c.scale == self.scale_factor
-                && c.top == top
-                && c.colors == colors
-        });
-        if !hit {
+        let colors = Colors::from_theme(theme);
+        // Same layout function the click hit-test uses, so they can't drift.
+        let Some(layout) = self.search_layout() else {
+            return;
+        };
+        let cached = self
+            .search_palette_cache
+            .as_ref()
+            .is_some_and(|c| c.view == *view && c.layout == layout && c.colors == colors);
+        if !cached {
             let mut b = vec![];
             let mut g = vec![];
-            self.build_search_palette(&mut b, &mut g, view, theme, top);
+            self.build_search_palette(&mut b, &mut g, view, &layout, &colors);
             self.search_palette_cache = Some(SearchGeometry {
                 view: view.clone(),
-                size,
-                scale: self.scale_factor,
-                top,
+                layout,
                 colors,
                 bg: b,
                 glyphs: g,
@@ -70,213 +138,252 @@ impl Renderer {
             glyphs.extend_from_slice(&c.glyphs);
         }
     }
+
+    /// Text vertically centred in a box of height `h` at `y`.
+    fn search_text_y(y: f32, h: f32, size: f32) -> f32 {
+        y + (h - size * 1.2) / 2.
+    }
+
+    /// `text` in `color`, with `hits` (char ranges) in the bright accent.
+    #[allow(clippy::too_many_arguments)]
+    fn search_text(
+        &mut self,
+        glyphs: &mut Vec<GlyphVertex>,
+        c: &Colors,
+        text: &str,
+        hits: &[(usize, usize)],
+        x: f32,
+        y: f32,
+        size: f32,
+        color: [f32; 4],
+    ) {
+        let ranges = byte_ranges(text, hits);
+        self.draw_text_colored(glyphs, text, x, y, size, 1.2, &|i| {
+            if ranges.iter().any(|&(a, b)| i >= a && i < b) {
+                c.accent_bright
+            } else {
+                color
+            }
+        });
+    }
+
     fn build_search_palette(
         &mut self,
         bg: &mut Vec<BgVertex>,
         glyphs: &mut Vec<GlyphVertex>,
         v: &SearchView,
-        theme: &Theme,
-        top: f32,
+        l: &SearchLayout,
+        c: &Colors,
     ) {
-        let Some(l) = SearchLayout::new(
-            self.config.width as f32,
-            self.config.height as f32,
-            top,
-            self.scale_factor,
-        ) else {
-            return;
-        };
         let s = l.scale;
-        let [x, y, w, h] = [l.x, l.y, l.w, l.h];
-        let fg = theme.foreground.to_f32();
-        let base = theme.background.to_f32();
-        let panel = [base[0] * 0.83, base[1] * 0.83, base[2] * 0.83, 1.];
-        let line = [fg[0] * 0.24, fg[1] * 0.24, fg[2] * 0.24, 1.];
-        let muted = [fg[0] * 0.65, fg[1] * 0.65, fg[2] * 0.65, 1.];
-        let accent = [0.48, 0.72, 0.98, 1.];
-        self.card_round(
-            bg,
-            [x + 2. * s, y + 5. * s, w, h],
-            18. * s,
-            [0., 0., 0., 0.35],
-        );
-        self.card_round(bg, [x, y, w, h], 18. * s, line);
-        self.card_round(bg, [x + s, y + s, w - 2. * s, h - 2. * s], 17. * s, panel);
-        self.card_text(
-            glyphs,
-            "SEARCH WORKSPACE",
-            x + 20. * s,
-            y + 13. * s,
-            11. * s,
-            accent,
-        );
-        self.card_text(
-            glyphs,
-            &fit(&v.root, w - 224. * s, 9. * s),
-            x + 180. * s,
-            y + 15. * s,
-            9. * s,
-            muted,
-        );
-        self.card_text(glyphs, "×", x + w - 29. * s, y + 11. * s, 18. * s, muted);
-        if v.query_selected && !v.query.is_empty() {
-            let width = (unicode_width::UnicodeWidthStr::width(v.query.as_str()) as f32 * 9.6 * s)
-                .min(w - 48. * s);
-            self.card_round(
-                bg,
-                [x + 18. * s, y + 40. * s, width + 4. * s, 24. * s],
-                3. * s,
-                [0.18, 0.30, 0.43, 1.],
-            );
-        }
-        let query = if v.query.is_empty() {
-            "Files, output, text, branches, tasks…".into()
-        } else {
-            v.query.clone()
-        };
-        self.card_text(
-            glyphs,
-            &fit(&query, w - 48. * s, 16. * s),
-            x + 20. * s,
-            y + 42. * s,
-            16. * s,
-            if v.query.is_empty() { muted } else { fg },
-        );
-        // Query caret is presentation only; input remains owned by the modal controller.
-        let before: String = v.query.chars().take(v.cursor).collect();
-        let caret = unicode_width::UnicodeWidthStr::width(before.as_str()) as f32 * 9.6 * s;
-        if !v.query_selected && caret < w - 50. * s {
-            self.draw_rect(
-                bg,
-                x + 20. * s + caret,
-                y + 43. * s,
-                1. * s,
-                19. * s,
-                accent,
-            );
-        }
-        let tw = (w - 24. * s) / 6.;
-        for (i, label) in ["All", "Output", "Files", "Text", "Git", "Tasks"]
-            .iter()
-            .enumerate()
-        {
-            let tx = x + 12. * s + i as f32 * tw;
-            if i == v.scope {
-                self.card_round(
-                    bg,
-                    [tx, y + 76. * s, tw - 4. * s, 28. * s],
-                    7. * s,
-                    [0.18, 0.25, 0.32, 1.],
-                );
+        let (x, y, w, h) = (l.x, l.y, l.w, l.h);
+        self.card_round(bg, [x + 2. * s, y + 8. * s, w, h], 12. * s, c.shadow);
+        self.card_round(bg, [x, y, w, h], 12. * s, c.border);
+        self.card_round(bg, [x + s, y + s, w - 2. * s, h - 2. * s], 11. * s, c.panel);
+
+        self.draw_query_row(bg, glyphs, v, l, c);
+        self.draw_rect(bg, x + s, y + QUERY_H * s, w - 2. * s, s.max(1.), c.line);
+
+        for (i, label) in SCOPES.iter().enumerate() {
+            let p = l.scope_pill(i);
+            let on = i == v.scope;
+            if on {
+                self.card_round(bg, p, 6. * s, c.accent_dim);
             }
+            let size = PILL_TEXT * s;
+            let tx = p[0] + (p[2] - Self::approx_text_width(label, size)) / 2.;
+            let ty = Self::search_text_y(p[1], PILL_H * s, size);
             self.card_text(
                 glyphs,
                 label,
-                tx + 9. * s,
-                y + 83. * s,
-                11. * s,
-                if i == v.scope { accent } else { muted },
+                tx,
+                ty,
+                size,
+                if on { c.accent_bright } else { c.quiet },
             );
         }
-        self.draw_rect(bg, x + 16. * s, y + 110. * s, w - 32. * s, s, line);
+        let list = l.list();
+        self.draw_rect(bg, x + s, list[1] - s, w - 2. * s, s.max(1.), c.line);
+
         let first = l.first(v.selected);
         for (slot, row) in v.rows.iter().skip(first).take(l.count).enumerate() {
-            let ry = y + (116. + slot as f32 * 46.) * s;
             let selected = first + slot == v.selected;
-            if selected {
-                self.card_round(
-                    bg,
-                    [x + 8. * s, ry, w - 16. * s, 44. * s],
-                    8. * s,
-                    [0.16, 0.21, 0.26, 1.],
-                );
-                self.card_round(
-                    bg,
-                    [x + 9. * s, ry + 9. * s, 3. * s, 26. * s],
-                    1.5 * s,
-                    accent,
-                );
-            }
-            let color = match row.kind.as_str() {
-                "FILE" | "TEXT" => [0.45, 0.8, 0.78, 1.],
-                "BRANCH" | "WORKTREE" => [0.76, 0.61, 0.95, 1.],
-                "TASK" => [0.94, 0.76, 0.4, 1.],
-                _ => accent,
-            };
-            self.card_text(glyphs, &row.kind, x + 20. * s, ry + 9. * s, 9. * s, color);
-            self.card_text(
-                glyphs,
-                &fit(&row.title, w - 122. * s, 13. * s),
-                x + 94. * s,
-                ry + 5. * s,
-                13. * s,
-                fg,
-            );
-            self.card_text(
-                glyphs,
-                &fit(&row.detail, w - 122. * s, 10. * s),
-                x + 94. * s,
-                ry + 25. * s,
-                10. * s,
-                muted,
-            );
+            self.draw_result(bg, glyphs, c, row, l.row(slot), selected, s);
         }
         if v.rows.is_empty() {
+            let msg = if v.query.is_empty() {
+                "Type to search files, text, terminal output, branches and tasks."
+            } else {
+                v.status.as_str()
+            };
+            let size = 13. * s;
+            let text = fit(msg, list[2] - 40. * s, size);
             self.card_text(
                 glyphs,
-                "No results yet — type or choose a scope",
-                x + 20. * s,
-                y + 130. * s,
-                12. * s,
-                muted,
+                &text,
+                list[0] + 20. * s,
+                list[1] + 22. * s,
+                size,
+                c.quiet,
             );
         }
-        let py = y + (122. + l.count as f32 * 46.) * s;
-        let bottom = y + h - 62. * s;
-        if py + 18. * s < bottom {
-            self.draw_rect(bg, x + 16. * s, py - 4. * s, w - 32. * s, s, line);
-            for (i, text) in v.preview.iter().enumerate() {
-                let yy = py + i as f32 * 16. * s;
-                if yy + 15. * s > bottom {
-                    break;
-                }
-                self.card_text(
-                    glyphs,
-                    &fit(text, w - 40. * s, 11. * s),
-                    x + 20. * s,
-                    yy,
-                    11. * s,
-                    muted,
+
+        let f = l.footer();
+        self.draw_rect(bg, x + s, f[1], w - 2. * s, s.max(1.), c.line);
+        let size = 12. * s;
+        let ty = Self::search_text_y(f[1], FOOTER_H * s, size);
+        let hint_w = Self::approx_text_width(&v.hint, size);
+        let status = fit(&v.status, w - hint_w - 64. * s, size);
+        self.card_text(glyphs, &status, x + 18. * s, ty, size, c.quiet);
+        self.card_text(glyphs, &v.hint, x + w - 18. * s - hint_w, ty, size, c.muted);
+    }
+
+    fn draw_query_row(
+        &mut self,
+        bg: &mut Vec<BgVertex>,
+        glyphs: &mut Vec<GlyphVertex>,
+        v: &SearchView,
+        l: &SearchLayout,
+        c: &Colors,
+    ) {
+        let s = l.scale;
+        let q = l.query_row();
+        let cy = q[1] + q[3] / 2.;
+        // Magnifier: ring plus handle.
+        let (mx, my, r) = (q[0] + 26. * s, cy - 2. * s, 6.5 * s);
+        self.card_round(bg, [mx - r, my - r, 2. * r, 2. * r], r, c.quiet);
+        let ri = r - 1.8 * s;
+        self.card_round(bg, [mx - ri, my - ri, 2. * ri, 2. * ri], ri, c.panel);
+        self.card_line(
+            bg,
+            [mx + r * 0.7, my + r * 0.7],
+            [mx + r * 1.45, my + r * 1.45],
+            1.8 * s,
+            c.quiet,
+        );
+
+        let size = 16. * s;
+        let tx = q[0] + 48. * s;
+        let ty = Self::search_text_y(q[1], q[3], size);
+        let root_size = 11.5 * s;
+        let root = fit(&v.root, q[2] * 0.3, root_size);
+        let root_w = Self::approx_text_width(&root, root_size);
+        let room = q[2] - 48. * s - root_w - 40. * s;
+        if v.query.is_empty() {
+            self.card_text(glyphs, "Search this project", tx, ty, size, c.quiet);
+        } else {
+            let query = fit(&v.query, room, size);
+            if v.query_selected {
+                let qw = Self::approx_text_width(&query, size);
+                self.card_round(
+                    bg,
+                    [tx - 2. * s, ty - 1. * s, qw + 4. * s, size * 1.25],
+                    3. * s,
+                    c.accent_dim,
                 );
             }
+            self.card_text(glyphs, &query, tx, ty, size, c.text);
         }
+        if !v.query_selected {
+            let before: String = v.query.chars().take(v.cursor).collect();
+            let cx = tx + Self::approx_text_width(&before, size);
+            if cx < tx + room {
+                self.draw_rect(bg, cx, ty + 1. * s, size * 0.6, size * 1.15, c.accent);
+            }
+        }
+        let rty = Self::search_text_y(q[1], q[3], root_size);
         self.card_text(
             glyphs,
-            &fit(&v.status, w - 40. * s, 10. * s),
-            x + 20. * s,
-            y + h - 54. * s,
-            10. * s,
-            muted,
+            &root,
+            q[0] + q[2] - 18. * s - root_w,
+            rty,
+            root_size,
+            c.quiet,
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_result(
+        &mut self,
+        bg: &mut Vec<BgVertex>,
+        glyphs: &mut Vec<GlyphVertex>,
+        c: &Colors,
+        row: &SearchRow,
+        r: [f32; 4],
+        selected: bool,
+        s: f32,
+    ) {
+        if selected {
+            let sel = [
+                r[0] + 8. * s,
+                r[1] + 2. * s,
+                r[2] - 16. * s,
+                (ROW_H - 4.) * s,
+            ];
+            self.card_round(bg, sel, 6. * s, c.selected);
+            self.card_round(bg, [sel[0], sel[1], 2. * s, sel[3]], 1. * s, c.accent);
+        }
+        let kind_x = r[0] + 22. * s;
+        let text_x = r[0] + 96. * s;
+        let room = r[0] + r[2] - text_x - 18. * s;
         self.card_text(
             glyphs,
-            &fit(&v.action, w - 40. * s, 10. * s),
-            x + 20. * s,
-            y + h - 36. * s,
-            10. * s,
-            accent,
+            &row.kind,
+            kind_x,
+            r[1] + 11. * s,
+            11.5 * s,
+            if selected { c.muted } else { c.quiet },
         );
-        self.card_text(
+        let size = 13.5 * s;
+        let title = fit(&row.title, room, size);
+        self.search_text(
             glyphs,
-            &fit(
-                "↑ ↓ select   Tab scope   Enter preview   Esc close",
-                w - 40. * s,
-                9. * s,
-            ),
-            x + 20. * s,
-            y + h - 19. * s,
-            9. * s,
-            muted,
+            c,
+            &title,
+            &row.hits,
+            text_x,
+            r[1] + 9. * s,
+            size,
+            c.text,
         );
+        let detail = fit(&row.detail, room, 12. * s);
+        self.card_text(glyphs, &detail, text_x, r[1] + 29. * s, 12. * s, c.quiet);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hit_ranges_map_to_bytes_for_multibyte_text() {
+        // "é" is 2 bytes; char range 1..3 covers "éx".
+        assert_eq!(byte_ranges("aéxb", &[(1, 3)]), vec![(1, 4)]);
+        assert_eq!(byte_ranges("abc", &[(2, 9)]), vec![(2, 3)]);
+        assert!(byte_ranges("abc", &[(2, 2)]).is_empty());
+    }
+
+    #[test]
+    fn colors_follow_the_theme() {
+        let gruvbox = Colors::from_theme(&Theme::by_name("gruvbox"));
+        let nord = Colors::from_theme(&Theme::by_name("nord"));
+        assert_ne!(gruvbox, nord);
+        let theme = Theme::by_name("gruvbox");
+        assert_eq!(gruvbox.accent, theme.ansi[3].to_f32());
+        assert_eq!(gruvbox.text, theme.foreground.to_f32());
+        // Surfaces sit between background and foreground, closest to the background.
+        let (bg, fg) = (theme.background.to_f32(), theme.foreground.to_f32());
+        for ch in 0..3 {
+            let lo = bg[ch].min(fg[ch]);
+            let hi = bg[ch].max(fg[ch]);
+            assert!((lo..=hi).contains(&gruvbox.panel[ch]));
+            assert!((gruvbox.panel[ch] - bg[ch]).abs() < (gruvbox.muted[ch] - bg[ch]).abs() + 1e-6);
+        }
+    }
+
+    #[test]
+    fn fit_truncates_with_an_ellipsis() {
+        assert_eq!(fit("abcdef", 6. * 0.6 * 10., 10.), "abcdef");
+        assert_eq!(fit("abcdefgh", 6. * 0.6 * 10., 10.), "abcde…");
     }
 }

@@ -27,6 +27,17 @@ pub enum PromptKind {
     RenameTab,
     RenameTerminal,
     OpenLink,
+    /// "Run task?" for tasks marked `confirm = true`; shows the command.
+    ConfirmTask,
+    /// Explicit permission for just this command, not trust for its whole file.
+    ReviewTask,
+}
+
+impl PromptKind {
+    /// Confirmations show text the user can read and inspect, not edit.
+    pub fn read_only(self) -> bool {
+        matches!(self, Self::OpenLink | Self::ConfirmTask | Self::ReviewTask)
+    }
 }
 
 pub struct TextPrompt {
@@ -46,11 +57,7 @@ pub struct TextPrompt {
 impl TextPrompt {
     pub fn new(kind: PromptKind, initial: &str) -> Self {
         let chars: Vec<char> = initial.chars().collect();
-        let cursor = if kind == PromptKind::OpenLink {
-            0
-        } else {
-            chars.len()
-        };
+        let cursor = if kind.read_only() { 0 } else { chars.len() };
         Self {
             kind,
             chars,
@@ -66,6 +73,8 @@ impl TextPrompt {
         match self.kind {
             PromptKind::Find => "Find",
             PromptKind::OpenLink => "Open link? Enter: open / Esc: cancel",
+            PromptKind::ConfirmTask => "Run task? Enter: run / Esc: cancel",
+            PromptKind::ReviewTask => "Review task · Enter: run once / Esc: cancel",
             PromptKind::RenameTab => "Change Tab Title",
             PromptKind::RenameTerminal => "Change Terminal Title",
         }
@@ -80,7 +89,7 @@ impl TextPrompt {
     }
 
     pub fn insert_char(&mut self, c: char) {
-        if self.kind == PromptKind::OpenLink || c.is_control() {
+        if self.kind.read_only() || c.is_control() {
             return;
         }
         self.chars.insert(self.cursor, c);
@@ -88,7 +97,7 @@ impl TextPrompt {
     }
 
     pub fn backspace(&mut self) {
-        if self.kind == PromptKind::OpenLink || self.cursor == 0 {
+        if self.kind.read_only() || self.cursor == 0 {
             return;
         }
         self.chars.remove(self.cursor - 1);
@@ -96,7 +105,7 @@ impl TextPrompt {
     }
 
     pub fn delete_forward(&mut self) {
-        if self.kind != PromptKind::OpenLink && self.cursor < self.chars.len() {
+        if !self.kind.read_only() && self.cursor < self.chars.len() {
             self.chars.remove(self.cursor);
         }
     }
@@ -234,6 +243,22 @@ pub fn find_matches_bounded<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_review_is_read_only_and_explicitly_authorizes_only_one_run() {
+        for kind in [PromptKind::ReviewTask, PromptKind::ConfirmTask] {
+            let mut prompt = TextPrompt::new(kind, "(cd '/repo' && cargo build --release)");
+            prompt.move_end();
+            prompt.insert_char(';');
+            prompt.backspace();
+            prompt.delete_forward();
+            assert_eq!(prompt.text(), "(cd '/repo' && cargo build --release)");
+            assert!(kind.read_only());
+        }
+        assert!(TextPrompt::new(PromptKind::ReviewTask, "echo OK")
+            .title()
+            .contains("run once"));
+    }
 
     #[test]
     fn link_confirmation_cannot_be_edited_by_typing_paste_or_ime() {

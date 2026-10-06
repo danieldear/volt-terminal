@@ -37,6 +37,9 @@ pub struct TerminalPane {
     /// When true, keyboard/paste input to this pane's PTY is suppressed.
     /// Set via the context menu's "Terminal Read-only" toggle.
     pub read_only: bool,
+    /// The last project task typed into this pane, and how it went.
+    /// Boxed: most panes never run a task, and panes are moved around in trees.
+    pub task_run: Option<Box<crate::tasks::TaskRun>>,
 }
 
 pub struct TerminalTab {
@@ -286,6 +289,7 @@ impl TerminalPane {
             scroll_view_offset: 0,
             custom_title: None,
             read_only: false,
+            task_run: None,
         })
     }
 

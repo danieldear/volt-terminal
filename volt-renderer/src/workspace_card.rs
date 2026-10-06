@@ -14,6 +14,11 @@ pub enum CardIcon {
     Pin,
     Unpin,
     Expand,
+    Search,
+    Plus,
+    Edit,
+    /// Compact, non-interactive status banner. Deliberately has no item glyph.
+    Notice,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CardTone {

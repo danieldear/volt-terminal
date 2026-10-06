@@ -25,9 +25,9 @@ const TAB_BAR_MIN_W: f32 = 100.0;
 const TAB_BAR_MAX_W: f32 = 220.0;
 const TAB_BAR_CLOSE_W: f32 = 16.0;
 const TAB_BAR_UI_LINE_HEIGHT: f32 = 1.15;
-const TAB_BAR_TITLE_LEFT_PAD: f32 = 18.0;
-const TAB_BAR_TITLE_RIGHT_RESERVE: f32 = 44.0;
-const TAB_BAR_STATUS_RIGHT_RESERVE: f32 = 22.0;
+const TAB_BAR_TITLE_LEFT_PAD: f32 = 26.0;
+const TAB_BAR_TITLE_RIGHT_RESERVE: f32 = 12.0;
+const TAB_BAR_STATUS_RIGHT_RESERVE: f32 = 6.0;
 const TAB_BAR_TAB_TOP_INSET: f32 = 4.0;
 const TAB_BAR_TAB_BOTTOM_INSET: f32 = 4.0;
 const TAB_BAR_BUTTON_INSET: f32 = 4.0;
@@ -341,6 +341,10 @@ pub struct Renderer {
     /// Theme editor panel; drawn in the top layer, above the search palette.
     pub theme_editor: Option<crate::theme_editor::ThemeEditorView>,
     theme_editor_cache: Option<theme_editor_draw::EditorGeometry>,
+    pub task_form: Option<crate::task_form::TaskFormView>,
+    /// Task buttons where the workspace card sits while it's closed.
+    pub task_strip: Option<crate::task_strip::TaskStripView>,
+    task_form_cache: Option<task_form_draw::FormGeometry>,
     row_cache: Vec<CachedRow>,
     cache_context: Option<([f32; 8], Theme, CursorStyle)>,
     row_cache_enabled: bool,
@@ -731,6 +735,9 @@ impl Renderer {
             workspace_card_cache: None,
             theme_editor: None,
             theme_editor_cache: None,
+            task_form: None,
+            task_strip: None,
+            task_form_cache: None,
             tab_bar_height,
             custom_tab_bar: true,
             scale_factor,
@@ -920,6 +927,7 @@ impl Renderer {
         self.workspace_card_cache = None;
         self.search_palette_cache = None;
         self.theme_editor_cache = None;
+        self.task_form_cache = None;
         self.shape_cache.clear();
         self.extended_shape_cache.clear();
         self.row_cache.clear();
@@ -1303,6 +1311,24 @@ impl Renderer {
         line_height: f32,
         color: [f32; 4],
     ) {
+        self.draw_text_colored(glyphs, text, px, py, font_size_phys, line_height, &|_| {
+            color
+        });
+    }
+
+    /// One shaping pass; `color_at` picks each glyph's color from its byte
+    /// offset in `text`, so highlighted spans line up exactly with the text.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_colored(
+        &mut self,
+        glyphs: &mut Vec<GlyphVertex>,
+        text: &str,
+        px: f32,
+        py: f32,
+        font_size_phys: f32,
+        line_height: f32,
+        color_at: &dyn Fn(usize) -> [f32; 4],
+    ) {
         let sw = self.config.width as f32;
         let sh = self.config.height as f32;
         let fam_name = self.font_family.clone();
@@ -1328,6 +1354,7 @@ impl Renderer {
                 ) else {
                     continue;
                 };
+                let color = color_at(glyph.start);
                 let color = if region.is_color {
                     [1.0, 1.0, 1.0, color[3]]
                 } else {
@@ -1558,6 +1585,7 @@ impl Renderer {
             self.workspace_card_cache = None;
             self.search_palette_cache = None;
             self.theme_editor_cache = None;
+            self.task_form_cache = None;
             self.row_cache.clear();
         }
         if self.extended_shape_cache.len() > 4096 {
@@ -1948,21 +1976,15 @@ impl Renderer {
         if self.custom_tab_bar && tabs.len() > 1 && full_redraw {
             let sc = self.scale_factor;
             let ui_line_height = TAB_BAR_UI_LINE_HEIGHT;
+            // Chrome: the terminal background a shade darker, one hairline below.
+            let base = theme.background.to_f32();
             self.draw_rect(
                 &mut bg_verts,
                 0.0,
                 0.0,
                 sw,
                 tab_top_h,
-                theme.background.to_f32_alpha(0.94),
-            );
-            self.draw_rect(
-                &mut bg_verts,
-                0.0,
-                0.0,
-                sw,
-                (1.0 * sc).max(1.0),
-                theme.foreground.to_f32_alpha(0.05),
+                [base[0] * 0.78, base[1] * 0.78, base[2] * 0.78, 0.96],
             );
             self.draw_rect(
                 &mut bg_verts,
@@ -1970,7 +1992,7 @@ impl Renderer {
                 tab_top_h - (1.0 * sc).max(1.0),
                 sw,
                 (1.0 * sc).max(1.0),
-                theme.foreground.to_f32_alpha(0.16),
+                theme.foreground.to_f32_alpha(0.10),
             );
 
             let left_pad = (TAB_BAR_LEFT_PAD * sc).round();
@@ -1986,8 +2008,8 @@ impl Renderer {
             let tab_h = (tab_top_h - (TAB_BAR_TAB_TOP_INSET + TAB_BAR_TAB_BOTTOM_INSET) * sc)
                 .max(24.0 * sc);
             let tab_y = ((tab_top_h - tab_h) * 0.5).round().max(2.0 * sc);
-            let tab_font = (11.0 * sc).round().max(1.0);
-            let info_font = (9.0 * sc).round().max(1.0);
+            let tab_font = (12.0 * sc).round().max(1.0);
+            let info_font = (10.0 * sc).round().max(1.0);
             let close_font = (11.0 * sc).round().max(1.0);
             let text_top = tab_y + (tab_h - tab_font * ui_line_height) * 0.5;
             let icon_top = tab_y + (tab_h - info_font * ui_line_height) * 0.5;
@@ -2000,115 +2022,91 @@ impl Renderer {
                 let tx = left_pad + i as f32 * (tab_w + tab_gap);
                 let title = tab.title;
                 let active = tab.active;
-                let tab_edge = theme
-                    .foreground
-                    .to_f32_alpha(if active { 0.14 } else { 0.07 });
-                let tab_bg = if active {
-                    theme.background.to_f32_alpha(0.68)
-                } else {
-                    theme.background.to_f32_alpha(0.30)
+                // Inactive tabs are just their label; the active tab gets a
+                // soft rounded fill. A colored tab is tinted with its color
+                // (stronger when active) and keeps a bar on its left edge.
+                // `under` tracks the resulting fill for the idle dot's middle.
+                let blend = |u: [f32; 4], c: [f32; 4], a: f32| {
+                    [
+                        u[0] * (1.0 - a) + c[0] * a,
+                        u[1] * (1.0 - a) + c[1] * a,
+                        u[2] * (1.0 - a) + c[2] * a,
+                        1.0,
+                    ]
                 };
-                self.draw_rect(&mut bg_verts, tx, tab_y, tab_w, tab_h, tab_bg);
+                let mut under = [base[0] * 0.78, base[1] * 0.78, base[2] * 0.78, 1.0];
+                if active {
+                    self.card_round(
+                        &mut bg_verts,
+                        [tx, tab_y, tab_w, tab_h],
+                        7.0 * sc,
+                        theme.foreground.to_f32_alpha(0.09),
+                    );
+                    under = blend(under, theme.foreground.to_f32(), 0.09);
+                }
                 if let Some(color) = tab.color {
                     let [r, g, b] = color.rgb();
-                    self.draw_rect(
+                    let tint = if active { 0.22 } else { 0.11 };
+                    self.card_round(
                         &mut bg_verts,
-                        tx,
-                        tab_y,
-                        tab_w,
-                        tab_h,
-                        [r, g, b, if active { 0.12 } else { 0.07 }],
+                        [tx, tab_y, tab_w, tab_h],
+                        7.0 * sc,
+                        [r, g, b, tint],
                     );
-                    // A stable edge remains visible even when the title is
-                    // shortened; the busy/idle dot keeps its own semantics.
-                    self.draw_rect(
+                    under = blend(under, [r, g, b, 1.0], tint);
+                    let bar_w = (3.0 * sc).max(2.0);
+                    self.card_round(
                         &mut bg_verts,
-                        tx,
-                        tab_y,
-                        (3.0 * sc).max(2.0),
-                        tab_h,
-                        [r, g, b, if active { 1.0 } else { 0.75 }],
-                    );
-                }
-                self.draw_rect(
-                    &mut bg_verts,
-                    tx,
-                    tab_y,
-                    tab_w,
-                    (1.0 * sc).max(1.0),
-                    tab_edge,
-                );
-                self.draw_rect(
-                    &mut bg_verts,
-                    tx,
-                    tab_y + tab_h - (1.0 * sc).max(1.0),
-                    tab_w,
-                    (1.0 * sc).max(1.0),
-                    theme
-                        .background
-                        .to_f32_alpha(if active { 0.44 } else { 0.28 }),
-                );
-                self.draw_rect(
-                    &mut bg_verts,
-                    tx,
-                    tab_y,
-                    (1.0 * sc).max(1.0),
-                    tab_h,
-                    tab_edge,
-                );
-                self.draw_rect(
-                    &mut bg_verts,
-                    tx + tab_w - (1.0 * sc).max(1.0),
-                    tab_y,
-                    (1.0 * sc).max(1.0),
-                    tab_h,
-                    tab_edge,
-                );
-                if active {
-                    let highlight = tab.color.map_or_else(
-                        || theme.foreground.to_f32_alpha(0.56),
-                        |color| {
-                            let [r, g, b] = color.rgb();
-                            [r, g, b, 0.90]
-                        },
-                    );
-                    self.draw_rect(
-                        &mut bg_verts,
-                        tx,
-                        tab_y,
-                        tab_w,
-                        (1.5 * sc).max(1.0),
-                        highlight,
+                        [tx, tab_y + 8.0 * sc, bar_w, tab_h - 16.0 * sc],
+                        bar_w / 2.0,
+                        [r, g, b, if active { 1.0 } else { 0.8 }],
                     );
                 }
 
-                let dot = if tab.busy { "\u{25cf}" } else { "\u{25cb}" };
-                let dot_color = if tab.busy {
-                    [0.55, 0.92, 0.65, 0.95]
+                // Status dot, drawn as a shape so it stays round at any size:
+                // filled in the theme's green while busy, a ring when idle.
+                let d = 7.0 * sc;
+                let (dx, dy) = (tx + 12.0 * sc, tab_y + (tab_h - d) / 2.0);
+                if tab.busy {
+                    self.draw_rounded_rect(
+                        &mut bg_verts,
+                        dx,
+                        dy,
+                        d,
+                        d,
+                        d / 2.0,
+                        theme.ansi[2].to_f32(),
+                    );
                 } else {
-                    theme.foreground.to_f32_alpha(0.46)
-                };
-                self.draw_text_with_line_height(
-                    &mut glyph_verts,
-                    dot,
-                    tx + 7.0 * sc,
-                    icon_top,
-                    info_font,
-                    ui_line_height,
-                    dot_color,
-                );
+                    let ring = theme.foreground.to_f32_alpha(0.46);
+                    let inner = (1.4 * sc).max(1.0);
+                    self.draw_rounded_rect(&mut bg_verts, dx, dy, d, d, d / 2.0, ring);
+                    let fill = under;
+                    let id = d - 2.0 * inner;
+                    self.draw_rounded_rect(
+                        &mut bg_verts,
+                        dx + inner,
+                        dy + inner,
+                        id,
+                        id,
+                        id / 2.0,
+                        fill,
+                    );
+                }
 
                 let close_w = TAB_BAR_CLOSE_W * sc;
                 let close_box_w = close_w + (TAB_BAR_BUTTON_PADDING + 1.0) * sc;
                 let close_box_x = tx + tab_w - close_box_w - (TAB_BAR_BUTTON_INSET + 1.0) * sc;
-                let close_box_y = tab_y + (1.0 * sc).max(1.0);
-                let close_box_h = (tab_h - 2.0 * sc).max(18.0 * sc);
                 let info_text = if tab.pane_count > 1 {
                     format!("#{} · {}", tab.index, tab.pane_count)
                 } else {
                     format!("#{}", tab.index)
                 };
-                let info_x = close_box_x - TAB_BAR_STATUS_RIGHT_RESERVE * sc;
+                // "#2 · 3" sits right-aligned against the close button; the
+                // title gets everything to its left.
+                let info_x = close_box_x
+                    - TAB_BAR_STATUS_RIGHT_RESERVE * sc
+                    - Self::approx_text_width(&info_text, info_font);
                 let title_left = tx + TAB_BAR_TITLE_LEFT_PAD * sc;
                 let title_right =
                     (info_x - TAB_BAR_TITLE_RIGHT_RESERVE * sc).max(title_left + 12.0 * sc);
@@ -2246,24 +2244,14 @@ impl Renderer {
                     ui_line_height,
                     theme
                         .foreground
-                        .to_f32_alpha(if active { 0.76 } else { 0.46 }),
+                        .to_f32_alpha(if active { 0.55 } else { 0.38 }),
                 );
 
-                self.draw_rect(
-                    &mut bg_verts,
-                    close_box_x,
-                    close_box_y,
-                    close_box_w,
-                    close_box_h,
-                    theme
-                        .background
-                        .to_f32_alpha(if active { 0.44 } else { 0.24 }),
-                );
                 let cx = close_box_x + (TAB_BAR_BUTTON_PADDING * 0.75) * sc;
                 let close_color = if active {
-                    theme.foreground.to_f32_alpha(0.82)
+                    theme.foreground.to_f32_alpha(0.62)
                 } else {
-                    theme.foreground.to_f32_alpha(0.36)
+                    theme.foreground.to_f32_alpha(0.32)
                 };
                 self.draw_text_with_line_height(
                     &mut glyph_verts,
@@ -2276,17 +2264,6 @@ impl Renderer {
                 );
             }
 
-            let plus_box_x = plus_x - (TAB_BAR_BUTTON_INSET / 2.0) * sc;
-            let plus_box_y = tab_y + (1.0 * sc).max(1.0);
-            let plus_box_h = (tab_h - 2.0 * sc).max(18.0 * sc);
-            self.draw_rect(
-                &mut bg_verts,
-                plus_box_x,
-                plus_box_y,
-                plus_w + TAB_BAR_BUTTON_INSET * sc,
-                plus_box_h,
-                theme.background.to_f32_alpha(0.44),
-            );
             self.draw_text_with_line_height(
                 &mut glyph_verts,
                 "+",
@@ -2294,7 +2271,7 @@ impl Renderer {
                 icon_top,
                 tab_font,
                 ui_line_height,
-                theme.foreground.to_f32_alpha(0.72),
+                theme.foreground.to_f32_alpha(0.55),
             );
         }
 
@@ -2598,7 +2575,10 @@ impl Renderer {
         }
 
         let overlay_start = (bg_verts.len(), glyph_verts.len());
-        if let Some(card) = self.workspace_card.clone() {
+        // A security/command confirmation must remain unobscured. Keep card
+        // geometry/reserved terminal width intact, but don't paint over it.
+        let confirmation = prompt.as_ref().is_some_and(|p| p.read_only);
+        if let Some(card) = self.workspace_card.clone().filter(|_| !confirmation) {
             self.draw_workspace_card(
                 &mut bg_verts,
                 &mut glyph_verts,
@@ -2609,14 +2589,14 @@ impl Renderer {
         }
 
         let search_start = (bg_verts.len(), glyph_verts.len());
+        if let Some(strip) = self.task_strip.clone().filter(|_| !confirmation) {
+            self.draw_task_strip(&mut bg_verts, &mut glyph_verts, &strip, theme);
+        }
         if let Some(search) = self.search_palette.clone() {
-            self.draw_search_palette(
-                &mut bg_verts,
-                &mut glyph_verts,
-                &search,
-                theme,
-                tab_top_h + alert_h,
-            );
+            self.draw_search_palette(&mut bg_verts, &mut glyph_verts, &search, theme);
+        }
+        if let Some(form) = self.task_form.clone() {
+            self.draw_task_form(&mut bg_verts, &mut glyph_verts, &form, theme);
         }
         if let Some(editor) = self.theme_editor.clone() {
             self.draw_theme_editor(&mut bg_verts, &mut glyph_verts, &editor);
@@ -2722,5 +2702,9 @@ mod placement_tests {
 #[path = "search_palette_draw.rs"]
 mod search_palette_draw;
 
+#[path = "task_form_draw.rs"]
+mod task_form_draw;
+#[path = "task_strip_draw.rs"]
+mod task_strip_draw;
 #[path = "theme_editor_draw.rs"]
 mod theme_editor_draw;

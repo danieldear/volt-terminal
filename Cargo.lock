@@ -2434,7 +2434,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "volt"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "tokio",
@@ -2444,9 +2444,10 @@ dependencies = [
 
 [[package]]
 name = "volt-config"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dirs",
+ "libc",
  "serde",
  "toml",
  "toml_edit 0.20.2",
@@ -2454,7 +2455,7 @@ dependencies = [
 
 [[package]]
 name = "volt-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "libc",
@@ -2469,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "volt-renderer"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2487,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "volt-ui"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "dirs",

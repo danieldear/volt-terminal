@@ -6,13 +6,15 @@
 
 <br/>
 
-Volt keeps the shell at the center of your workflow. Git changes, branches,
-worktrees, search, and project actions are within reach in a compact workspace
-card that can sit beside the terminal or float over it.
+Volt keeps the shell at the center of your workflow. One search box covers
+your scrollback and your project, your project's build, run and test commands
+are one click away, and Git changes, branches and worktrees sit in a compact
+workspace card beside the terminal or floating over it. GPU-rendered, written
+in Rust, for macOS and Linux.
 
 > ⚠️ **Early development.** Volt is functional on macOS, but it has not been validated as a daily driver; APIs and config formats may change before v1.0.
 
-**Public preview (October 2026):** [Volt v0.1.8](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.8)
+**Public preview (October 2026):** [Volt v0.1.9](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.9)
 is available with macOS and Linux archives and SHA-256 checksums. The macOS
 archive is **ad-hoc signed, not Developer ID signed or notarized**. macOS
 Gatekeeper may prevent it from opening; a notarized public build is planned,
@@ -24,12 +26,14 @@ not yet released. You can also [build from source](#building-from-source).
 
 - **GPU-accelerated rendering** — Metal-backed via `wgpu`, smooth at any size
 - **VTE-based parsing** — common ANSI/xterm sequences; advanced DCS and some OSC features remain unsupported
-- **Tabs + pane splits** — per-tab color accents, drag-to-reorder custom tabs, split right/left/up/down, drag-resizable dividers
+- **Tabs + pane splits** — a flat tab bar with color-tinted tabs, drag-to-reorder, split right/left/up/down, drag-resizable dividers
 - **Full mouse support** — click, scroll, Shift-click extension, drag selection with edge auto-scroll through retained history, double-click word / triple-click line select
 - **Native macOS menu bar** — File/Edit/View/Window menus and a dynamic Services submenu; keyboard shortcuts are handled by Volt, not menu-item accelerators
 - **Native right-click context menu** — Copy/Paste, split in any direction, reset terminal, read-only toggle, rename tab/terminal, and choose a tab color
-- **Workspace Search** (`Cmd+Shift+P`) — floating local search for fuzzy file paths, saved text, retained output/current TUI screen, branches, worktrees, and task previews. [Scope and limits](docs/workspace-search.md).
-- **In-terminal Find** (`Cmd+F`) — search scrollback + visible output, jump between matches (navigation is capped at 100,000 matches)
+- **Project tasks** — one-click build/run/test commands per project in `.volt/tasks.toml`, run in the current tab with ✓ / ✗ status. Add them from a form or import suggestions from your project files; shared task files are reviewed before anything runs. [Details](#project-tasks)
+- **Your editor** — set nvim, nano or any editor per file type in `[editor]`; search results open in it at the matching line, and `Cmd+,` opens the settings in it. [Details](#configuration)
+- **Search** (`Cmd+F`) — one local search box for this terminal's full scrollback and the project's file names, file contents, terminal output, branches, worktrees and tasks, with matches highlighted as you type. Enter opens files in your editor, at the matching line, or jumps to matching output. [Scope and limits](docs/workspace-search.md).
+- **In-terminal Find** — Enter on an output result highlights every match in the terminal; Enter / Shift+Enter step between them (capped at 100,000 matches)
 - **Alternate screen buffer** — vim, htop, etc. work correctly
 - **Config reload** — edit `config.toml`, press `Cmd+Shift+R`
 - **Themes** — built-in Catppuccin, Tokyo Night, Gruvbox, Nord, Dracula, plus your own; switch from Volt ▸ Theme and edit colors live with **Customize Theme…** ([details](#themes))
@@ -50,7 +54,7 @@ including the dynamic Services submenu, is genuine.
 | Platform | Status |
 |----------|--------|
 | macOS 13+ | ✅ Primary target |
-| Linux | 🚧 Compiles, UI layer in progress |
+| Linux (x86_64) | ✅ Release archives. Copy and paste, the menu bar and secure keyboard entry are macOS-only for now |
 | Windows | ❌ Not planned |
 
 ---
@@ -103,7 +107,7 @@ Pushing a `v*` tag runs the release workflow. It builds and uploads:
 - a macOS `Volt.app` zip archive
 - `SHA256SUMS.txt`
 
-The public [v0.1.8 release](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.8)
+The public [v0.1.9 release](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.9)
 is ad-hoc signed on macOS, **not notarized**. The workflow defaults to that
 mode until Apple credentials are configured; it never silently substitutes an
 ad-hoc build for a requested notarized build. See [distribution setup](docs/distribution.md).
@@ -115,8 +119,9 @@ release. Verify downloads against the accompanying `SHA256SUMS.txt`.
 ## Configuration
 
 Volt reads `~/.config/volt/config.toml`. Press **`Cmd+,`** (or Volt ▸
-Settings…) to open it in your default editor — the file is written with
-fully-commented defaults the first time you do this. Press **`Cmd+Shift+R`**
+Settings…) to open it in your `[editor]` (or the system's default app if none
+is set) — the file is written with fully-commented defaults the first time you
+do this. Press **`Cmd+Shift+R`**
 (or Volt ▸ Reload Settings) to reload without restarting.
 
 ```toml
@@ -140,7 +145,20 @@ line_height = 1.4
 opacity = 1.0
 cursor_style = "block"   # block | underline | beam
 cursor_blink = true
+
+[editor]
+# Opens files from search (at the matching line) and Volt ▸ Settings….
+# Volt types the command into the current tab. Unset: $VISUAL / $EDITOR,
+# else the system's default app.
+command = "nvim"
+
+[editor.filetypes]          # by extension or full file name
+md = "nano"
 ```
+
+Volt knows how nvim/vim, nano, micro, Emacs, Helix, VS Code, Zed and Sublime
+take a line number. For another editor, put `{file}` and `{line}` in the
+command, e.g. `command = "myedit --line {line} {file}"`.
 
 ### Themes
 
@@ -189,6 +207,72 @@ these checks, symlinks, files over 64 KiB, and anything past the first 256
 files are skipped; the reason shows in the alert bar. Themes are re-read on
 Reload Settings and after each save.
 
+### Project tasks
+
+Give a project its own one-click commands (build, run, test, deploy) in
+`.volt/tasks.toml` at the project root. Commit it to share the tasks with your team.
+
+```toml
+[[task]]
+name = "Build"
+run  = "cargo build --release"
+
+[[task]]
+name = "Deploy staging"
+run  = "./scripts/deploy.sh --env staging"
+cwd  = "infra"          # optional: a folder inside the project
+confirm = true          # optional: show the command and ask before each run
+```
+
+**Where tasks appear**
+
+- The workspace card (`Cmd+Shift+A`) ▸ **Tasks**: saved tasks first, then
+  **Add task**, **Edit tasks file**, and a collapsed **Suggested tasks** list.
+- While the card is closed, the same tasks are buttons at its top-right spot,
+  hidden while a full-screen app such as nvim is running. A recognized project
+  with no saved tasks shows just **+ Add task** there.
+- On macOS, **View ▸ Project Tasks** and **View ▸ Add Task…** work whether or
+  not the card is open. Search (`Cmd+F`) lists tasks too; Enter there opens
+  the Tasks card for review and never runs a command.
+
+**Running**
+
+- A click types the command into the active pane of the current tab and
+  presses Enter, so its output is right there and the keyboard stays with the
+  terminal. Half-typed input is cleared first (Ctrl-Y brings it back). Outside
+  the task's folder the command runs in a subshell, so your shell stays put.
+- Volt won't type over something else: a command that's still running, a
+  full-screen app, a password prompt, or a read-only pane blocks the task, and
+  a short note says why.
+- With shell integration enabled, each task shows running, ✓ or ✗ from its
+  exit code. Without it, the task is marked **Sent** rather than claiming to run.
+- Write `./program` for a compiled executable (not `zsh ./program`). Volt
+  never adds `&` or runs tasks in the background.
+
+**Adding and editing**
+
+- **Add task** opens a form (name, command, folder, ask-before-running) and
+  saves to `.volt/tasks.toml`, keeping any comments already in the file.
+- **Edit tasks file** opens the file in your `[editor]` to change or delete tasks.
+- **Suggested tasks** come from `Cargo.toml`, `package.json` scripts, `go.mod`,
+  `Package.swift`, and pytest/CMake setups, read without executing those
+  manifests. Select one to see its command, folder and source, then choose
+  **Add to tasks file**. Importing never runs it, and imported tasks ask before
+  each run. Commands already in the file aren't suggested again.
+
+**Trust**
+
+- A tasks file that arrives with a clone or a pull is someone else's commands.
+  Its buttons show a shield: clicking one previews that command and its folder,
+  Enter runs it **once**, and Escape cancels. That doesn't trust the file or
+  its other tasks.
+- For one-click runs, review every command in the card and choose **Trust these
+  tasks**. Any change to the file invalidates trust and pending confirmations.
+- Tasks you add in Volt to a new or already trusted file are trusted
+  automatically. Adding a task never trusts commands you haven't reviewed.
+- Each command must be a single line. Symlinked files or `.volt` folders,
+  folders outside the project, and files over 64 KB are refused.
+
 ---
 
 ## Keyboard shortcuts
@@ -212,10 +296,10 @@ commands, but not every shortcut or its key-equivalent hint.
 | `Cmd+Alt+Arrow` / `Ctrl+Alt+Arrow` | Move focus between panes |
 | `Cmd+C` / `Ctrl+Shift+C` | Copy selection |
 | `Cmd+V` / `Ctrl+Shift+V` | Paste |
-| `Cmd+F` | Find in terminal |
+| `Cmd+F` | Search terminal output and the project (selection prefills it) |
 | `Cmd+=` / `Cmd+-` | Increase / decrease font size |
 | `Cmd+Shift+A` | Toggle workspace card |
-| `Cmd+Shift+P` | Open workspace search |
+| `Cmd+Shift+P` | Same search panel (alias) |
 | `Enter` / `Shift+Enter` (Find open) | Next / previous terminal match |
 | `Ctrl+Cmd+F` | Toggle full screen |
 | `Cmd+K` | Clear screen and scrollback |

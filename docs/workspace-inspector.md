@@ -53,11 +53,31 @@ root remains separate from the active subproject root.
 - Make: marker only; dynamic targets are not guessed.
 - Bounded immediate source-file sampling identifies standalone language folders.
 
-Project disclosure shows detected evidence and task scope. Selecting a task
-shows its command, directory, and definition; **Run in new terminal** executes it.
-Dynamic strings are passed as arguments, not interpolated into shell source.
-Build/package scripts are still executable project code: only run trusted tasks.
-Task output remains in a dedicated tab and a shell starts after completion.
+Project disclosure shows detected evidence and task scope. In **Tasks**, saved
+commands come first. **Suggested tasks** stays collapsed until opened; select
+one to inspect its command, directory, and source, then choose **Add to tasks
+file**. Import does not run it. The command appears among saved tasks (and
+asks before running), and exact duplicates stop appearing as suggestions.
+**Add task**, **Edit tasks file**, and trust review share the same section.
+Imported arguments are shell-quoted when written to `.volt/tasks.toml`.
+Build/package scripts are still executable project code: only run reviewed
+tasks. Saved tasks are typed into the active pane of the current tab, with
+visible output and keyboard focus returned to the terminal. They are not
+launched in a background runner. A foreground command, full-screen app,
+read-only pane, or detected password prompt blocks dispatch. A compact notice
+explains why; it is not another task. Shell integration supplies start/exit
+status; without it, the task is marked **Sent**, not falsely **Running**.
+Use `./program` for a compiled executable, not `zsh ./program`. Shell scripts
+may use their interpreter explicitly. A task command containing `&` can itself
+request background execution; Volt does not add it.
+
+Compact task buttons run trusted tasks directly (`confirm = true` still asks).
+A shield marks untrusted tasks: clicking opens a small read-only command
+preview, including the working directory, rather than opening the workspace
+card. Enter runs **only that command once**; Escape cancels. This does not
+trust the file or its other tasks. File-wide **Trust these tasks** remains in
+the card after reviewing all commands. Editing the file or switching panes
+invalidates a pending confirmation.
 
 ## Git, worktrees, GitHub
 
