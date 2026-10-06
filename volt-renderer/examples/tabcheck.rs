@@ -74,6 +74,31 @@ fn main() -> Result<()> {
     png.set_color(png::ColorType::Rgba);
     png.set_depth(png::BitDepth::Eight);
     png.write_header()?.write_image_data(&rgba)?;
-    println!("tab color + title fixture: target/tabcheck/tab-colors.png");
+    // Retina: the same tabs at 2x, for reviewing shapes at their real size.
+    let (w2, h2) = (width * 2, height * 2);
+    let mut retina =
+        pollster::block_on(Renderer::new_offscreen(w2, h2, 14.0, 2.0, "SF Mono", 1.4))?;
+    let (cols, rows) = retina.grid_size_for_tab_count(3);
+    retina.render_frame(
+        &Grid::new(cols, rows),
+        &Theme::dark(),
+        &tabs,
+        false,
+        None,
+        false,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        false,
+    );
+    let rgba2 = retina.read_offscreen_rgba()?;
+    let file = std::fs::File::create("target/tabcheck/tab-colors-2x.png")?;
+    let mut png = png::Encoder::new(file, w2, h2);
+    png.set_color(png::ColorType::Rgba);
+    png.set_depth(png::BitDepth::Eight);
+    png.write_header()?.write_image_data(&rgba2)?;
+    println!("tab color + title fixture: target/tabcheck/tab-colors.png (+ -2x)");
     Ok(())
 }
