@@ -14,7 +14,7 @@ in Rust, for macOS and Linux.
 
 > ⚠️ **Early development.** Volt is functional on macOS, but it has not been validated as a daily driver; APIs and config formats may change before v1.0.
 
-**Public preview (October 2026):** [Volt v0.1.9](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.9)
+**Public preview (October 2026):** [Volt v0.1.10](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.10)
 is available with macOS and Linux archives and SHA-256 checksums. The macOS
 archive is **ad-hoc signed, not Developer ID signed or notarized**. macOS
 Gatekeeper may prevent it from opening; a notarized public build is planned,
@@ -107,7 +107,7 @@ Pushing a `v*` tag runs the release workflow. It builds and uploads:
 - a macOS `Volt.app` zip archive
 - `SHA256SUMS.txt`
 
-The public [v0.1.9 release](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.9)
+The public [v0.1.10 release](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.10)
 is ad-hoc signed on macOS, **not notarized**. The workflow defaults to that
 mode until Apple credentials are configured; it never silently substitutes an
 ad-hoc build for a requested notarized build. See [distribution setup](docs/distribution.md).

@@ -459,6 +459,35 @@ const OUTPUT_ROWS: usize = 60;
 /// Text copied from the scrollback for one search.
 const OUTPUT_BUDGET: usize = 32 * 1024 * 1024;
 
+/// Keep the newest rows when bounded, preserving absolute row indexes and
+/// chronological order for navigation. As before, a single row may exceed the
+/// budget; that ensures even a very long current line remains searchable.
+fn terminal_snapshot(
+    grid: &volt_core::grid::Grid,
+    budget: usize,
+    stopped: impl Fn() -> bool,
+) -> (Vec<(usize, String)>, bool) {
+    let history = grid.scrollback_len();
+    let total = history + grid.rows;
+    let mut bytes = 0;
+    let mut rows = Vec::new();
+    for row in (0..total).rev() {
+        if stopped() || bytes >= budget {
+            break;
+        }
+        let text = if row < history {
+            grid.row_text(grid.scrollback_row(row))
+        } else {
+            grid.row_text(grid.row_cells(row - history))
+        };
+        bytes += text.len();
+        rows.push((row, text));
+    }
+    let truncated = rows.len() < total;
+    rows.reverse();
+    (rows, truncated)
+}
+
 pub fn search(input: SearchInput, cancel: &AtomicU64, generation: u64) -> SearchOutput {
     let start = Instant::now();
     let stopped =
@@ -488,26 +517,7 @@ pub fn search(input: SearchInput, cancel: &AtomicU64, generation: u64) -> Search
     if input.scope.includes(Scope::Terminal) {
         // A bounded snapshot on the worker, never disk I/O or matching under the PTY lock.
         let snapshot = input.performer.try_lock().ok().map(|p| {
-            let g = &p.grid;
-            // The full scrollback, like Find, within a byte budget.
-            let total = g.scrollback_len() + g.rows;
-            let mut bytes = 0;
-            let rows = (0..total)
-                .take_while(|_| !stopped())
-                .map_while(|row| {
-                    if bytes > OUTPUT_BUDGET {
-                        return None;
-                    }
-                    let text = if row < g.scrollback_len() {
-                        g.row_text(g.scrollback_row(row))
-                    } else {
-                        g.row_text(g.row_cells(row - g.scrollback_len()))
-                    };
-                    bytes += text.len();
-                    Some((row, text))
-                })
-                .collect::<Vec<_>>();
-            let truncated = rows.len() < total;
+            let (rows, truncated) = terminal_snapshot(&p.grid, OUTPUT_BUDGET, stopped);
             (rows, p.alternate_screen_active(), truncated)
         });
         if let Some((rows, alternate, truncated)) = snapshot {
@@ -1253,6 +1263,52 @@ mod tests {
         assert!(matches!(o.rows[0].action, Action::Terminal { row: 0, .. }));
         assert_eq!(o.status, "1 matching line in this terminal's output");
     }
+    #[test]
+    fn bounded_terminal_snapshot_keeps_newest_output_and_absolute_indexes() {
+        let f = Fixture::new();
+        let input = f.input("hit", Scope::Terminal);
+        let mut p = input.performer.lock().unwrap();
+        let text: String = (0..100).map(|i| format!("hit {i}\r\n")).collect();
+        vte::Parser::new().advance(&mut *p, text.as_bytes());
+        let total = p.grid.scrollback_len() + p.grid.rows;
+        let (rows, truncated) = terminal_snapshot(&p.grid, p.grid.cols * 2, || false);
+        assert!(truncated);
+        assert_eq!(rows.last().unwrap().0, total - 1);
+        assert!(rows.iter().any(|(_, text)| text.trim_end() == "hit 99"));
+        assert!(!rows.iter().any(|(_, text)| text.trim_end() == "hit 0"));
+        assert!(rows.windows(2).all(|r| r[1].0 == r[0].0 + 1));
+        for (row, text) in rows {
+            let expected = if row < p.grid.scrollback_len() {
+                p.grid.row_text(p.grid.scrollback_row(row))
+            } else {
+                p.grid
+                    .row_text(p.grid.row_cells(row - p.grid.scrollback_len()))
+            };
+            assert_eq!(text, expected);
+        }
+    }
+
+    #[test]
+    fn terminal_snapshot_honors_cancellation_and_zero_budget() {
+        let grid = volt_core::grid::Grid::new(10, 2);
+        assert_eq!(terminal_snapshot(&grid, 100, || true), (vec![], true));
+        assert_eq!(terminal_snapshot(&grid, 0, || false), (vec![], true));
+        let (rows, truncated) = terminal_snapshot(&grid, 100, || false);
+        assert!(!truncated);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn terminal_snapshot_keeps_one_oversized_newest_line() {
+        let mut p = Performer::new(40, 1);
+        vte::Parser::new().advance(&mut p, b"newest long line");
+        let (rows, truncated) = terminal_snapshot(&p.grid, 1, || false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1.trim_end(), "newest long line");
+        assert!(!truncated);
+    }
+
     #[test]
     fn many_output_matches_list_the_latest_and_count_them_all() {
         let f = Fixture::new();
