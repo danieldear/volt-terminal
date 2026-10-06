@@ -28,8 +28,9 @@ not yet released. You can also [build from source](#building-from-source).
 - **Full mouse support** — click, scroll, Shift-click extension, drag selection with edge auto-scroll through retained history, double-click word / triple-click line select
 - **Native macOS menu bar** — File/Edit/View/Window menus and a dynamic Services submenu; keyboard shortcuts are handled by Volt, not menu-item accelerators
 - **Native right-click context menu** — Copy/Paste, split in any direction, reset terminal, read-only toggle, rename tab/terminal, and choose a tab color
-- **Workspace Search** (`Cmd+Shift+P`) — floating local search for fuzzy file paths, saved text, retained output/current TUI screen, branches, worktrees, and task previews. [Scope and limits](docs/workspace-search.md).
-- **In-terminal Find** (`Cmd+F`) — search scrollback + visible output, jump between matches (navigation is capped at 100,000 matches)
+- **Project tasks** — one-click build/run/test commands per folder in `.volt/tasks.toml`, run in the current tab, with a trust check for shared files. [Details](#project-tasks)
+- **Search** (`Cmd+F`) — one local search box for this terminal's full scrollback and the project's file names, file contents, terminal output, branches, worktrees and tasks, with matches highlighted as you type. Enter opens files in your editor, at the matching line, or jumps to matching output. [Scope and limits](docs/workspace-search.md).
+- **In-terminal Find** — Enter on an output result highlights every match in the terminal; Enter / Shift+Enter step between them (capped at 100,000 matches)
 - **Alternate screen buffer** — vim, htop, etc. work correctly
 - **Config reload** — edit `config.toml`, press `Cmd+Shift+R`
 - **Themes** — built-in Catppuccin, Tokyo Night, Gruvbox, Nord, Dracula, plus your own; switch from Volt ▸ Theme and edit colors live with **Customize Theme…** ([details](#themes))
@@ -140,7 +141,20 @@ line_height = 1.4
 opacity = 1.0
 cursor_style = "block"   # block | underline | beam
 cursor_blink = true
+
+[editor]
+# Opens files from search (at the matching line) and Volt ▸ Settings….
+# Volt types the command into the current tab. Unset: $VISUAL / $EDITOR,
+# else the system's default app.
+command = "nvim"
+
+[editor.filetypes]          # by extension or full file name
+md = "nano"
 ```
+
+Volt knows how nvim/vim, nano, micro, Emacs, Helix, VS Code, Zed and Sublime
+take a line number. For another editor, put `{file}` and `{line}` in the
+command, e.g. `command = "myedit --line {line} {file}"`.
 
 ### Themes
 
@@ -189,6 +203,45 @@ these checks, symlinks, files over 64 KiB, and anything past the first 256
 files are skipped; the reason shows in the alert bar. Themes are re-read on
 Reload Settings and after each save.
 
+### Project tasks
+
+Give a project its own one-click commands (build, run, test, deploy) in
+`.volt/tasks.toml` at the project root. Commit it to share the tasks with your team.
+
+```toml
+[[task]]
+name = "Build"
+run  = "cargo build --release"
+
+[[task]]
+name = "Deploy staging"
+run  = "./scripts/deploy.sh --env staging"
+cwd  = "infra"          # optional: a folder inside the project
+confirm = true          # optional: show the command and ask before each run
+```
+
+- **Run:** open the workspace card (`Cmd+Shift+A`) ▸ **Tasks** and click a task.
+  While the card is closed, the same tasks appear as buttons at its top-right
+  spot (hidden while a full-screen app such as nvim is running).
+- **Same tab:** Volt types the task's command into the current terminal and
+  presses Enter. Any half-typed input is cleared first (Ctrl-Y brings it back).
+  Outside the task's folder it runs in a subshell, so your shell stays where it
+  is. Read-only panes and full-screen apps are refused.
+- **Status:** with shell integration enabled, each task shows running, ✓ or ✗
+  from the command's exit code.
+- **Add task** opens a form (name, command, folder, ask-before-running) and
+  saves to `.volt/tasks.toml`, keeping any comments already in the file.
+  **Edit tasks file** opens it in your `[editor]` to edit or delete tasks.
+- **Trust:** a tasks file that arrives with a clone or a pull is someone else's
+  commands. Volt shows every command and runs nothing until you choose **Trust
+  these tasks**, and asks again whenever the file changes. Tasks you add in
+  Volt are trusted automatically. Each command must be a single line; symlinked
+  files, folders outside the project, and files over 64 KB are refused.
+
+Volt also detects common tasks from `Cargo.toml`, `package.json` scripts,
+`go.mod`, `Package.swift`, and pytest/CMake setups; those are listed under
+**Detected** and run in a new tab.
+
 ---
 
 ## Keyboard shortcuts
@@ -212,10 +265,10 @@ commands, but not every shortcut or its key-equivalent hint.
 | `Cmd+Alt+Arrow` / `Ctrl+Alt+Arrow` | Move focus between panes |
 | `Cmd+C` / `Ctrl+Shift+C` | Copy selection |
 | `Cmd+V` / `Ctrl+Shift+V` | Paste |
-| `Cmd+F` | Find in terminal |
+| `Cmd+F` | Search terminal output and the project (selection prefills it) |
 | `Cmd+=` / `Cmd+-` | Increase / decrease font size |
 | `Cmd+Shift+A` | Toggle workspace card |
-| `Cmd+Shift+P` | Open workspace search |
+| `Cmd+Shift+P` | Same search panel (alias) |
 | `Enter` / `Shift+Enter` (Find open) | Next / previous terminal match |
 | `Ctrl+Cmd+F` | Toggle full screen |
 | `Cmd+K` | Clear screen and scrollback |

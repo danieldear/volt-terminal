@@ -258,6 +258,15 @@ struct MainState {
     /// Open theme editor. While `Some`, `theme` is its live working copy and
     /// keyboard input goes to the editor.
     theme_editor: Option<crate::theme_editor::ThemeEditor>,
+    /// The active pane's project tasks (`.volt/tasks.toml`).
+    tasks: crate::tasks::TaskLoader,
+    /// A `confirm = true` task waiting on the "Run task?" prompt.
+    pending_task: Option<usize>,
+    /// A short note about the last task action ("Added …", or why it didn't
+    /// run), shown with the tasks for a few seconds.
+    task_message: Option<(String, Instant)>,
+    /// Open "Add task" form; captures the keyboard like the theme editor.
+    task_form: Option<crate::task_form::TaskForm>,
 }
 
 impl MainState {
@@ -355,18 +364,27 @@ impl MainState {
         self.begin_redraw();
     }
     fn toggle_search(&mut self) {
-        if self.theme_editor.is_some() {
+        if self.theme_editor.is_some() || self.task_form.is_some() {
             return;
         }
         if self.workspace_search.visible {
             self.workspace_search.close();
         } else {
+            // A one-line selection becomes the query, selected so typing replaces it.
+            let seed = self
+                .selected_text()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty() && !t.contains('\n') && t.chars().count() <= 256);
             let pane = self.active_tab().active_pane();
             let pid = pane.pty.child_pid();
             let cwd = pid
                 .and_then(crate::workspace_panel::local_process_cwd)
                 .or_else(|| pane.cwd.clone());
             self.workspace_search.open(pid, cwd);
+            if let Some(seed) = seed {
+                self.workspace_search.edit(&seed);
+                self.workspace_search.query_selected = true;
+            }
             self.workspace_panel.focused = false;
             self.workspace_panel.drag_offset = None;
             self.active_prompt = None;
@@ -380,6 +398,314 @@ impl MainState {
         }
         self.sync_search();
     }
+    /// Type `line` into the active terminal and press Enter, as the user
+    /// would. Half-typed input is cleared first with Ctrl-E Ctrl-U (shells
+    /// keep it: Ctrl-Y brings it back). Refused while a full-screen app owns
+    /// the screen, where the keys would go to that app instead.
+    fn type_into_shell(&mut self, line: &str) -> Result<(), String> {
+        let pane = self.active_tab().active_pane();
+        if pane.read_only {
+            return Err("This terminal is read-only.".into());
+        }
+        match pane.performer.try_lock() {
+            Ok(p) if p.alternate_screen_active() => {
+                return Err("Quit the full-screen app in this terminal first.".into());
+            }
+            Ok(_) => {}
+            Err(_) => return Err("The terminal is busy. Try again.".into()),
+        }
+        let mut bytes = b"\x05\x15".to_vec();
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\r');
+        self.send_pty_input(&bytes);
+        self.begin_redraw();
+        Ok(())
+    }
+
+    /// Open `path` in the editor from `[editor]` (or $VISUAL / $EDITOR) in
+    /// this tab, or with the system's default app when none is configured.
+    fn open_in_editor(
+        &mut self,
+        path: &std::path::Path,
+        line: Option<usize>,
+    ) -> Result<(), String> {
+        let editor =
+            crate::editor::editor_for(&self.config.editor, path, &|var| std::env::var(var).ok());
+        match editor {
+            Some(editor) => {
+                let command = crate::editor::command_line(&editor, path, line)
+                    .ok_or_else(|| "That file name can't be opened safely.".to_string())?;
+                self.type_into_shell(&command)
+            }
+            None if open_with_system_app(path) => Ok(()),
+            None => Err("Couldn't open that file.".into()),
+        }
+    }
+
+    /// Volt ▸ Settings… and Cmd+, : the config file, in the configured editor.
+    fn open_config(&mut self) {
+        let Some(path) = config_file_to_edit() else {
+            return;
+        };
+        if let Err(message) = self.open_in_editor(&path, None) {
+            // E.g. nvim is already full-screen here: fall back to the app.
+            eprintln!("volt-ui: {message} Opening settings with the system app.");
+            open_with_system_app(&path);
+        }
+    }
+
+    /// The folder the active pane's shell is in, as the OS reports it.
+    fn active_local_cwd(&self) -> Option<std::path::PathBuf> {
+        let pane = self.active_tab().active_pane();
+        pane.pty
+            .child_pid()
+            .and_then(crate::workspace_panel::local_process_cwd)
+            .or_else(|| pane.cwd.clone())
+    }
+
+    /// Run project task `index` in this tab. Untrusted files go to review
+    /// first, and `confirm = true` tasks ask before running.
+    fn run_task(&mut self, index: usize, confirmed: bool) {
+        self.task_message = None;
+        let Some(tasks) = self.tasks.tasks.clone() else {
+            return;
+        };
+        let Some(task) = tasks.tasks.get(index).cloned() else {
+            return;
+        };
+        if !tasks.trusted {
+            self.set_task_message("Review this project's tasks before running them.");
+            self.show_tasks_in_card();
+            return;
+        }
+        if task.confirm && !confirmed {
+            self.pending_task = Some(index);
+            self.workspace_search.close();
+            self.renderer.search_palette = None;
+            self.active_prompt = Some(crate::prompt::TextPrompt::new(
+                crate::prompt::PromptKind::ConfirmTask,
+                &task.run,
+            ));
+            self.begin_redraw();
+            return;
+        }
+        let here = self.active_local_cwd();
+        let line =
+            crate::tasks::command_line(&tasks, &task, &self.config.shell.program, here.as_deref());
+        match self.type_into_shell(&line) {
+            Ok(()) => {
+                self.active_pane_mut().task_run = Some(Box::new(crate::tasks::TaskRun {
+                    name: task.name,
+                    root: tasks.root,
+                    state: crate::tasks::RunState::Sent,
+                }));
+            }
+            Err(message) => self.set_task_message(message),
+        }
+        self.sync_workspace_card();
+        self.begin_redraw();
+    }
+
+    /// Trust the current tasks file after the user reviewed it in the card.
+    fn trust_tasks(&mut self) {
+        let Some(root) = self.tasks.tasks.as_ref().map(|t| t.root.clone()) else {
+            return;
+        };
+        let failure = match volt_config::tasks::trust_dir() {
+            Some(dir) => volt_config::tasks::trust(&root, &dir)
+                .err()
+                .map(|e| format!("Couldn't record trust: {e}")),
+            None => Some("Couldn't find Volt's config folder.".into()),
+        };
+        if let Some(tasks) = self.tasks.tasks.as_mut() {
+            tasks.trusted = failure.is_none();
+        }
+        match failure {
+            Some(message) => self.set_task_message(message),
+            None => self.set_task_message("Trusted. These tasks can run now."),
+        }
+        self.tasks.refresh();
+        self.sync_workspace_card();
+    }
+
+    fn open_task_form(&mut self) {
+        if self.theme_editor.is_some() {
+            return;
+        }
+        let Some(root) = self.tasks.tasks.as_ref().map(|t| t.root.clone()) else {
+            self.set_task_message("Open a project folder to add tasks.");
+            self.sync_workspace_card();
+            return;
+        };
+        self.workspace_search.close();
+        self.renderer.search_palette = None;
+        self.active_prompt = None;
+        self.workspace_panel.focused = false;
+        self.task_message = None;
+        self.task_form = Some(crate::task_form::TaskForm::new(root));
+        self.sync_task_form();
+    }
+
+    /// Push the form to the renderer; a window too small for it closes it.
+    fn sync_task_form(&mut self) {
+        self.renderer.task_form = self.task_form.as_ref().map(|f| f.view());
+        if self.task_form.is_some() && self.renderer.task_form_layout().is_none() {
+            self.close_task_form();
+            self.set_task_message("Make the window larger to add a task.");
+            self.sync_workspace_card();
+        }
+        self.begin_redraw();
+    }
+
+    fn close_task_form(&mut self) {
+        self.task_form = None;
+        self.renderer.task_form = None;
+        self.begin_redraw();
+    }
+
+    fn apply_form_outcome(&mut self, outcome: crate::task_form::FormOutcome) {
+        use crate::task_form::FormOutcome as O;
+        match outcome {
+            O::Redraw => self.sync_task_form(),
+            O::Cancel => self.close_task_form(),
+            O::Save(task) => {
+                let Some(root) = self.task_form.as_ref().map(|f| f.root.clone()) else {
+                    return;
+                };
+                let trust = volt_config::tasks::trust_dir();
+                match volt_config::tasks::save(&root, None, Some(&task), trust.as_deref()) {
+                    Ok(()) => {
+                        self.close_task_form();
+                        self.set_task_message(format!("Added \"{}\".", task.name));
+                        self.tasks.refresh();
+                        self.sync_workspace_card();
+                    }
+                    Err(message) => {
+                        if let Some(form) = self.task_form.as_mut() {
+                            form.failed(message);
+                        }
+                        self.sync_task_form();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keyboard input while the form is open. Every key is consumed.
+    fn task_form_key(
+        &mut self,
+        key: PhysicalKey,
+        text: Option<&str>,
+        command: bool,
+        shift: bool,
+        ctrl: bool,
+    ) {
+        if command && key == PhysicalKey::Code(KeyCode::KeyV) {
+            self.paste_clipboard();
+            return;
+        }
+        let Some(form) = self.task_form.as_mut() else {
+            return;
+        };
+        let outcome = match key {
+            PhysicalKey::Code(KeyCode::KeyS) if command => form.save(),
+            PhysicalKey::Code(KeyCode::Backspace) if command => form.clear(),
+            _ if command || ctrl => return,
+            PhysicalKey::Code(KeyCode::Escape) => crate::task_form::FormOutcome::Cancel,
+            PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => form.enter(),
+            PhysicalKey::Code(KeyCode::Tab) => form.next(shift),
+            PhysicalKey::Code(KeyCode::ArrowDown) => form.next(false),
+            PhysicalKey::Code(KeyCode::ArrowUp) => form.next(true),
+            PhysicalKey::Code(KeyCode::Backspace) => form.backspace(),
+            PhysicalKey::Code(KeyCode::Delete) => form.delete(),
+            PhysicalKey::Code(KeyCode::ArrowLeft) => form.move_cursor(-1),
+            PhysicalKey::Code(KeyCode::ArrowRight) => form.move_cursor(1),
+            PhysicalKey::Code(KeyCode::Home) => form.cursor_to_edge(false),
+            PhysicalKey::Code(KeyCode::End) => form.cursor_to_edge(true),
+            _ => match text {
+                Some(text) => form.type_text(text),
+                None => return,
+            },
+        };
+        self.apply_form_outcome(outcome);
+    }
+
+    /// Task buttons for where the closed workspace card sits. Only for a
+    /// project's own tasks, never over a full-screen app or another panel.
+    fn task_strip_view(&self) -> Option<volt_renderer::task_strip::TaskStripView> {
+        use volt_renderer::task_strip::{StripState, StripTask, TaskStripView, MAX_BUTTONS};
+        let tasks = self.tasks.tasks.as_ref()?;
+        if tasks.tasks.is_empty()
+            || tasks.problem.is_some()
+            || self.renderer.workspace_card.is_some()
+            || self.workspace_search.visible
+            || self.task_form.is_some()
+            || self.theme_editor.is_some()
+        {
+            return None;
+        }
+        let pane = self.active_tab().active_pane();
+        match pane.performer.try_lock() {
+            Ok(p) if p.alternate_screen_active() => return None,
+            Ok(_) => {}
+            // Busy parsing output: keep what is on screen rather than flicker.
+            Err(_) => return self.renderer.task_strip.clone(),
+        }
+        let run = pane.task_run.as_deref().filter(|r| r.root == tasks.root);
+        Some(TaskStripView {
+            tasks: tasks
+                .tasks
+                .iter()
+                .take(MAX_BUTTONS)
+                .map(|t| StripTask {
+                    name: t.name.clone(),
+                    state: match run.filter(|r| r.name == t.name).map(|r| r.state) {
+                        Some(crate::tasks::RunState::Running) => StripState::Running,
+                        Some(crate::tasks::RunState::Finished(0)) => StripState::Succeeded,
+                        Some(crate::tasks::RunState::Finished(_)) => StripState::Failed,
+                        _ => StripState::Idle,
+                    },
+                })
+                .collect(),
+            more: tasks.tasks.len() > MAX_BUTTONS,
+            message: self.task_note(),
+        })
+    }
+
+    /// Open `.volt/tasks.toml` in the configured editor, in this tab.
+    fn edit_tasks_file(&mut self) {
+        let Some(file) = self.tasks.tasks.as_ref().map(|t| t.file()) else {
+            return;
+        };
+        match self.open_in_editor(&file, None) {
+            Ok(()) => self.task_message = None,
+            Err(message) => self.set_task_message(message),
+        }
+        self.sync_workspace_card();
+        self.begin_redraw();
+    }
+
+    fn set_task_message(&mut self, message: impl Into<String>) {
+        self.task_message = Some((message.into(), Instant::now()));
+    }
+
+    /// The current task note, if it's still fresh.
+    fn task_note(&self) -> Option<String> {
+        self.task_message
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(6))
+            .map(|(m, _)| m.clone())
+    }
+
+    /// Open the workspace card with Tasks expanded (e.g. to review a file).
+    fn show_tasks_in_card(&mut self) {
+        self.workspace_panel.visible = true;
+        self.workspace_panel.minimized = false;
+        self.workspace_panel.expanded = Some(1);
+        self.sync_workspace_card();
+        self.begin_redraw();
+    }
+
     fn activate_search_result(&mut self) {
         use crate::workspace_search::Action;
         let action = self
@@ -410,31 +736,47 @@ impl MainState {
                 })
             };
             if valid {
+                // Hand off to Find: every match in this terminal highlighted,
+                // positioned on the one picked; Enter / Shift+Enter step on.
                 let query = self.workspace_search.input.text().trim().to_string();
-                let (matches, truncated) = crate::prompt::find_matches_bounded(
-                    &query,
-                    std::iter::once((row, text.as_str())),
-                    100,
-                );
-                let mut prompt =
-                    crate::prompt::TextPrompt::new(crate::prompt::PromptKind::Find, &query);
-                prompt.matches = matches;
-                prompt.matches_truncated = truncated;
                 self.workspace_search.close();
-                self.active_prompt = Some(prompt);
-                self.search_dirty = false;
+                self.active_prompt = Some(crate::prompt::TextPrompt::new(
+                    crate::prompt::PromptKind::Find,
+                    &query,
+                ));
                 self.search_target = Some((self.active_tab, self.active_tab().tree.active_id));
+                self.recompute_search_matches();
+                if let Some(prompt) = self.active_prompt.as_mut() {
+                    if let Some(i) = prompt.matches.iter().position(|m| m.row == row) {
+                        prompt.current_match = i;
+                    }
+                }
                 self.scroll_to_current_match();
             } else {
                 self.workspace_search.output.status =
-                    "Output changed or busy — edit the query to refresh".into();
+                    "That output has changed. Edit the search to refresh it.".into();
             }
-        } else {
-            self.workspace_search.preview_selected(&self.proxy);
+        } else if let Some(Action::File { path, line }) = action {
+            // Only a regular file inside the searched project, re-checked now.
+            let root = self.workspace_search.output.root.clone();
+            let line = (line > 1).then_some(line);
+            let result = if crate::workspace_search::contained_file(&path, &root) {
+                self.open_in_editor(&path, line)
+            } else {
+                Err("That file is no longer in the project.".into())
+            };
+            match result {
+                Ok(()) => self.workspace_search.close(),
+                Err(message) => self.workspace_search.output.status = message,
+            }
         }
         self.sync_search();
     }
     fn sync_workspace_card(&mut self) {
+        self.workspace_panel.custom_tasks = self.tasks.tasks.clone();
+        self.workspace_panel.task_run =
+            self.active_tab().active_pane().task_run.as_deref().cloned();
+        self.workspace_panel.task_message = self.task_note();
         self.renderer.workspace_card = self.workspace_panel.presentation_card();
         if let Some(card) = self.renderer.workspace_card.as_mut() {
             card.floating =
@@ -486,9 +828,33 @@ impl MainState {
     }
 
     fn activate_workspace_action(&mut self, id: usize) {
+        use crate::workspace_panel as wp;
         if id == 103 {
             self.toggle_workspace_layout();
             return;
+        }
+        match id {
+            wp::SEARCH_ROW => {
+                self.toggle_search();
+                return;
+            }
+            wp::TRUST_ROW => {
+                self.trust_tasks();
+                return;
+            }
+            wp::EDIT_TASKS_ROW => {
+                self.edit_tasks_file();
+                return;
+            }
+            wp::ADD_TASK_ROW => {
+                self.open_task_form();
+                return;
+            }
+            _ if (wp::TASK_ROWS..wp::TASK_ROWS + wp::MAX_TASK_ROWS).contains(&id) => {
+                self.run_task(id - wp::TASK_ROWS, false);
+                return;
+            }
+            _ => {}
         }
         if id == 900 || (3000..3032).contains(&id) {
             let task = if id == 900 {
@@ -856,7 +1222,7 @@ impl MainState {
                 self.copy_selection();
             }
             A::Paste => self.paste_clipboard(),
-            A::Find => self.open_find_prompt(),
+            A::Find => self.toggle_search(),
             A::SearchWorkspace => self.toggle_search(),
             A::ToggleWorkspace => self.toggle_workspace_panel(),
             A::ToggleWorkspaceLayout => self.toggle_workspace_layout(),
@@ -916,7 +1282,7 @@ impl MainState {
                     .then_some(winit::window::Fullscreen::Borderless(None));
                 self.window.set_fullscreen(next);
             }
-            A::OpenConfig => open_config_in_editor(),
+            A::OpenConfig => self.open_config(),
             A::Ignore | A::Unbind => return,
             A::NewWindow | A::ReloadConfig | A::Quit | A::ClosePane | A::CustomizeTheme => {
                 unreachable!("App-owned action")
@@ -1588,6 +1954,11 @@ impl MainState {
             self.apply_editor_outcome(outcome);
             return;
         }
+        if let Some(form) = self.task_form.as_mut() {
+            let outcome = form.type_text(text);
+            self.apply_form_outcome(outcome);
+            return;
+        }
         match committed_text_target(
             self.workspace_search.visible,
             self.active_prompt.is_some(),
@@ -1617,6 +1988,7 @@ impl MainState {
         #[cfg(target_os = "macos")]
         {
             if self.theme_editor.is_none()
+                && self.task_form.is_none()
                 && !self.workspace_search.visible
                 && self.workspace_panel.visible
                 && self.workspace_panel.focused
@@ -1639,6 +2011,11 @@ impl MainState {
             if let Some(editor) = self.theme_editor.as_mut() {
                 let outcome = editor.paste(&String::from_utf8_lossy(&data));
                 self.apply_editor_outcome(outcome);
+                return;
+            }
+            if let Some(form) = self.task_form.as_mut() {
+                let outcome = form.type_text(&String::from_utf8_lossy(&data));
+                self.apply_form_outcome(outcome);
                 return;
             }
             if self.workspace_search.visible {
@@ -1668,24 +2045,9 @@ impl MainState {
 
     // ── Find / rename overlay ────────────────────────────────────────────
 
-    fn open_find_prompt(&mut self) {
-        if self.theme_editor.is_some() {
-            return;
-        }
-        self.workspace_search.close();
-        self.renderer.search_palette = None;
-        self.search_dirty = false;
-        self.search_target = Some((self.active_tab, self.active_tab().tree.active_id));
-        self.active_prompt = Some(crate::prompt::TextPrompt::new(
-            crate::prompt::PromptKind::Find,
-            "",
-        ));
-        self.begin_redraw();
-    }
-
     #[cfg(target_os = "macos")]
     fn open_rename_prompt(&mut self, kind: crate::prompt::PromptKind, tab: Option<usize>) {
-        if self.theme_editor.is_some() {
+        if self.theme_editor.is_some() || self.task_form.is_some() {
             return;
         }
         self.workspace_search.close();
@@ -1701,7 +2063,9 @@ impl MainState {
             crate::prompt::PromptKind::RenameTerminal => {
                 self.active_tab().active_pane().custom_title.as_deref()
             }
-            crate::prompt::PromptKind::Find | crate::prompt::PromptKind::OpenLink => None,
+            crate::prompt::PromptKind::Find
+            | crate::prompt::PromptKind::OpenLink
+            | crate::prompt::PromptKind::ConfirmTask => None,
         };
         let initial = rename_initial_text(custom);
         self.active_prompt = Some(crate::prompt::TextPrompt::new(kind, &initial));
@@ -1724,6 +2088,11 @@ impl MainState {
             crate::prompt::PromptKind::Find => {
                 // Enter/Shift+Enter cycle matches instead of confirming while
                 // a Find prompt is open; reaching here just closes it.
+            }
+            crate::prompt::PromptKind::ConfirmTask => {
+                if let Some(index) = self.pending_task.take() {
+                    self.run_task(index, true);
+                }
             }
             crate::prompt::PromptKind::RenameTab => {
                 let text = prompt.text();
@@ -2340,6 +2709,10 @@ impl App {
             last_search_refresh: Instant::now(),
             show_inspector: false,
             theme_editor: None,
+            tasks: crate::tasks::TaskLoader::default(),
+            pending_task: None,
+            task_message: None,
+            task_form: None,
         };
         state
             .window
@@ -2424,6 +2797,9 @@ impl App {
         };
         if state.theme_editor.is_some() {
             state.cancel_theme_editor();
+            return;
+        }
+        if state.task_form.is_some() {
             return;
         }
         // Unknown ids render as the Catppuccin fallback, so edit that.
@@ -2596,7 +2972,17 @@ impl App {
                 return;
             }
             A::OpenSettings => {
-                open_config_in_editor();
+                match self
+                    .target_window_id()
+                    .and_then(|id| self.windows.get_mut(&id))
+                {
+                    Some(state) => state.open_config(),
+                    None => {
+                        if let Some(path) = config_file_to_edit() {
+                            open_with_system_app(&path);
+                        }
+                    }
+                }
                 return;
             }
             A::OpenThemesFolder => {
@@ -2669,7 +3055,7 @@ impl App {
                 state.begin_redraw();
             }
             A::SearchWorkspace => state.toggle_search(),
-            A::Find => state.open_find_prompt(),
+            A::Find => state.toggle_search(),
             A::ToggleWorkspaceLayout => state.toggle_workspace_layout(),
             A::ToggleChatPanel => {
                 state.toggle_workspace_panel();
@@ -2800,25 +3186,34 @@ fn open_themes_folder() {
     }
 }
 
-fn open_config_in_editor() {
-    let Some(path) = config_path_to_edit() else {
-        return;
-    };
+/// The config file to edit, created from the commented sample if missing.
+fn config_file_to_edit() -> Option<std::path::PathBuf> {
+    let path = config_path_to_edit()?;
     if let Err(err) = create_sample_config_if_missing(&path) {
         eprintln!("volt-ui: failed to create sample config: {err}");
-        return;
+        return None;
     }
+    Some(path)
+}
 
-    #[cfg(target_os = "macos")]
+/// Open with the system's default app (`open` / `xdg-open`), no shell.
+fn open_with_system_app(path: &std::path::Path) -> bool {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    match std::process::Command::new(program)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
     {
-        if let Err(err) = std::process::Command::new("open").arg(&path).spawn() {
-            eprintln!("volt-ui: failed to open config in editor: {err}");
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        if let Err(err) = std::process::Command::new("xdg-open").arg(&path).spawn() {
-            eprintln!("volt-ui: failed to open config in editor: {err}");
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("volt-ui: failed to open {}: {err}", path.display());
+            false
         }
     }
 }
@@ -3008,6 +3403,9 @@ impl ApplicationHandler<VoltEvent> for App {
                 if state.theme_editor.is_some() {
                     state.sync_theme_editor();
                 }
+                if state.task_form.is_some() {
+                    state.sync_task_form();
+                }
                 state.resize_all_tabs_to_current_grid();
                 #[cfg(target_os = "macos")]
                 {
@@ -3026,6 +3424,9 @@ impl ApplicationHandler<VoltEvent> for App {
                 state.resize_all_tabs_to_current_grid();
                 if state.theme_editor.is_some() {
                     state.sync_theme_editor();
+                }
+                if state.task_form.is_some() {
+                    state.sync_task_form();
                 }
                 #[cfg(target_os = "macos")]
                 {
@@ -3298,6 +3699,48 @@ impl ApplicationHandler<VoltEvent> for App {
                     state.selection_scroll_deadline = None;
                     return;
                 }
+                // Task strip buttons (shown while the workspace card is closed).
+                if btn_state == ElementState::Pressed && button == MouseButton::Left {
+                    if let Some(l) = state.renderer.task_strip_layout() {
+                        use volt_renderer::task_strip::StripHit;
+                        let hit = l.hit(state.mouse_pos.0, state.mouse_pos.1);
+                        if hit != StripHit::Outside {
+                            state.search_mouse_capture = Some(button);
+                            match hit {
+                                StripHit::Task(i) => state.run_task(i, false),
+                                StripHit::More => state.show_tasks_in_card(),
+                                StripHit::Add => state.open_task_form(),
+                                StripHit::Outside => {}
+                            }
+                            state.begin_redraw();
+                            return;
+                        }
+                    }
+                }
+                // Clicks on the task form never reach the terminal below.
+                if btn_state == ElementState::Pressed {
+                    if let Some(l) = state.renderer.task_form_layout() {
+                        use volt_renderer::task_form::FormHit;
+                        let hit = l.hit(state.mouse_pos.0, state.mouse_pos.1);
+                        if hit != FormHit::Outside {
+                            state.search_mouse_capture = Some(button);
+                            let outcome = match (button, state.task_form.as_mut()) {
+                                (MouseButton::Left, Some(form)) => match hit {
+                                    FormHit::Field(i) => Some(form.focus(i)),
+                                    FormHit::Confirm => Some(form.toggle_confirm()),
+                                    FormHit::Save => Some(form.save()),
+                                    FormHit::Cancel => Some(crate::task_form::FormOutcome::Cancel),
+                                    FormHit::Body | FormHit::Outside => None,
+                                },
+                                _ => None,
+                            };
+                            if let Some(outcome) = outcome {
+                                state.apply_form_outcome(outcome);
+                            }
+                            return;
+                        }
+                    }
+                }
                 // Clicks on the theme editor never reach the terminal below;
                 // clicks elsewhere do, so text can still be selected.
                 if btn_state == ElementState::Pressed {
@@ -3341,15 +3784,12 @@ impl ApplicationHandler<VoltEvent> for App {
                                 state.workspace_search.selected,
                                 state.workspace_search.output.rows.len(),
                             ) {
-                                SearchHit::Close | SearchHit::Outside => {
-                                    state.workspace_search.close()
-                                }
+                                SearchHit::Outside => state.workspace_search.close(),
                                 SearchHit::Scope(i) => state
                                     .workspace_search
                                     .set_scope(crate::workspace_search::Scope::ALL[i]),
                                 SearchHit::Row(i) => {
                                     state.workspace_search.selected = i;
-                                    state.workspace_search.preview_selected(&state.proxy);
                                 }
                                 SearchHit::Body => {}
                             }
@@ -3655,6 +4095,12 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                if state.renderer.task_form_layout().is_some_and(|l| {
+                    l.hit(state.mouse_pos.0, state.mouse_pos.1)
+                        != volt_renderer::task_form::FormHit::Outside
+                }) {
+                    return;
+                }
                 if state.renderer.theme_editor_layout().is_some_and(|l| {
                     l.hit(state.mouse_pos.0, state.mouse_pos.1, false)
                         != volt_renderer::theme_editor::EditorHit::Outside
@@ -3804,6 +4250,19 @@ impl ApplicationHandler<VoltEvent> for App {
                 let super_key = state.super_down();
                 let shift = state.shift_down();
                 let alt = state.modifiers.alt_key();
+                // The task form owns the keyboard while open; Cmd+Q still quits.
+                if state.task_form.is_some()
+                    && !(super_key && physical_key == PhysicalKey::Code(KeyCode::KeyQ))
+                {
+                    state.task_form_key(
+                        physical_key,
+                        text.as_ref().map(|t| t.as_str()),
+                        super_key,
+                        shift,
+                        ctrl,
+                    );
+                    return;
+                }
                 // The theme editor owns the keyboard. App-level Cmd shortcuts
                 // (quit, windows, tabs, font size, reload) still work.
                 if state.theme_editor.is_some() {
@@ -3858,7 +4317,9 @@ impl ApplicationHandler<VoltEvent> for App {
                 }
                 // Local text fields and inspector navigation own their keys.
                 let custom = if crate::keybindings::terminal_owns_keys(
-                    state.active_prompt.is_some() || state.theme_editor.is_some(),
+                    state.active_prompt.is_some()
+                        || state.theme_editor.is_some()
+                        || state.task_form.is_some(),
                     state.workspace_search.visible,
                     state.workspace_panel.visible,
                     state.workspace_panel.focused,
@@ -3939,11 +4400,9 @@ impl ApplicationHandler<VoltEvent> for App {
                         _ => {}
                     }
                 }
-                // Cmd+F opens terminal Find regardless of whether the workspace
-                // search palette happens to be open. This used to be handled
-                // only inside the `workspace_search.visible` branch below,
-                // which meant Cmd+F silently did nothing the rest of the time
-                // — the common case.
+                // Cmd+F opens (or closes) search: terminal output across the
+                // full scrollback first, then project files, text, Git and
+                // tasks. Handled before the open-panel branch so it toggles.
                 #[cfg(target_os = "macos")]
                 if defaults
                     && super_key
@@ -3952,7 +4411,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     && !shift
                     && physical_key == PhysicalKey::Code(KeyCode::KeyF)
                 {
-                    state.open_find_prompt();
+                    state.toggle_search();
                     return;
                 }
                 if state.workspace_search.visible {
@@ -4242,9 +4701,9 @@ impl ApplicationHandler<VoltEvent> for App {
                             state.begin_redraw();
                             return;
                         }
-                        // Cmd+, → open config file in default editor
+                        // Cmd+, → open the config file in the configured editor
                         PhysicalKey::Code(KeyCode::Comma) => {
-                            open_config_in_editor();
+                            state.open_config();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyD) => {
@@ -4557,9 +5016,15 @@ impl ApplicationHandler<VoltEvent> for App {
                                 }
                                 CoreEvent::CommandStarted => {
                                     pane.running = true;
+                                    if let Some(run) = pane.task_run.as_mut() {
+                                        run.started();
+                                    }
                                 }
-                                CoreEvent::CommandFinished { .. } => {
+                                CoreEvent::CommandFinished { exit_code, .. } => {
                                     pane.running = false;
+                                    if let Some(run) = pane.task_run.as_mut() {
+                                        run.finished(exit_code);
+                                    }
                                 }
                                 CoreEvent::PtyError(msg) => {
                                     if i == active {
@@ -4657,7 +5122,7 @@ impl ApplicationHandler<VoltEvent> for App {
                             .as_ref()
                             .map(|p| volt_renderer::PromptOverlay {
                                 title: p.title(),
-                                read_only: p.kind == crate::prompt::PromptKind::OpenLink,
+                                read_only: p.kind.read_only(),
                                 text: prompt_text.as_deref().unwrap_or(""),
                                 cursor: p.cursor,
                                 match_count: p.matches.len(),
@@ -4680,6 +5145,14 @@ impl ApplicationHandler<VoltEvent> for App {
                         None
                     };
                     let active_read_only = state.active_tab().active_pane().read_only;
+                    state.renderer.task_strip = state.task_strip_view();
+                    if state.workspace_panel.task_run.as_ref()
+                        != state.active_tab().active_pane().task_run.as_deref()
+                        && state.renderer.workspace_card.is_some()
+                    {
+                        // A task finished (or started): refresh its ✓ / ✗ in the card.
+                        state.sync_workspace_card();
+                    }
                     state.renderer.render_frame(
                         &render_grid,
                         &state.theme,
@@ -4767,6 +5240,15 @@ impl ApplicationHandler<VoltEvent> for App {
                         Some(next_blink_deadline.map_or(deadline, |d| d.min(deadline)));
                 }
             }
+            let pane_cwd = cwd.clone();
+            let task_cwd = move || {
+                pid.and_then(crate::workspace_panel::local_process_cwd)
+                    .or(pane_cwd)
+            };
+            if state.tasks.tick(task_cwd, &state.proxy) {
+                state.sync_workspace_card();
+                state.begin_redraw();
+            }
             if state.workspace_panel.tick(cwd, pid, &state.proxy) {
                 let previous_grid = state.current_grid_size();
                 state.sync_workspace_card();
@@ -4841,9 +5323,15 @@ impl ApplicationHandler<VoltEvent> for App {
                                 }
                                 CoreEvent::CommandStarted => {
                                     pane.running = true;
+                                    if let Some(run) = pane.task_run.as_mut() {
+                                        run.started();
+                                    }
                                 }
-                                CoreEvent::CommandFinished { .. } => {
+                                CoreEvent::CommandFinished { exit_code, .. } => {
                                     pane.running = false;
+                                    if let Some(run) = pane.task_run.as_mut() {
+                                        run.finished(exit_code);
+                                    }
                                 }
                                 CoreEvent::PtyError(msg) => {
                                     if i == active {

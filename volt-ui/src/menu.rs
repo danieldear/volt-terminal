@@ -251,7 +251,7 @@ pub fn install_app_menu() -> AppMenu {
     let view_menu = Submenu::new("View", true);
     let _ = view_menu.append_items(&[
         &MenuAction::ToggleChatPanel.item("Toggle Workspace Panel"),
-        &MenuAction::SearchWorkspace.item("Search Workspace…  ⌘⇧P"),
+        &MenuAction::SearchWorkspace.item("Search…  ⌘F"),
         &MenuAction::ToggleWorkspaceLayout.item("Switch Workspace: Docked / Floating"),
         &PredefinedMenuItem::separator(),
         &MenuAction::IncreaseFontSize.item("Increase Font Size"),

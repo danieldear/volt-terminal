@@ -44,6 +44,12 @@ pub struct WorkspacePanel {
     pub scroll: usize,
     pub snapshot: Option<Snapshot>,
     pub selected_task: Option<ProjectTask>,
+    /// The project's own tasks (`.volt/tasks.toml`), loaded by the app.
+    pub custom_tasks: Option<volt_config::tasks::ProjectTasks>,
+    /// The last task typed into the active pane, for its ✓ / ✗ status.
+    pub task_run: Option<crate::tasks::TaskRun>,
+    /// Why the last task action didn't happen.
+    pub task_message: Option<String>,
     pub selected_item: Option<usize>,
     pub pull_request: Option<PrState>,
     pr_key: Option<String>,
@@ -71,6 +77,9 @@ impl Default for WorkspacePanel {
             scroll: 0,
             snapshot: None,
             selected_task: None,
+            custom_tasks: None,
+            task_run: None,
+            task_message: None,
             selected_item: None,
             pull_request: None,
             pr_key: None,
@@ -412,8 +421,14 @@ impl WorkspacePanel {
             (3, "Rules & context", CardIcon::File),
             (4, "Tools / MCP", CardIcon::Link),
         ] {
+            let custom_tasks = self
+                .custom_tasks
+                .as_ref()
+                .is_some_and(|t| !t.tasks.is_empty() || t.problem.is_some());
             if if id == 8 {
                 !matches!(self.pull_request, Some(PrState::Found(_)))
+            } else if id == 1 && custom_tasks {
+                false
             } else {
                 !s.is_some_and(|s| section_available(id, s))
             } {
@@ -429,6 +444,12 @@ impl WorkspacePanel {
                             format!("{} files", s.files.len())
                         }
                     })
+                    .unwrap_or_default(),
+                1 => self
+                    .custom_tasks
+                    .as_ref()
+                    .filter(|t| !t.tasks.is_empty())
+                    .map(|t| t.tasks.len().to_string())
                     .unwrap_or_default(),
                 2 => "Not connected".into(),
                 6 => s.map(|s| s.branch.clone()).unwrap_or_default(),
@@ -512,7 +533,85 @@ impl WorkspacePanel {
                     }
                 }
                 1 => {
+                    if let Some(message) = &self.task_message {
+                        for line in display_lines(message) {
+                            row(&line, "", CardIcon::File, None, false, false);
+                        }
+                    }
+                    if let Some(custom) = &self.custom_tasks {
+                        if let Some(problem) = &custom.problem {
+                            for line in display_lines(problem) {
+                                row(&line, "", CardIcon::File, None, false, false);
+                            }
+                        } else if !custom.tasks.is_empty() && !custom.trusted {
+                            // Someone else's commands: show them all before anything runs.
+                            row(
+                                "Review before running:",
+                                "",
+                                CardIcon::File,
+                                None,
+                                false,
+                                false,
+                            );
+                            for task in &custom.tasks {
+                                for line in display_lines(&format!("{}: {}", task.name, task.run)) {
+                                    row(&line, "", CardIcon::File, None, false, false);
+                                }
+                            }
+                            row(
+                                "Trust these tasks",
+                                "",
+                                CardIcon::Play,
+                                Some(TRUST_ROW),
+                                false,
+                                false,
+                            );
+                        } else {
+                            for (i, task) in custom.tasks.iter().enumerate() {
+                                let status = self
+                                    .task_run
+                                    .as_ref()
+                                    .filter(|r| r.name == task.name && r.root == custom.root)
+                                    .map(|r| match r.state {
+                                        crate::tasks::RunState::Sent => "",
+                                        crate::tasks::RunState::Running => "Running…",
+                                        crate::tasks::RunState::Finished(0) => "✓ Done",
+                                        crate::tasks::RunState::Finished(_) => "✗ Failed",
+                                    })
+                                    .unwrap_or("");
+                                row(
+                                    &task.name,
+                                    status,
+                                    CardIcon::Play,
+                                    Some(TASK_ROWS + i),
+                                    false,
+                                    false,
+                                );
+                            }
+                        }
+                        row(
+                            "Add task",
+                            "",
+                            CardIcon::Plus,
+                            Some(ADD_TASK_ROW),
+                            false,
+                            false,
+                        );
+                        if custom.file().exists() || custom.problem.is_some() {
+                            row(
+                                "Edit tasks file",
+                                "",
+                                CardIcon::Edit,
+                                Some(EDIT_TASKS_ROW),
+                                false,
+                                false,
+                            );
+                        }
+                    }
                     if let Some(s) = s {
+                        if !s.project.tasks.is_empty() {
+                            row("Detected", "", CardIcon::File, None, false, false);
+                        }
                         for (i, task) in s.project.tasks.iter().enumerate() {
                             row(
                                 &task.label,
@@ -822,6 +921,22 @@ impl WorkspacePanel {
                 row.tone = CardTone::Green;
             }
         }
+        // A shortcut to search, on top of a card that has something to show.
+        if !card.rows.is_empty() {
+            card.rows.insert(
+                0,
+                CardRow {
+                    label: "Search".into(),
+                    detail: "⌘F".into(),
+                    icon: CardIcon::Search,
+                    action: Some(SEARCH_ROW),
+                    expanded: false,
+                    section: false,
+                    tone: CardTone::Muted,
+                    diff: None,
+                },
+            );
+        }
         card
     }
 }
@@ -846,10 +961,19 @@ fn display_lines(text: &str) -> Vec<String> {
     lines
 }
 
+/// Card row actions handled by the app (outside `activate`).
+pub const SEARCH_ROW: usize = 1300;
+pub const TASK_ROWS: usize = 1100;
+pub const MAX_TASK_ROWS: usize = volt_config::tasks::MAX_TASKS;
+pub const ADD_TASK_ROW: usize = 1202;
+pub const EDIT_TASKS_ROW: usize = 1200;
+pub const TRUST_ROW: usize = 1201;
+
 fn section_available(id: usize, s: &Snapshot) -> bool {
     match id {
         0 => s.repository,
-        1 => s.rust || !s.project.tasks.is_empty(),
+        // Any project or checkout can have its own tasks, so offer "Add task".
+        1 => s.rust || !s.project.tasks.is_empty() || s.repository || !s.project.tags.is_empty(),
         2 => s.configs.iter().any(|p| {
             p == "AGENTS.md"
                 || p == "CLAUDE.md"

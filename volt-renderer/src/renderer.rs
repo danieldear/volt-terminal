@@ -341,6 +341,10 @@ pub struct Renderer {
     /// Theme editor panel; drawn in the top layer, above the search palette.
     pub theme_editor: Option<crate::theme_editor::ThemeEditorView>,
     theme_editor_cache: Option<theme_editor_draw::EditorGeometry>,
+    pub task_form: Option<crate::task_form::TaskFormView>,
+    /// Task buttons where the workspace card sits while it's closed.
+    pub task_strip: Option<crate::task_strip::TaskStripView>,
+    task_form_cache: Option<task_form_draw::FormGeometry>,
     row_cache: Vec<CachedRow>,
     cache_context: Option<([f32; 8], Theme, CursorStyle)>,
     row_cache_enabled: bool,
@@ -731,6 +735,9 @@ impl Renderer {
             workspace_card_cache: None,
             theme_editor: None,
             theme_editor_cache: None,
+            task_form: None,
+            task_strip: None,
+            task_form_cache: None,
             tab_bar_height,
             custom_tab_bar: true,
             scale_factor,
@@ -920,6 +927,7 @@ impl Renderer {
         self.workspace_card_cache = None;
         self.search_palette_cache = None;
         self.theme_editor_cache = None;
+        self.task_form_cache = None;
         self.shape_cache.clear();
         self.extended_shape_cache.clear();
         self.row_cache.clear();
@@ -1303,6 +1311,24 @@ impl Renderer {
         line_height: f32,
         color: [f32; 4],
     ) {
+        self.draw_text_colored(glyphs, text, px, py, font_size_phys, line_height, &|_| {
+            color
+        });
+    }
+
+    /// One shaping pass; `color_at` picks each glyph's color from its byte
+    /// offset in `text`, so highlighted spans line up exactly with the text.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_colored(
+        &mut self,
+        glyphs: &mut Vec<GlyphVertex>,
+        text: &str,
+        px: f32,
+        py: f32,
+        font_size_phys: f32,
+        line_height: f32,
+        color_at: &dyn Fn(usize) -> [f32; 4],
+    ) {
         let sw = self.config.width as f32;
         let sh = self.config.height as f32;
         let fam_name = self.font_family.clone();
@@ -1328,6 +1354,7 @@ impl Renderer {
                 ) else {
                     continue;
                 };
+                let color = color_at(glyph.start);
                 let color = if region.is_color {
                     [1.0, 1.0, 1.0, color[3]]
                 } else {
@@ -1558,6 +1585,7 @@ impl Renderer {
             self.workspace_card_cache = None;
             self.search_palette_cache = None;
             self.theme_editor_cache = None;
+            self.task_form_cache = None;
             self.row_cache.clear();
         }
         if self.extended_shape_cache.len() > 4096 {
@@ -2609,14 +2637,14 @@ impl Renderer {
         }
 
         let search_start = (bg_verts.len(), glyph_verts.len());
+        if let Some(strip) = self.task_strip.clone() {
+            self.draw_task_strip(&mut bg_verts, &mut glyph_verts, &strip, theme);
+        }
         if let Some(search) = self.search_palette.clone() {
-            self.draw_search_palette(
-                &mut bg_verts,
-                &mut glyph_verts,
-                &search,
-                theme,
-                tab_top_h + alert_h,
-            );
+            self.draw_search_palette(&mut bg_verts, &mut glyph_verts, &search, theme);
+        }
+        if let Some(form) = self.task_form.clone() {
+            self.draw_task_form(&mut bg_verts, &mut glyph_verts, &form, theme);
         }
         if let Some(editor) = self.theme_editor.clone() {
             self.draw_theme_editor(&mut bg_verts, &mut glyph_verts, &editor);
@@ -2722,5 +2750,9 @@ mod placement_tests {
 #[path = "search_palette_draw.rs"]
 mod search_palette_draw;
 
+#[path = "task_form_draw.rs"]
+mod task_form_draw;
+#[path = "task_strip_draw.rs"]
+mod task_strip_draw;
 #[path = "theme_editor_draw.rs"]
 mod theme_editor_draw;

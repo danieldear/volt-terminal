@@ -13,4 +13,7 @@ pub mod tab_color;
 
 pub mod theme_editor;
 
+pub mod task_form;
+pub mod task_strip;
+
 mod prompt_viewport;

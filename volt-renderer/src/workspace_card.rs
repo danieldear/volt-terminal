@@ -14,6 +14,9 @@ pub enum CardIcon {
     Pin,
     Unpin,
     Expand,
+    Search,
+    Plus,
+    Edit,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CardTone {

@@ -1,11 +1,14 @@
 pub mod app;
 pub mod chat_panel;
 pub mod display_link;
+pub mod editor;
 pub mod menu;
 pub mod pane_tree;
 pub mod prompt;
 pub mod tab;
 pub mod tab_layout;
+pub mod task_form;
+pub mod tasks;
 pub mod theme_editor;
 pub use app::App;
 

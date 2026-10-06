@@ -170,6 +170,20 @@ pub enum WorkspaceLayout {
     Docked,
     Floating,
 }
+/// Which editor opens files from search and Volt ▸ Settings…. Volt types the
+/// command into the current terminal tab, so terminal editors run in place.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct EditorConfig {
+    /// Default editor command, e.g. "nvim" or "code --wait". Empty uses
+    /// $VISUAL, then $EDITOR, then the system's default app.
+    #[serde(default)]
+    pub command: String,
+    /// Per file type: extension without the dot ("md") or a full file name
+    /// ("Makefile") → editor command. Overrides `command`.
+    #[serde(default)]
+    pub filetypes: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkspaceConfig {
     #[serde(default)]
@@ -194,6 +208,8 @@ pub struct Config {
     pub ai: AiConfig,
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+    #[serde(default)]
+    pub editor: EditorConfig,
 }
 fn default_theme() -> String {
     "catppuccin".to_string()
@@ -479,6 +495,18 @@ cursor_blink = true
 # "docked" reserves space; "floating" overlays and can be dragged by its header.
 layout = "docked"
 
+# ── Editor ──────────────────────────────────────────────────────────────────────
+# Opens files from search (at the matching line) and Volt ▸ Settings….
+# Volt types the command into the current terminal tab. When unset, Volt uses
+# $VISUAL or $EDITOR, or else the system's default app.
+# [editor]
+# command = "nvim"
+#
+# Per file type, by extension or full file name:
+# [editor.filetypes]
+# md = "nano"
+# json = "zed"
+
 [terminal]
 # Number of lines retained in the scrollback buffer per pane.
 # Increase this for high-output commands such as `adb logcat`.
@@ -670,6 +698,30 @@ fn with_theme_line(text: &str, id: &str) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_section_parses_and_the_sample_block_works_uncommented() {
+        let c: Config =
+            toml::from_str("[editor]\ncommand = \"nvim\"\n[editor.filetypes]\nmd = \"nano\"\n")
+                .unwrap();
+        assert_eq!(c.editor.command, "nvim");
+        assert_eq!(c.editor.filetypes["md"], "nano");
+        assert_eq!(Config::default().editor, EditorConfig::default());
+
+        let sample = sample_config_toml()
+            .replace("# [editor]", "[editor]")
+            .replace("# command = \"nvim\"", "command = \"nvim\"")
+            .replace("# [editor.filetypes]", "[editor.filetypes]")
+            .replace("# md = \"nano\"", "md = \"nano\"")
+            .replace("# json = \"zed\"", "json = \"zed\"");
+        let c = parse_config_with_compat(&sample).unwrap();
+        assert_eq!(c.editor.command, "nvim");
+        assert_eq!(c.editor.filetypes.len(), 2);
+        assert_eq!(
+            c.terminal.scrollback_lines, 10000,
+            "[terminal] still parses after it"
+        );
+    }
 
     #[test]
     fn settings_prefers_existing_legacy_config_over_creating_shadow_file() {

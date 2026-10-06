@@ -53,8 +53,11 @@ root remains separate from the active subproject root.
 - Make: marker only; dynamic targets are not guessed.
 - Bounded immediate source-file sampling identifies standalone language folders.
 
-Project disclosure shows detected evidence and task scope. Selecting a task
-shows its command, directory, and definition; **Run in new terminal** executes it.
+Project disclosure shows detected evidence and task scope. Selecting a detected
+task shows its command, directory, and definition; **Run in new terminal**
+executes it. A project's own tasks (`.volt/tasks.toml`, see the README's
+"Project tasks") are listed first and run in the current tab with one click;
+**Add task**, **Edit tasks file**, and the trust review live in the same section.
 Dynamic strings are passed as arguments, not interpolated into shell source.
 Build/package scripts are still executable project code: only run trusted tasks.
 Task output remains in a dedicated tab and a shell starts after completion.
