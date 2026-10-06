@@ -1,5 +1,44 @@
 use super::{BgVertex, GlyphVertex, Renderer, Theme};
 use crate::workspace_card::{CardIcon, CardLayout, CardTone, WorkspaceCard};
+
+/// Notices occupy one shared layout row, not one selectable item per line.
+/// Wrap at word boundaries and bound long diagnostics to two lines.
+fn notice_lines(text: &str) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+    const WIDTH: usize = 36;
+    let mut lines = vec![String::new()];
+    for word in text.split_whitespace() {
+        let line = lines.last_mut().unwrap();
+        let width = line.width() + usize::from(!line.is_empty()) + word.width();
+        if width > WIDTH && !line.is_empty() {
+            if lines.len() == 2 {
+                let last = lines.last_mut().unwrap();
+                while last.width() >= WIDTH {
+                    last.pop();
+                }
+                last.push('…');
+                break;
+            }
+            lines.push(String::new());
+        }
+        let line = lines.last_mut().unwrap();
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        if word.width() > WIDTH {
+            for c in word.chars() {
+                if line.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) >= WIDTH {
+                    break;
+                }
+                line.push(c);
+            }
+            line.push('…');
+        } else {
+            line.push_str(word);
+        }
+    }
+    lines
+}
 pub(super) struct CardGeometry {
     card: WorkspaceCard,
     size: (u32, u32),
@@ -158,6 +197,7 @@ impl Renderer {
     ) {
         // A coherent 16-unit outline family. No dependency on terminal font glyphs.
         let paths: &[&[[f32; 2]]] = match icon {
+            CardIcon::Notice => &[],
             CardIcon::Folder => &[&[
                 [1., 4.],
                 [6., 4.],
@@ -446,6 +486,28 @@ impl Renderer {
         }
         for (i, row) in card.rows.iter().skip(card.scroll).take(l.count).enumerate() {
             let y = l.y + (82. + i as f32 * 40.) * s;
+            if row.icon == CardIcon::Notice {
+                let color = row.tone.color(dark);
+                self.card_round(
+                    bg,
+                    [l.x + 22. * s, y + 2. * s, l.w - 44. * s, 36. * s],
+                    6. * s,
+                    [color[0], color[1], color[2], 0.08],
+                );
+                let lines = notice_lines(&row.label);
+                let start = y + (40. - lines.len() as f32 * 12.6) * 0.5 * s;
+                for (i, line) in lines.iter().enumerate() {
+                    self.card_text(
+                        glyphs,
+                        line,
+                        l.x + 30. * s,
+                        start + i as f32 * 12.6 * s,
+                        10.5 * s,
+                        color,
+                    );
+                }
+                continue;
+            }
             let selected = row.action.is_some() && row.action == card.hover;
             if row.section {
                 self.draw_rect(
@@ -561,5 +623,41 @@ impl Renderer {
             9. * s,
             muted,
         );
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::notice_lines;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn status_wraps_between_words_not_inside_command() {
+        let lines = notice_lines("Wait for the current command to finish before running a task.");
+        assert_eq!(
+            lines,
+            [
+                "Wait for the current command to",
+                "finish before running a task."
+            ]
+        );
+        assert_eq!(
+            notice_lines("Command running. Wait before starting a task."),
+            ["Command running. Wait before", "starting a task."]
+        );
+    }
+
+    #[test]
+    fn long_diagnostics_remain_bounded_and_signal_truncation() {
+        for text in [
+            "longword".repeat(100),
+            "many words ".repeat(100),
+            "界".repeat(100),
+        ] {
+            let lines = notice_lines(&text);
+            assert!(lines.len() <= 2);
+            assert!(lines.iter().all(|l| l.width() <= 36));
+            assert!(lines.last().unwrap().ends_with('…'));
+        }
     }
 }

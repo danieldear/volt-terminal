@@ -34,6 +34,7 @@ impl Renderer {
             let edge = match task.state {
                 StripState::Failed => red,
                 StripState::Running => c.accent,
+                StripState::ReviewRequired => c.accent,
                 _ => c.border,
             };
             self.card_round(bg, r, 8. * s, edge);
@@ -41,6 +42,22 @@ impl Renderer {
             // Leading mark: ▶ idle, a dot while running, ✓ / ✗ when done.
             let (mx, my) = (r[0] + 13. * s, r[1] + r[3] / 2.);
             match task.state {
+                StripState::ReviewRequired => {
+                    // Shield: this click reviews a command rather than silently
+                    // navigating to the workspace card or granting file trust.
+                    let p = |dx: f32, dy: f32| [mx + dx * s, my + dy * s];
+                    for (a, b) in [
+                        ((-4., -4.), (0., -5.5)),
+                        ((0., -5.5), (4., -4.)),
+                        ((4., -4.), (3.5, 2.)),
+                        ((3.5, 2.), (0., 5.5)),
+                        ((0., 5.5), (-3.5, 2.)),
+                        ((-3.5, 2.), (-4., -4.)),
+                        ((0., -2.5), (0., 1.)),
+                    ] {
+                        self.card_line(bg, p(a.0, a.1), p(b.0, b.1), 1.4 * s, c.accent);
+                    }
+                }
                 StripState::Idle => {
                     let p = |dx: f32, dy: f32| [mx + dx * s, my + dy * s];
                     self.card_line(bg, p(-3., -4.5), p(-3., 4.5), 1.6 * s, c.accent);
@@ -71,16 +88,26 @@ impl Renderer {
                 c.text,
             );
         }
-        for (r, glyph) in l.more.iter().map(|r| (*r, "⋯")).chain([(l.add, "+")]) {
+        let add_label = if view.tasks.is_empty() {
+            "+ Add task"
+        } else {
+            "+"
+        };
+        for (r, glyph) in l.more.iter().map(|r| (*r, "⋯")).chain([(l.add, add_label)]) {
             self.card_round(bg, r, 8. * s, c.border);
             self.card_round(bg, pill(r), 7. * s, c.panel);
-            let gx = r[0] + (r[2] - Self::approx_text_width(glyph, 15. * s)) / 2.;
+            let glyph_size = if glyph == "+ Add task" {
+                TEXT * s
+            } else {
+                15. * s
+            };
+            let gx = r[0] + (r[2] - Self::approx_text_width(glyph, glyph_size)) / 2.;
             self.card_text(
                 glyphs,
                 glyph,
                 gx,
-                r[1] + (r[3] - 15. * s * 1.2) / 2.,
-                15. * s,
+                r[1] + (r[3] - glyph_size * 1.2) / 2.,
+                glyph_size,
                 c.muted,
             );
         }

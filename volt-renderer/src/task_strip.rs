@@ -4,6 +4,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StripState {
     Idle,
+    ReviewRequired,
     Running,
     Succeeded,
     Failed,
@@ -75,9 +76,14 @@ impl TaskStripLayout {
             .map(|t| text_w(&label(&t.name)) + 38.)
             .collect();
         let more_w = view.more.then_some(ICON_W);
+        let add_w = if view.tasks.is_empty() {
+            text_w("+ Add task") + 22.
+        } else {
+            ICON_W
+        };
         let total = widths.iter().sum::<f32>()
             + more_w.unwrap_or(0.)
-            + ICON_W
+            + add_w
             + GAP * (widths.len() + usize::from(view.more)) as f32;
         // A window too narrow for the strip doesn't show it; the card still works.
         if (total + 2. * MARGIN) * s > width {
@@ -92,7 +98,7 @@ impl TaskStripLayout {
         };
         let buttons = widths.drain(..).map(&mut rect).collect();
         let more = more_w.map(&mut rect);
-        let add = rect(ICON_W);
+        let add = rect(add_w);
         Some(Self {
             scale: s,
             buttons,
@@ -156,6 +162,14 @@ mod tests {
             assert_eq!(l.hit(x, y), StripHit::Add);
             assert_eq!(l.hit(5., 5.), StripHit::Outside);
         }
+    }
+
+    #[test]
+    fn a_project_with_no_tasks_has_a_visible_first_task_button() {
+        let l = TaskStripLayout::new(&view(0, false), 800., 30., 1.).unwrap();
+        assert!(l.buttons.is_empty());
+        assert!(l.add[2] > ICON_W);
+        assert_eq!(l.hit(l.add[0] + 10., l.add[1] + 10.), StripHit::Add);
     }
 
     #[test]

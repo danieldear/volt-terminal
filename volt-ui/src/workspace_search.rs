@@ -61,6 +61,10 @@ pub enum Action {
     Branch(String),
     Worktree(PathBuf),
     Task(ProjectTask),
+    SavedTask {
+        name: String,
+        root: PathBuf,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct ResultRow {
@@ -233,6 +237,7 @@ impl SearchPalette {
             let hint = match row.map(|r| &r.action) {
                 Some(Action::File { .. }) => "Enter to open",
                 Some(Action::Terminal { .. }) => "Enter to jump to line",
+                Some(Action::Task(_) | Action::SavedTask { .. }) => "Enter to review in Tasks",
                 _ => "Esc to close",
             };
             SearchView {
@@ -581,7 +586,44 @@ pub fn search(input: SearchInput, cancel: &AtomicU64, generation: u64) -> Search
         output.root = repo.unwrap_or_else(|| project.root.clone());
     }
     if input.scope.includes(Scope::Tasks) {
+        let saved = input.cwd.as_ref().and_then(|cwd| {
+            volt_config::tasks::project_root(cwd, dirs::home_dir().as_deref()).map(|root| {
+                volt_config::tasks::load(&root, volt_config::tasks::trust_dir().as_deref())
+            })
+        });
+        if let Some(saved) = &saved {
+            for task in &saved.tasks {
+                if let Some(score) = fuzzy_score(q, &task.name) {
+                    push(
+                        &mut output.rows,
+                        ResultRow {
+                            kind: "TASK",
+                            hits: label_hits(q, &task.name),
+                            title: task.name.clone(),
+                            detail: if saved.trusted {
+                                "Saved task".into()
+                            } else {
+                                "Review tasks file first".into()
+                            },
+                            score: score + 100,
+                            action: Action::SavedTask {
+                                name: task.name.clone(),
+                                root: saved.root.clone(),
+                            },
+                        },
+                    );
+                }
+            }
+        }
         for task in &project.tasks {
+            if saved.as_ref().is_some_and(|saved| {
+                crate::tasks::detected_task(task, saved)
+                    .ok()
+                    .flatten()
+                    .is_none()
+            }) {
+                continue;
+            }
             if let Some(score) = fuzzy_score(q, &task.label) {
                 push(
                     &mut output.rows,
@@ -1233,5 +1275,19 @@ mod tests {
         assert_eq!(out.rows.len(), 1);
         assert!(!f.0.join("NEVER_RUN").exists());
         assert!(matches!(out.rows[0].action, Action::Task(_)));
+    }
+
+    #[test]
+    fn task_search_finds_saved_commands_without_repeating_imported_suggestions() {
+        let f = Fixture::new();
+        f.put("Cargo.toml", "[package]\nname='sample'\nversion='0.1.0'\n");
+        f.put(
+            ".volt/tasks.toml",
+            "[[task]]\nname='cargo build'\nrun='cargo build'\nconfirm=true\n",
+        );
+        let out = f.run("cargo build", Scope::Tasks);
+        assert_eq!(out.rows.len(), 1);
+        assert!(matches!(out.rows[0].action, Action::SavedTask { .. }));
+        assert_eq!(out.rows[0].detail, "Review tasks file first");
     }
 }

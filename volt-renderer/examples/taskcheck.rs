@@ -7,10 +7,14 @@ use volt_core::{cell::Cell, grid::Grid};
 use volt_renderer::{
     task_form::{FormField, TaskFormView},
     task_strip::{StripState, StripTask, TaskStripView},
-    Renderer,
+    PromptOverlay, Renderer,
 };
 
 fn draw(r: &mut Renderer, g: &Grid, theme: &Theme) {
+    draw_with_prompt(r, g, theme, None);
+}
+
+fn draw_with_prompt(r: &mut Renderer, g: &Grid, theme: &Theme, prompt: Option<PromptOverlay<'_>>) {
     r.render_frame(
         g,
         theme,
@@ -21,7 +25,7 @@ fn draw(r: &mut Renderer, g: &Grid, theme: &Theme) {
         None,
         &[],
         None,
-        None,
+        prompt,
         None,
         false,
     );
@@ -37,7 +41,7 @@ fn strip() -> TaskStripView {
             task("Build", StripState::Succeeded),
             task("Test", StripState::Failed),
             task("Run", StripState::Running),
-            task("Deploy staging", StripState::Idle),
+            task("Review task", StripState::ReviewRequired),
         ],
         more: false,
         message: Some("Added \"Deploy staging\".".into()),
@@ -114,6 +118,39 @@ fn main() -> Result<()> {
         anyhow::ensure!(r.grid_size() == size, "strip resized the grid");
         draw(&mut r, &filled, &theme);
         let with_strip = r.read_offscreen_rgba()?;
+        let prompt = || {
+            Some(PromptOverlay {
+                title: "Review task · Enter: run once / Esc: cancel",
+                text: "cargo build --release",
+                read_only: true,
+                cursor: 0,
+                match_count: 0,
+                matches_truncated: false,
+                current_match: 0,
+            })
+        };
+        r.workspace_card = Some(volt_renderer::workspace_card::WorkspaceCard {
+            floating: true,
+            title: "Must not cover confirmation".into(),
+            ..Default::default()
+        });
+        draw_with_prompt(&mut r, &filled, &theme, prompt());
+        let prompt_over_strip = r.read_offscreen_rgba()?;
+        png(
+            &format!("target/taskcheck/review-{scale}.png"),
+            w,
+            h,
+            &prompt_over_strip,
+        )?;
+        r.task_strip = None;
+        r.workspace_card = None;
+        draw_with_prompt(&mut r, &filled, &theme, prompt());
+        anyhow::ensure!(
+            prompt_over_strip == r.read_offscreen_rgba()?,
+            "task strip obscures command confirmation"
+        );
+        r.task_strip = Some(strip());
+        draw(&mut r, &filled, &theme);
         for b in &l.buttons {
             let inset = [
                 b[0] + 30. * scale,
@@ -137,6 +174,32 @@ fn main() -> Result<()> {
         anyhow::ensure!(
             r.read_offscreen_rgba()? == baseline,
             "strip leaves pixels when hidden"
+        );
+
+        // The first-task affordance remains visible before any commands exist.
+        r.task_strip = Some(TaskStripView {
+            tasks: vec![],
+            more: false,
+            message: None,
+        });
+        let add = r.task_strip_layout().expect("empty strip fits").add;
+        draw(&mut r, &filled, &theme);
+        let empty_strip = r.read_offscreen_rgba()?;
+        anyhow::ensure!(
+            region(&empty_strip, w, add) != region(&baseline, w, add),
+            "Add task button is invisible in an empty project"
+        );
+        png(
+            &format!("target/taskcheck/empty-strip-{scale}.png"),
+            w,
+            h,
+            &empty_strip,
+        )?;
+        r.task_strip = None;
+        draw(&mut r, &filled, &theme);
+        anyhow::ensure!(
+            r.read_offscreen_rgba()? == baseline,
+            "empty strip leaves pixels behind"
         );
 
         // Form: opaque over the terminal, cache-stable, follows the theme.

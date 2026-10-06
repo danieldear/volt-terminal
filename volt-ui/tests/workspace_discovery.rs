@@ -3,7 +3,9 @@ use std::{
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
+use volt_config::tasks::{self, load, save};
 use volt_ui::{
+    tasks::detected_task,
     workspace_git::{parse_pr, parse_worktrees, valid_pr_url, PrState},
     workspace_project::*,
 };
@@ -33,6 +35,25 @@ impl Drop for Temp {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn detected_cargo_command_becomes_a_trusted_reusable_task_only_after_import() {
+    let project = Temp::new();
+    let trust_store = Temp::new();
+    project.put("Cargo.toml", "[package]\nname='sample'\nversion='0.1.0'\n");
+    let found = discover(&project.0, Some(&project.0));
+    let root = tasks::project_root(&project.0, None).unwrap();
+    let before = load(&root, Some(&trust_store.0));
+    assert!(!tasks::tasks_file(&root).exists());
+    let build = detected_task(&found.tasks[0], &before).unwrap().unwrap();
+    assert_eq!(build.run, "cargo build");
+    assert!(build.confirm);
+    save(&root, None, Some(&build), Some(&trust_store.0)).unwrap();
+    let after = load(&root, Some(&trust_store.0));
+    assert!(after.trusted);
+    assert_eq!(after.tasks, vec![build]);
+    assert!(detected_task(&found.tasks[0], &after).unwrap().is_none());
 }
 #[test]
 fn monorepo_scopes_tasks_and_inherits_package_manager() {

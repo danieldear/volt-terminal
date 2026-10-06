@@ -38,10 +38,10 @@ pub enum FormHit {
 pub const FIELDS: usize = 3;
 // Logical units; multiplied by the scale factor.
 const W: f32 = 520.;
-const H: f32 = 400.;
+const H: f32 = 360.;
 pub(crate) const PAD: f32 = 22.;
-pub(crate) const FIELD_Y0: f32 = 76.;
-pub(crate) const FIELD_STEP: f32 = 66.;
+pub(crate) const FIELD_Y0: f32 = 68.;
+pub(crate) const FIELD_STEP: f32 = 58.;
 pub(crate) const LABEL_H: f32 = 20.;
 pub(crate) const INPUT_H: f32 = 34.;
 pub(crate) const CONFIRM_Y: f32 = FIELD_Y0 + FIELDS as f32 * FIELD_STEP + 4.;
@@ -170,6 +170,15 @@ mod tests {
         assert!(l.save()[1] + l.save()[3] < l.y + l.h);
         assert!(l.cancel()[0] + l.cancel()[2] < l.save()[0]);
         assert!(TaskFormLayout::new(500., 800., 0., 1.).is_none());
-        assert!(TaskFormLayout::new(1200., 400., 0., 1.).is_none());
+        assert!(TaskFormLayout::new(1200., 360., 0., 1.).is_none());
+    }
+
+    #[test]
+    fn add_task_fits_the_default_retina_window_with_chrome() {
+        let l = TaskFormLayout::new(1400., 900., 112., 2.).unwrap();
+        assert!(l.y >= 112.);
+        assert!(l.y + l.h <= 900.);
+        let (x, y) = center(l.save());
+        assert_eq!(l.hit(x, y), FormHit::Save);
     }
 }

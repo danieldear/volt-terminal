@@ -44,8 +44,13 @@ pub struct WorkspacePanel {
     pub scroll: usize,
     pub snapshot: Option<Snapshot>,
     pub selected_task: Option<ProjectTask>,
+    /// Manifest suggestions are secondary to runnable tasks and collapsed by default.
+    pub suggestions_open: bool,
     /// The project's own tasks (`.volt/tasks.toml`), loaded by the app.
     pub custom_tasks: Option<volt_config::tasks::ProjectTasks>,
+    /// Explicit Tasks menu navigation can show task creation in a plain folder.
+    /// Bound to its project root so navigating elsewhere doesn't show a generic card.
+    pub requested_tasks_root: Option<PathBuf>,
     /// The last task typed into the active pane, for its ✓ / ✗ status.
     pub task_run: Option<crate::tasks::TaskRun>,
     /// Why the last task action didn't happen.
@@ -77,7 +82,9 @@ impl Default for WorkspacePanel {
             scroll: 0,
             snapshot: None,
             selected_task: None,
+            suggestions_open: false,
             custom_tasks: None,
+            requested_tasks_root: None,
             task_run: None,
             task_message: None,
             selected_item: None,
@@ -122,6 +129,10 @@ impl WorkspacePanel {
                 } else {
                     task
                 };
+            }
+            SUGGESTIONS_ROW => {
+                self.suggestions_open = !self.suggestions_open;
+                self.selected_task = None;
             }
             2000..=2063 | 4000..=4063 => {
                 self.selected_item = if self.selected_item == Some(id) {
@@ -263,6 +274,7 @@ impl WorkspacePanel {
         self.scope_revision = self.scope_revision.wrapping_add(1);
         self.snapshot = None;
         self.selected_task = None;
+        self.suggestions_open = false;
         self.selected_item = None;
         self.pull_request = None;
         self.pr_key = None;
@@ -322,11 +334,21 @@ impl WorkspacePanel {
     /// the card, but closing it explicitly does not.
     pub fn presentation_card(&self) -> Option<WorkspaceCard> {
         (self.visible
-            && self
+            && (self
                 .snapshot
                 .as_ref()
-                .is_some_and(|s| (0..8).any(|id| section_available(id, s))))
+                .is_some_and(|s| (0..8).any(|id| section_available(id, s)))
+                || self.manual_tasks_available()))
         .then(|| self.card())
+    }
+
+    fn manual_tasks_available(&self) -> bool {
+        self.custom_tasks.as_ref().is_some_and(|tasks| {
+            self.requested_tasks_root.as_ref() == Some(&tasks.root)
+                || !tasks.tasks.is_empty()
+                || tasks.source_bytes.is_some()
+                || tasks.problem.is_some()
+        })
     }
 
     pub fn card(&self) -> WorkspaceCard {
@@ -393,7 +415,9 @@ impl WorkspacePanel {
             card.rows.push(CardRow {
                 label: safe_label(
                     label,
-                    if detail.is_empty() {
+                    if icon == CardIcon::Notice {
+                        160
+                    } else if detail.is_empty() {
                         27
                     } else {
                         27usize.saturating_sub(
@@ -421,10 +445,7 @@ impl WorkspacePanel {
             (3, "Rules & context", CardIcon::File),
             (4, "Tools / MCP", CardIcon::Link),
         ] {
-            let custom_tasks = self
-                .custom_tasks
-                .as_ref()
-                .is_some_and(|t| !t.tasks.is_empty() || t.problem.is_some());
+            let custom_tasks = self.manual_tasks_available();
             if if id == 8 {
                 !matches!(self.pull_request, Some(PrState::Found(_)))
             } else if id == 1 && custom_tasks {
@@ -534,9 +555,7 @@ impl WorkspacePanel {
                 }
                 1 => {
                     if let Some(message) = &self.task_message {
-                        for line in display_lines(message) {
-                            row(&line, "", CardIcon::File, None, false, false);
-                        }
+                        row(message, "", CardIcon::Notice, None, false, false);
                     }
                     if let Some(custom) = &self.custom_tasks {
                         if let Some(problem) = &custom.problem {
@@ -553,9 +572,23 @@ impl WorkspacePanel {
                                 false,
                                 false,
                             );
-                            for task in &custom.tasks {
-                                for line in display_lines(&format!("{}: {}", task.name, task.run)) {
+                            for (i, task) in custom.tasks.iter().enumerate() {
+                                row(
+                                    &task.name,
+                                    "Review",
+                                    CardIcon::Play,
+                                    Some(TASK_ROWS + i),
+                                    false,
+                                    false,
+                                );
+                                for line in task_command_lines(&format!("Command: {}", task.run)) {
                                     row(&line, "", CardIcon::File, None, false, false);
+                                }
+                                for line in display_lines(&format!(
+                                    "In: {}",
+                                    task.cwd.as_deref().unwrap_or("Project folder")
+                                )) {
+                                    row(&line, "", CardIcon::Folder, None, false, false);
                                 }
                             }
                             row(
@@ -608,22 +641,34 @@ impl WorkspacePanel {
                             );
                         }
                     }
-                    if let Some(s) = s {
-                        if !s.project.tasks.is_empty() {
-                            row("Detected", "", CardIcon::File, None, false, false);
+                    if let (Some(s), Some(custom)) = (s, &self.custom_tasks) {
+                        let suggestions = crate::tasks::suggested_tasks(&s.project.tasks, custom);
+                        if !suggestions.is_empty() {
+                            row(
+                                "Suggested tasks",
+                                &suggestions.len().to_string(),
+                                CardIcon::Plus,
+                                Some(SUGGESTIONS_ROW),
+                                false,
+                                self.suggestions_open,
+                            );
                         }
-                        for (i, task) in s.project.tasks.iter().enumerate() {
+                        if !self.suggestions_open {
+                            continue;
+                        }
+                        for (i, _) in suggestions {
+                            let task = &s.project.tasks[i];
                             row(
                                 &task.label,
                                 "",
-                                CardIcon::Play,
+                                CardIcon::Plus,
                                 Some(1000 + i),
                                 false,
                                 self.selected_task.as_ref() == Some(task),
                             );
                             if self.selected_task.as_ref() == Some(task) {
                                 for line in
-                                    display_lines(&format!("Command: {}", task.argv.join(" ")))
+                                    task_command_lines(&format!("Command: {}", task.argv.join(" ")))
                                         .into_iter()
                                         .chain(display_lines(&format!(
                                             "In: {}",
@@ -637,9 +682,9 @@ impl WorkspacePanel {
                                     row(&line, "", CardIcon::File, None, false, false);
                                 }
                                 row(
-                                    "Run in new terminal",
+                                    "Add to tasks file",
                                     "",
-                                    CardIcon::Play,
+                                    CardIcon::Plus,
                                     Some(900),
                                     false,
                                     false,
@@ -884,6 +929,7 @@ impl WorkspacePanel {
                 CardIcon::Agent => CardTone::Purple,
                 CardIcon::Link => CardTone::Purple,
                 CardIcon::File => CardTone::Cyan,
+                CardIcon::Notice => CardTone::Amber,
                 CardIcon::Server | CardIcon::Folder => CardTone::Blue,
                 _ => CardTone::Muted,
             };
@@ -941,11 +987,22 @@ impl WorkspacePanel {
     }
 }
 fn display_lines(text: &str) -> Vec<String> {
+    display_lines_limit(text, 512)
+}
+
+// Never hide the end of a command immediately above a Trust or Import action.
+// The config parser bounds saved commands to 1,000 characters, so even the
+// maximum valid command can be inspected in the scrollable card.
+fn task_command_lines(text: &str) -> Vec<String> {
+    display_lines_limit(text, volt_config::tasks::MAX_RUN_CHARS + 64)
+}
+
+fn display_lines_limit(text: &str, max_chars: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     let mut lines = Vec::new();
     let mut line = String::new();
     let mut width = 0;
-    for c in text.chars().take(512) {
+    for c in text.chars().take(max_chars) {
         let c = if c.is_control() { ' ' } else { c };
         let w = c.width().unwrap_or(0);
         if width + w > 27 {
@@ -958,6 +1015,9 @@ fn display_lines(text: &str) -> Vec<String> {
     if !line.is_empty() {
         lines.push(line);
     }
+    if text.chars().count() > max_chars {
+        lines.push("… (truncated)".into());
+    }
     lines
 }
 
@@ -968,6 +1028,7 @@ pub const MAX_TASK_ROWS: usize = volt_config::tasks::MAX_TASKS;
 pub const ADD_TASK_ROW: usize = 1202;
 pub const EDIT_TASKS_ROW: usize = 1200;
 pub const TRUST_ROW: usize = 1201;
+pub const SUGGESTIONS_ROW: usize = 1203;
 
 fn section_available(id: usize, s: &Snapshot) -> bool {
     match id {
@@ -1261,6 +1322,209 @@ fn parse_numstat(bytes: &[u8]) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use volt_config::tasks::{ProjectTasks, TaskDef};
+
+    #[test]
+    fn task_notice_is_one_non_actionable_banner_and_preserves_saved_tasks() {
+        let message = "Wait for the current command to finish before running a task.";
+        let panel = WorkspacePanel {
+            visible: true,
+            expanded: Some(1),
+            task_message: Some(message.into()),
+            custom_tasks: Some(ProjectTasks {
+                root: "/repo".into(),
+                tasks: vec![TaskDef {
+                    name: "run profile".into(),
+                    run: "./termbench normal".into(),
+                    ..Default::default()
+                }],
+                trusted: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let card = panel.presentation_card().unwrap();
+        let notices: Vec<_> = card
+            .rows
+            .iter()
+            .filter(|r| r.icon == CardIcon::Notice)
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].label, message);
+        assert_eq!(notices[0].action, None);
+        assert!(card.rows.iter().any(|r| r.action == Some(TASK_ROWS)));
+        let layout =
+            volt_renderer::workspace_card::CardLayout::for_card(1200., 900., 40., 1., &card)
+                .unwrap();
+        let index = card
+            .rows
+            .iter()
+            .position(|r| r.icon == CardIcon::Notice)
+            .unwrap();
+        assert_eq!(
+            layout.hit(layout.x + 100., layout.y + 102. + index as f32 * 40., &card),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_tasks_navigation_can_create_the_first_task_in_a_plain_folder() {
+        let mut panel = WorkspacePanel {
+            visible: true,
+            expanded: Some(1),
+            requested_tasks_root: Some("/plain".into()),
+            custom_tasks: Some(ProjectTasks {
+                root: "/plain".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(panel
+            .presentation_card()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|r| r.action == Some(ADD_TASK_ROW)));
+        panel.custom_tasks.as_mut().unwrap().root = "/other".into();
+        assert!(
+            panel.presentation_card().is_none(),
+            "explicit request must not leak into another folder"
+        );
+    }
+
+    #[test]
+    fn manual_saved_tasks_remain_visible_without_manifest_discovery() {
+        for trusted in [true, false] {
+            let panel = WorkspacePanel {
+                visible: true,
+                expanded: Some(1),
+                custom_tasks: Some(ProjectTasks {
+                    root: "/repo".into(),
+                    tasks: vec![TaskDef {
+                        name: "My build".into(),
+                        run: "make".into(),
+                        ..Default::default()
+                    }],
+                    trusted,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let card = panel.presentation_card().unwrap();
+            assert!(card
+                .rows
+                .iter()
+                .any(|r| r.label == "My build" && r.action == Some(TASK_ROWS)));
+            assert!(card.rows.iter().any(|r| r.action == Some(ADD_TASK_ROW)));
+            assert!(!card.rows.iter().any(|r| r.label == "Suggested tasks"));
+        }
+    }
+
+    #[test]
+    fn task_review_shows_the_end_of_long_commands_before_trust() {
+        let command = format!("echo {}SAFE_END", "x".repeat(900));
+        let panel = WorkspacePanel {
+            expanded: Some(1),
+            custom_tasks: Some(ProjectTasks {
+                root: "/repo".into(),
+                tasks: vec![TaskDef {
+                    name: "long command".into(),
+                    run: command,
+                    ..Default::default()
+                }],
+                source_bytes: Some(std::sync::Arc::from(&b"reviewed"[..])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let card = panel.card();
+        let trust = card
+            .rows
+            .iter()
+            .position(|row| row.action == Some(TRUST_ROW))
+            .unwrap();
+        assert!(card.rows[..trust]
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<String>()
+            .contains("SAFE_END"));
+        assert!(!card.rows[..trust]
+            .iter()
+            .any(|row| row.label.contains("truncated")));
+    }
+
+    #[test]
+    fn tasks_show_compact_suggestions_until_they_are_imported() {
+        let detected = ProjectTask {
+            label: "cargo test".into(),
+            argv: vec!["cargo".into(), "test".into()],
+            cwd: "/repo".into(),
+            definition: "Cargo.toml".into(),
+        };
+        let mut panel = WorkspacePanel {
+            expanded: Some(1),
+            snapshot: Some(Snapshot {
+                root: "/repo".into(),
+                repository: true,
+                project: Project {
+                    root: "/repo".into(),
+                    tasks: vec![detected.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            custom_tasks: Some(ProjectTasks {
+                root: "/repo".into(),
+                tasks: vec![TaskDef {
+                    name: "build".into(),
+                    run: "cargo build --release".into(),
+                    ..Default::default()
+                }],
+                trusted: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let card = panel.card();
+        assert!(card.rows.iter().any(|r| r.label == "build"));
+        assert!(card.rows.iter().any(|r| r.label == "Suggested tasks"));
+        assert!(!card.rows.iter().any(|r| r.label == "cargo test"));
+        panel.activate(SUGGESTIONS_ROW);
+        assert!(panel.card().rows.iter().any(|r| r.label == "cargo test"));
+        panel.activate(1000);
+        assert!(panel
+            .card()
+            .rows
+            .iter()
+            .any(|r| r.label == "Add to tasks file"));
+        panel.custom_tasks.as_mut().unwrap().tasks.push(TaskDef {
+            name: "cargo test".into(),
+            run: "cargo test".into(),
+            confirm: true,
+            ..Default::default()
+        });
+        panel.selected_task = None;
+        assert!(!panel
+            .card()
+            .rows
+            .iter()
+            .any(|r| r.label == "Suggested tasks"));
+    }
+    #[test]
+    fn a_plain_folder_with_only_a_tasks_file_still_has_a_card() {
+        let panel = WorkspacePanel {
+            visible: true,
+            snapshot: Some(Snapshot::default()),
+            custom_tasks: Some(ProjectTasks {
+                root: "/plain".into(),
+                source_bytes: Some(std::sync::Arc::from(&b""[..])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(panel.presentation_card().is_some());
+        assert!(panel.card().rows.iter().any(|r| r.label == "Tasks"));
+    }
     #[test]
     fn directory_and_pane_changes_clear_stale_state_and_reject_old_results() {
         let mut panel = WorkspacePanel::default();

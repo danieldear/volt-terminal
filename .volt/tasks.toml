@@ -1,0 +1,16 @@
+# Volt tasks for this project. Each task's `run` is typed into the terminal
+# as one command line. Volt asks before running a tasks file it hasn't seen.
+
+[[task]]
+name = "build"
+run = "cargo build --release"
+confirm = false
+
+[[task]]
+name = "open"
+run = "open -n target/macos/Volt.app"
+confirm = false
+
+[[task]]
+name = "Release"
+run = "./scripts/macos/build_app.sh --release"

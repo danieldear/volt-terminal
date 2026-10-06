@@ -260,8 +260,8 @@ struct MainState {
     theme_editor: Option<crate::theme_editor::ThemeEditor>,
     /// The active pane's project tasks (`.volt/tasks.toml`).
     tasks: crate::tasks::TaskLoader,
-    /// A `confirm = true` task waiting on the "Run task?" prompt.
-    pending_task: Option<usize>,
+    /// One exact task/file/pane snapshot awaiting explicit confirmation.
+    pending_task: Option<crate::tasks::PendingTask>,
     /// A short note about the last task action ("Added …", or why it didn't
     /// run), shown with the tasks for a few seconds.
     task_message: Option<(String, Instant)>,
@@ -400,12 +400,27 @@ impl MainState {
     }
     /// Type `line` into the active terminal and press Enter, as the user
     /// would. Half-typed input is cleared first with Ctrl-E Ctrl-U (shells
-    /// keep it: Ctrl-Y brings it back). Refused while a full-screen app owns
-    /// the screen, where the keys would go to that app instead.
+    /// keep it: Ctrl-Y brings it back). Refused while a known command,
+    /// hidden-input prompt, or full-screen app owns the terminal.
     fn type_into_shell(&mut self, line: &str) -> Result<(), String> {
         let pane = self.active_tab().active_pane();
         if pane.read_only {
             return Err("This terminal is read-only.".into());
+        }
+        if pane.running {
+            return Err(
+                "A command is running. Wait for it to finish before starting a task.".into(),
+            );
+        }
+        #[cfg(unix)]
+        if pane.pty.foreground_job_running() == Some(true) {
+            return Err(
+                "A command is running. Wait for it to finish before starting a task.".into(),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        if pane.pty.likely_password_prompt() == Some(true) {
+            return Err("A hidden-input prompt is active; task input was not sent.".into());
         }
         match pane.performer.try_lock() {
             Ok(p) if p.alternate_screen_active() => {
@@ -417,7 +432,18 @@ impl MainState {
         let mut bytes = b"\x05\x15".to_vec();
         bytes.extend_from_slice(line.as_bytes());
         bytes.push(b'\r');
-        self.send_pty_input(&bytes);
+        // Unlike ordinary keyboard input, task dispatch must report failed
+        // writes rather than silently mark a task as sent. The selected pane's
+        // existing PTY is the only destination: no background runner/new tab.
+        self.active_pane_mut()
+            .pty
+            .write(&bytes)
+            .map_err(|error| format!("Couldn't send task to this terminal: {error}"))?;
+        self.active_pane_mut().scroll_view_offset = 0;
+        self.bump_cursor_blink();
+        self.workspace_search.close();
+        self.renderer.search_palette = None;
+        self.workspace_panel.focused = false;
         self.begin_redraw();
         Ok(())
     }
@@ -463,8 +489,8 @@ impl MainState {
             .or_else(|| pane.cwd.clone())
     }
 
-    /// Run project task `index` in this tab. Untrusted files go to review
-    /// first, and `confirm = true` tasks ask before running.
+    /// Run in this pane. An untrusted task asks for one-time permission in a
+    /// compact prompt; this never grants trust to the entire tasks file.
     fn run_task(&mut self, index: usize, confirmed: bool) {
         self.task_message = None;
         let Some(tasks) = self.tasks.tasks.clone() else {
@@ -473,19 +499,39 @@ impl MainState {
         let Some(task) = tasks.tasks.get(index).cloned() else {
             return;
         };
-        if !tasks.trusted {
-            self.set_task_message("Review this project's tasks before running them.");
-            self.show_tasks_in_card();
+        // The loader is asynchronous. Never execute a cached command after
+        // its task file changed (or its trust copy disappeared) on disk.
+        let current =
+            volt_config::tasks::load(&tasks.root, volt_config::tasks::trust_dir().as_deref());
+        if current != tasks {
+            self.tasks.refresh();
+            self.set_task_message("Tasks changed. Click again after the list refreshes.");
+            self.sync_workspace_card();
+            self.begin_redraw();
             return;
         }
-        if task.confirm && !confirmed {
-            self.pending_task = Some(index);
+        let gate = crate::tasks::launch_gate(&tasks, &task);
+        if !confirmed && gate != crate::tasks::LaunchGate::Direct {
+            self.pending_task = Some(crate::tasks::PendingTask {
+                index,
+                tasks: tasks.clone(),
+                pane_pid: self.active_tab().active_pane().pty.child_pid(),
+            });
             self.workspace_search.close();
             self.renderer.search_palette = None;
+            self.workspace_panel.focused = false;
+            // Include the execution directory in the read-only preview.
+            let preview =
+                crate::tasks::command_line(&tasks, &task, &self.config.shell.program, None);
             self.active_prompt = Some(crate::prompt::TextPrompt::new(
-                crate::prompt::PromptKind::ConfirmTask,
-                &task.run,
+                if gate == crate::tasks::LaunchGate::ReviewOnce {
+                    crate::prompt::PromptKind::ReviewTask
+                } else {
+                    crate::prompt::PromptKind::ConfirmTask
+                },
+                &preview,
             ));
+            self.sync_workspace_card();
             self.begin_redraw();
             return;
         }
@@ -506,13 +552,63 @@ impl MainState {
         self.begin_redraw();
     }
 
+    /// Copy a reviewed manifest suggestion into `.volt/tasks.toml`. The
+    /// suggestion is not executed here; imported tasks use the ordinary trust
+    /// gate and ask for confirmation because manifest scripts can later change.
+    fn import_detected_task(&mut self) {
+        let Some(source) = self.workspace_panel.selected_task.clone() else {
+            return;
+        };
+        let Some(snapshot) = self.workspace_panel.snapshot.as_ref() else {
+            return;
+        };
+        if !snapshot.project.tasks.contains(&source) {
+            return;
+        }
+        let Some(saved) = self.tasks.tasks.as_ref() else {
+            self.set_task_message("No project tasks folder is available.");
+            self.sync_workspace_card();
+            return;
+        };
+        let root = saved.root.clone();
+        let candidate = crate::tasks::detected_task(&source, saved);
+        let result = match candidate {
+            Ok(Some(task)) => volt_config::tasks::save(
+                &root,
+                None,
+                Some(&task),
+                volt_config::tasks::trust_dir().as_deref(),
+            )
+            .map(|status| (task.name, status)),
+            Ok(None) => Err("That command is already in the tasks file.".into()),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok((name, status)) => {
+                self.workspace_panel.selected_task = None;
+                self.tasks.refresh();
+                self.set_task_message(if status == volt_config::tasks::SaveOutcome::NeedsReview {
+                    format!("Added {name}. Review and trust this tasks file before running.")
+                } else {
+                    format!("Added {name}. Select it above to run.")
+                });
+            }
+            Err(error) => self.set_task_message(error),
+        }
+        self.sync_workspace_card();
+    }
+
     /// Trust the current tasks file after the user reviewed it in the card.
     fn trust_tasks(&mut self) {
-        let Some(root) = self.tasks.tasks.as_ref().map(|t| t.root.clone()) else {
+        let Some((root, reviewed)) = self.tasks.tasks.as_ref().and_then(|t| {
+            t.source_bytes
+                .as_ref()
+                .map(|bytes| (t.root.clone(), bytes.clone()))
+        }) else {
             return;
         };
         let failure = match volt_config::tasks::trust_dir() {
-            Some(dir) => volt_config::tasks::trust(&root, &dir)
+            Some(dir) => volt_config::tasks::trust_reviewed(&root, &dir, &reviewed)
                 .err()
                 .map(|e| format!("Couldn't record trust: {e}")),
             None => Some("Couldn't find Volt's config folder.".into()),
@@ -532,9 +628,15 @@ impl MainState {
         if self.theme_editor.is_some() {
             return;
         }
-        let Some(root) = self.tasks.tasks.as_ref().map(|t| t.root.clone()) else {
-            self.set_task_message("Open a project folder to add tasks.");
+        let root = self
+            .active_local_cwd()
+            .and_then(|cwd| volt_config::tasks::project_root(&cwd, dirs::home_dir().as_deref()));
+        let Some(root) = root else {
+            self.set_task_message("Change to a project folder to add tasks.");
+            self.renderer
+                .set_top_alert(Some("Change to a project folder to add tasks.".into()));
             self.sync_workspace_card();
+            self.begin_redraw();
             return;
         };
         self.workspace_search.close();
@@ -574,9 +676,15 @@ impl MainState {
                 };
                 let trust = volt_config::tasks::trust_dir();
                 match volt_config::tasks::save(&root, None, Some(&task), trust.as_deref()) {
-                    Ok(()) => {
+                    Ok(status) => {
                         self.close_task_form();
-                        self.set_task_message(format!("Added \"{}\".", task.name));
+                        self.set_task_message(
+                            if status == volt_config::tasks::SaveOutcome::NeedsReview {
+                                format!("Added \"{}\". Review and trust the tasks file.", task.name)
+                            } else {
+                                format!("Added \"{}\".", task.name)
+                            },
+                        );
                         self.tasks.refresh();
                         self.sync_workspace_card();
                     }
@@ -635,10 +743,16 @@ impl MainState {
     fn task_strip_view(&self) -> Option<volt_renderer::task_strip::TaskStripView> {
         use volt_renderer::task_strip::{StripState, StripTask, TaskStripView, MAX_BUTTONS};
         let tasks = self.tasks.tasks.as_ref()?;
-        if tasks.tasks.is_empty()
+        if (tasks.tasks.is_empty()
+            && !self.tasks.project_context
+            && !self.workspace_panel.snapshot.as_ref().is_some_and(|s| {
+                (s.root == tasks.root || s.project.root.starts_with(&tasks.root))
+                    && (s.repository || s.rust || !s.project.tags.is_empty())
+            }))
             || tasks.problem.is_some()
             || self.renderer.workspace_card.is_some()
             || self.workspace_search.visible
+            || self.active_prompt.is_some()
             || self.task_form.is_some()
             || self.theme_editor.is_some()
         {
@@ -661,6 +775,7 @@ impl MainState {
                     name: t.name.clone(),
                     state: match run.filter(|r| r.name == t.name).map(|r| r.state) {
                         Some(crate::tasks::RunState::Running) => StripState::Running,
+                        _ if !tasks.trusted => StripState::ReviewRequired,
                         Some(crate::tasks::RunState::Finished(0)) => StripState::Succeeded,
                         Some(crate::tasks::RunState::Finished(_)) => StripState::Failed,
                         _ => StripState::Idle,
@@ -699,8 +814,24 @@ impl MainState {
 
     /// Open the workspace card with Tasks expanded (e.g. to review a file).
     fn show_tasks_in_card(&mut self) {
+        let Some(root) = self
+            .active_local_cwd()
+            .and_then(|cwd| volt_config::tasks::project_root(&cwd, dirs::home_dir().as_deref()))
+        else {
+            self.renderer.set_top_alert(Some(
+                "Change to a project folder to define and run tasks.".into(),
+            ));
+            self.begin_redraw();
+            return;
+        };
+        self.tasks.tasks = Some(volt_config::tasks::load(
+            &root,
+            volt_config::tasks::trust_dir().as_deref(),
+        ));
+        self.workspace_panel.requested_tasks_root = Some(root);
         self.workspace_panel.visible = true;
         self.workspace_panel.minimized = false;
+        self.workspace_panel.focused = true;
         self.workspace_panel.expanded = Some(1);
         self.sync_workspace_card();
         self.begin_redraw();
@@ -768,6 +899,37 @@ impl MainState {
             match result {
                 Ok(()) => self.workspace_search.close(),
                 Err(message) => self.workspace_search.output.status = message,
+            }
+        } else if let Some(Action::Task(task)) = action {
+            if self
+                .workspace_panel
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.project.tasks.contains(&task))
+            {
+                self.workspace_search.close();
+                self.workspace_panel.selected_task = self
+                    .tasks
+                    .tasks
+                    .as_ref()
+                    .and_then(|saved| crate::tasks::detected_task(&task, saved).ok().flatten())
+                    .map(|_| task);
+                self.workspace_panel.suggestions_open = true;
+                self.show_tasks_in_card();
+            } else {
+                self.workspace_search.output.status =
+                    "Project suggestions changed. Refresh the workspace and try again.".into();
+            }
+        } else if let Some(Action::SavedTask { name, root }) = action {
+            if self.tasks.tasks.as_ref().is_some_and(|tasks| {
+                tasks.root == root && tasks.tasks.iter().any(|task| task.name == name)
+            }) {
+                self.workspace_search.close();
+                self.workspace_panel.selected_task = None;
+                self.show_tasks_in_card();
+            } else {
+                self.workspace_search.output.status =
+                    "Project tasks changed. Refresh the search and try again.".into();
             }
         }
         self.sync_search();
@@ -856,29 +1018,25 @@ impl MainState {
             }
             _ => {}
         }
-        if id == 900 || (3000..3032).contains(&id) {
-            let task = if id == 900 {
-                self.workspace_panel.selected_task.clone().filter(|task| {
-                    self.workspace_panel
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|s| s.project.tasks.contains(task))
-                })
-            } else {
-                self.workspace_panel
-                    .snapshot
-                    .as_ref()
-                    .and_then(|s| s.git_details.worktrees.get(id - 3000))
-                    .filter(|w| !w.prunable)
-                    .map(|w| crate::workspace_project::ProjectTask {
-                        label: format!("Worktree: {}", w.branch),
-                        cwd: w.path.clone(),
-                        definition: String::new(),
-                        argv: std::iter::once(self.config.shell.program.clone())
-                            .chain(self.config.shell.args.clone())
-                            .collect(),
-                    })
-            };
+        if id == 900 {
+            self.import_detected_task();
+            return;
+        }
+        if (3000..3032).contains(&id) {
+            let task = self
+                .workspace_panel
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.git_details.worktrees.get(id - 3000))
+                .filter(|w| !w.prunable)
+                .map(|w| crate::workspace_project::ProjectTask {
+                    label: format!("Worktree: {}", w.branch),
+                    cwd: w.path.clone(),
+                    definition: String::new(),
+                    argv: std::iter::once(self.config.shell.program.clone())
+                        .chain(self.config.shell.args.clone())
+                        .collect(),
+                });
             if let Some(task) = task {
                 let mut config = self.config.clone();
                 let shell = config.shell.program.clone();
@@ -2065,7 +2223,8 @@ impl MainState {
             }
             crate::prompt::PromptKind::Find
             | crate::prompt::PromptKind::OpenLink
-            | crate::prompt::PromptKind::ConfirmTask => None,
+            | crate::prompt::PromptKind::ConfirmTask
+            | crate::prompt::PromptKind::ReviewTask => None,
         };
         let initial = rename_initial_text(custom);
         self.active_prompt = Some(crate::prompt::TextPrompt::new(kind, &initial));
@@ -2089,9 +2248,19 @@ impl MainState {
                 // Enter/Shift+Enter cycle matches instead of confirming while
                 // a Find prompt is open; reaching here just closes it.
             }
-            crate::prompt::PromptKind::ConfirmTask => {
-                if let Some(index) = self.pending_task.take() {
-                    self.run_task(index, true);
+            crate::prompt::PromptKind::ConfirmTask | crate::prompt::PromptKind::ReviewTask => {
+                if let Some(pending) = self.pending_task.take() {
+                    if pending.applies_to(
+                        self.tasks.tasks.as_ref(),
+                        self.active_tab().active_pane().pty.child_pid(),
+                    ) {
+                        self.run_task(pending.index, true);
+                    } else {
+                        self.tasks.refresh();
+                        self.set_task_message("Tasks changed. Select the task again to run it.");
+                        self.sync_workspace_card();
+                        self.begin_redraw();
+                    }
                 }
             }
             crate::prompt::PromptKind::RenameTab => {
@@ -3055,6 +3224,8 @@ impl App {
                 state.begin_redraw();
             }
             A::SearchWorkspace => state.toggle_search(),
+            A::ShowTasks => state.show_tasks_in_card(),
+            A::AddTask => state.open_task_form(),
             A::Find => state.toggle_search(),
             A::ToggleWorkspaceLayout => state.toggle_workspace_layout(),
             A::ToggleChatPanel => {
@@ -3489,6 +3660,14 @@ impl ApplicationHandler<VoltEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let pointer_moved = state.mouse_pos != (position.x as f32, position.y as f32);
                 state.mouse_pos = (position.x as f32, position.y as f32);
+                if state
+                    .active_prompt
+                    .as_ref()
+                    .is_some_and(|p| p.kind.read_only())
+                {
+                    state.window.set_cursor(winit::window::CursorIcon::Default);
+                    return;
+                }
                 if let Some(mut drag) = state.tab_drag {
                     let mx = state.mouse_pos.0;
                     let layout = TabLayout::compute(
@@ -3664,6 +3843,15 @@ impl ApplicationHandler<VoltEvent> for App {
                 button,
                 ..
             } => {
+                if state
+                    .active_prompt
+                    .as_ref()
+                    .is_some_and(|p| p.kind.read_only())
+                {
+                    // Confirmation is modal: don't activate the obscured card,
+                    // another task, a tab, or send a click to the terminal.
+                    return;
+                }
                 if button == MouseButton::Left && btn_state == ElementState::Released {
                     if let Some(drag) = state.tab_drag.take() {
                         if !drag.dragging {
@@ -4095,6 +4283,13 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                if state
+                    .active_prompt
+                    .as_ref()
+                    .is_some_and(|p| p.kind.read_only())
+                {
+                    return;
+                }
                 if state.renderer.task_form_layout().is_some_and(|l| {
                     l.hit(state.mouse_pos.0, state.mouse_pos.1)
                         != volt_renderer::task_form::FormHit::Outside
@@ -4568,6 +4763,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     match physical_key {
                         PhysicalKey::Code(KeyCode::Escape) => {
                             state.active_prompt = None;
+                            state.pending_task = None;
                             state.search_dirty = false;
                             state.search_target = None;
                             state.begin_redraw();
@@ -4944,12 +5140,8 @@ impl ApplicationHandler<VoltEvent> for App {
                 };
 
                 if let Some(bytes) = special {
-                    if matches!(
-                        physical_key,
-                        PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter)
-                    ) {
-                        state.active_pane_mut().running = true;
-                    }
+                    // Busy state comes from OSC command events, not Enter:
+                    // unintegrated shells never emit CommandFinished to clear it.
                     state.send_pty_input(&bytes);
                     return;
                 }

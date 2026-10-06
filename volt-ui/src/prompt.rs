@@ -29,12 +29,14 @@ pub enum PromptKind {
     OpenLink,
     /// "Run task?" for tasks marked `confirm = true`; shows the command.
     ConfirmTask,
+    /// Explicit permission for just this command, not trust for its whole file.
+    ReviewTask,
 }
 
 impl PromptKind {
     /// Confirmations show text the user can read and inspect, not edit.
     pub fn read_only(self) -> bool {
-        matches!(self, Self::OpenLink | Self::ConfirmTask)
+        matches!(self, Self::OpenLink | Self::ConfirmTask | Self::ReviewTask)
     }
 }
 
@@ -72,6 +74,7 @@ impl TextPrompt {
             PromptKind::Find => "Find",
             PromptKind::OpenLink => "Open link? Enter: open / Esc: cancel",
             PromptKind::ConfirmTask => "Run task? Enter: run / Esc: cancel",
+            PromptKind::ReviewTask => "Review task · Enter: run once / Esc: cancel",
             PromptKind::RenameTab => "Change Tab Title",
             PromptKind::RenameTerminal => "Change Terminal Title",
         }
@@ -240,6 +243,22 @@ pub fn find_matches_bounded<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_review_is_read_only_and_explicitly_authorizes_only_one_run() {
+        for kind in [PromptKind::ReviewTask, PromptKind::ConfirmTask] {
+            let mut prompt = TextPrompt::new(kind, "(cd '/repo' && cargo build --release)");
+            prompt.move_end();
+            prompt.insert_char(';');
+            prompt.backspace();
+            prompt.delete_forward();
+            assert_eq!(prompt.text(), "(cd '/repo' && cargo build --release)");
+            assert!(kind.read_only());
+        }
+        assert!(TextPrompt::new(PromptKind::ReviewTask, "echo OK")
+            .title()
+            .contains("run once"));
+    }
 
     #[test]
     fn link_confirmation_cannot_be_edited_by_typing_paste_or_ime() {

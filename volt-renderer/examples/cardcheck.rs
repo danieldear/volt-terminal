@@ -42,6 +42,18 @@ fn main() -> Result<()> {
                 subtitle: "Visual regression fixture".into(),
                 rows: vec![
                     CardRow {
+                        label:
+                            "A command is running. Wait for it to finish before starting a task."
+                                .into(),
+                        detail: String::new(),
+                        icon: CardIcon::Notice,
+                        action: None,
+                        expanded: false,
+                        section: false,
+                        tone: CardTone::Amber,
+                        diff: None,
+                    },
+                    CardRow {
                         label: "Changes".into(),
                         detail: "3".into(),
                         icon: CardIcon::Branch,

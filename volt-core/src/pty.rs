@@ -130,6 +130,18 @@ pub struct Pty {
 }
 
 impl Pty {
+    /// A foreground job owns input when the terminal's process group differs
+    /// from the shell's. Works without shell-integration hooks; only queried on
+    /// explicit task execution, never in the PTY parsing or rendering loops.
+    #[cfg(unix)]
+    pub fn foreground_job_running(&self) -> Option<bool> {
+        let fd = self.master.as_raw_fd()?;
+        let pid = libc::pid_t::try_from(self.child_pid()?).ok()?;
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        let shell_group = unsafe { libc::getpgid(pid) };
+        (foreground > 0 && shell_group > 0).then_some(foreground != shell_group)
+    }
+
     /// A password-style prompt usually keeps canonical input on while
     /// disabling terminal echo. Full-screen TUIs often disable both; treating
     /// every raw-mode program as a password prompt would hold macOS Secure
@@ -504,6 +516,31 @@ impl Drop for Pty {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_job_detection_recovers_without_osc_hooks() {
+        let (mut pty, _, _rx) = Pty::spawn("/bin/sh", &["-i".into()], 80, 24, || {}).unwrap();
+        let wait_for = |pty: &Pty, expected| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if pty.foreground_job_running() == Some(expected) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "foreground state did not become {expected}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        wait_for(&pty, false);
+        pty.write(b"sleep 2\n").unwrap();
+        wait_for(&pty, true);
+        wait_for(&pty, false);
+        // An ordinary Enter must not make the PTY permanently busy.
+        pty.write(b"\n").unwrap();
+        wait_for(&pty, false);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

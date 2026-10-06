@@ -18,6 +18,8 @@ pub enum MenuAction {
     Paste,
     Find,
     SearchWorkspace,
+    ShowTasks,
+    AddTask,
     ToggleChatPanel,
     ToggleWorkspaceLayout,
     IncreaseFontSize,
@@ -101,6 +103,8 @@ impl MenuAction {
             Paste => "volt.paste",
             Find => "volt.find",
             SearchWorkspace => "volt.search_workspace",
+            ShowTasks => "volt.show_tasks",
+            AddTask => "volt.add_task",
             ToggleWorkspaceLayout => "volt.toggle_workspace_layout",
             ToggleChatPanel => "volt.toggle_chat_panel",
             IncreaseFontSize => "volt.increase_font_size",
@@ -138,6 +142,8 @@ impl MenuAction {
             "volt.paste" => Paste,
             "volt.find" => Find,
             "volt.search_workspace" => SearchWorkspace,
+            "volt.show_tasks" => ShowTasks,
+            "volt.add_task" => AddTask,
             "volt.toggle_workspace_layout" => ToggleWorkspaceLayout,
             "volt.toggle_chat_panel" => ToggleChatPanel,
             "volt.increase_font_size" => IncreaseFontSize,
@@ -252,6 +258,8 @@ pub fn install_app_menu() -> AppMenu {
     let _ = view_menu.append_items(&[
         &MenuAction::ToggleChatPanel.item("Toggle Workspace Panel"),
         &MenuAction::SearchWorkspace.item("Search…  ⌘F"),
+        &MenuAction::ShowTasks.item("Project Tasks"),
+        &MenuAction::AddTask.item("Add Task…"),
         &MenuAction::ToggleWorkspaceLayout.item("Switch Workspace: Docked / Floating"),
         &PredefinedMenuItem::separator(),
         &MenuAction::IncreaseFontSize.item("Increase Font Size"),
@@ -414,6 +422,13 @@ pub fn build_tab_context_menu(tab_color: Option<TabColor>) -> Menu {
 #[cfg(test)]
 mod tab_color_tests {
     use super::*;
+
+    #[test]
+    fn manual_task_menu_actions_round_trip() {
+        for action in [MenuAction::ShowTasks, MenuAction::AddTask] {
+            assert_eq!(MenuAction::from_id(action.id()), Some(action));
+        }
+    }
 
     #[test]
     fn every_tab_color_menu_id_round_trips_and_clear_is_distinct() {

@@ -71,7 +71,7 @@ the matched characters in each result.
 | Files | File-name substring, then path substring, then letters in the file name; scattered letters across folders only when close together | Local workspace-relative paths |
 | Text | Case-insensitive literal, not regex | Saved UTF-8 text files |
 | Git | Fuzzy subsequence | Local branches and worktree metadata, no network |
-| Tasks | Fuzzy subsequence | Discovered project task definitions; review only |
+| Tasks | Fuzzy subsequence | Saved `.volt/tasks.toml` commands and unimported project suggestions. Enter opens the Tasks card for review; search never executes a command |
 
 Results are grouped by provider, then ranked within each provider; text matches
 stay in reading order (file by file, line by line). File/Text

@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#08080b">
   <title>Volt — a fast, native terminal for macOS and Linux</title>
-  <meta name="description" content="Volt is a GPU-rendered terminal for macOS and Linux, written in Rust. Tabs, split panes, project-wide search, live theme editing, and automatic Secure Keyboard Entry on macOS. Free and open source.">
+  <meta name="description" content="Volt is a GPU-rendered terminal for macOS and Linux, written in Rust. One-click project tasks, search across your scrollback and project, tabs and split panes, live theme editing, and automatic Secure Keyboard Entry on macOS. Free and open source.">
   <meta property="og:title" content="Volt — a fast, native terminal for macOS and Linux">
   <meta property="og:description" content="GPU-rendered and written in Rust, for macOS and Linux. Free and open source.">
   <meta property="og:type" content="website">
@@ -154,7 +154,10 @@
       color: color-mix(in srgb, var(--t-fg) 62%, transparent);
     }
     .tab.active { background: color-mix(in srgb, var(--t-fg) 9%, transparent); color: var(--t-fg); }
-    .tab::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: var(--accent, transparent); }
+    /* A colored tab is tinted with its color, stronger when active. */
+    .tab.colored { background: color-mix(in srgb, var(--accent) 11%, transparent); }
+    .tab.colored.active { background: linear-gradient(color-mix(in srgb, var(--accent) 22%, transparent), color-mix(in srgb, var(--accent) 22%, transparent)), color-mix(in srgb, var(--t-fg) 9%, transparent); }
+    .tab::before { content: ""; position: absolute; left: 0; top: 8px; bottom: 8px; width: 3px; border-radius: 2px; background: var(--accent, transparent); }
     .tab .dot { width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid currentColor; opacity: .7; }
     .tab .dot.busy { border: 0; background: var(--a2); opacity: 1; }
     .tab .name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -242,6 +245,21 @@
     .stage-search { height: 430px; }
 
     .window-mini { position: relative; }
+    .tasks-pane { position: relative; min-height: 270px; padding-top: 58px; }
+    .strip { position: absolute; top: 12px; right: 12px; display: flex; gap: 6px; }
+    .strip > span {
+      display: inline-flex; align-items: center; gap: 8px;
+      height: 28px; padding: 0 12px 0 10px; border-radius: 8px;
+      background: color-mix(in srgb, var(--t-bg) 92%, var(--t-fg));
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--t-fg) 22%, transparent);
+      font: 500 12px/1 var(--mono); color: var(--t-fg); white-space: pre;
+    }
+    .strip .mark { font-size: 11px; line-height: 1; }
+    .strip .ok .mark { color: var(--a2); }
+    .strip .run { box-shadow: inset 0 0 0 1px var(--a3); }
+    .strip .run .mark { width: 7px; height: 7px; border-radius: 50%; background: var(--a3); }
+    .strip .idle .mark { color: var(--a3); }
+    .strip .add { padding: 0 10px; color: color-mix(in srgb, var(--t-fg) 60%, transparent); }
     .secure-pane { position: relative; min-height: 240px; }
     .badge {
       position: absolute; top: 14px; right: 14px;
@@ -342,6 +360,7 @@
       .scopes span:last-child { display: none; }
       .result { grid-template-columns: 52px minmax(0, 1fr); }
       .secure-pane { padding-top: 60px; }
+      .strip .hide-narrow { display: none; }
       .status-table th, .status-table td { display: block; width: auto; padding: 0; border: 0; }
       .status-table tr { display: block; padding: 18px 0; border-top: 1px solid var(--line); }
       .status-table td { margin-top: 6px; }
@@ -377,7 +396,7 @@
           <h1 id="hero-title">A fast, native terminal for macOS and Linux.<span class="caret" aria-hidden="true"></span></h1>
         </div>
         <div>
-          <p class="lede">Volt is written in Rust and draws every frame on the GPU, so it stays smooth under heavy output. Search your whole project from the prompt, keep work side by side in tabs and split panes, and edit themes live with your own session as the preview.</p>
+          <p class="lede">Volt is written in Rust and draws every frame on the GPU, so it stays smooth under heavy output. Run your project's tasks with one click, search your scrollback and your whole project from one box, and keep work side by side in tabs and split panes.</p>
           <div class="actions">
             <a class="button button-primary" href="https://github.com/danieldear/volt-terminal/releases/latest">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0-5-5m5 5 5-5M5 21h14"/></svg>
@@ -393,8 +412,8 @@
         <div class="window" id="demo" aria-hidden="true">
           <div class="tabbar">
             <div class="lights"><i></i><i></i><i></i></div>
-            <div class="tab" style="--accent: var(--a1)"><span class="dot"></span><span class="name">billing-api</span><span class="num">#1</span><span class="close">×</span></div>
-            <div class="tab active" style="--accent: var(--a4)"><span class="dot busy"></span><span class="name">tests</span><span class="num">#2 · 2</span><span class="close">×</span></div>
+            <div class="tab colored" style="--accent: var(--a1)"><span class="dot"></span><span class="name">billing-api</span><span class="num">#1</span><span class="close">×</span></div>
+            <div class="tab active colored" style="--accent: var(--a4)"><span class="dot busy"></span><span class="name">tests</span><span class="num">#2 · 2</span><span class="close">×</span></div>
             <div class="tab"><span class="dot"></span><span class="name">zsh</span><span class="num">#3</span><span class="close">×</span></div>
             <span class="newtab">+</span>
           </div>
@@ -468,7 +487,6 @@
         </div>
       </div>
 
-      <!-- Workflow features: pending product direction. -->
     </section>
 
     <!-- ── Spotlights ───────────────────────────────────── -->
@@ -516,6 +534,34 @@ c8a55f0 Split billing routes
       </div>
 
       <div class="spotlight flip">
+        <div class="spot-text">
+          <h2>Your project's commands, one click away.</h2>
+          <p>Save build, test, run and deploy commands in <code>.volt/tasks.toml</code>. They appear as buttons and run right in your current tab, with ✓ or ✗ when they finish if shell integration is on.</p>
+          <ul>
+            <li>Add tasks from a form, or import the ones Volt finds in Cargo.toml, package.json and other project files.</li>
+            <li>A tasks file that arrives with a clone is reviewed before anything runs, and again whenever it changes.</li>
+            <li>Volt won't type over a running command, a full-screen app or a password prompt.</li>
+          </ul>
+        </div>
+        <div class="window window-mini" aria-hidden="true">
+          <div class="tabbar">
+            <div class="lights"><i></i><i></i><i></i></div>
+            <div class="tab active"><span class="dot busy"></span><span class="name">atlas</span><span class="num">#1</span><span class="close">×</span></div>
+            <span class="newtab">+</span>
+          </div>
+          <div class="pane tasks-pane"><div class="strip"><span class="ok"><span class="mark">✓</span>Build</span><span class="run"><span class="mark"></span>Test</span><span class="idle hide-narrow"><span class="mark">▶</span>Run</span><span class="idle hide-narrow"><span class="mark">▶</span>Deploy</span><span class="add">+</span></div><span class="c4 b">~/code/atlas</span> <span class="c5">main</span> <span class="c2">❯</span> cargo test
+<span class="c2 b">   Compiling</span> atlas v0.4.2
+<span class="c2 b">    Finished</span> `test` profile in 3.81s
+<span class="c2 b">     Running</span> unittests src/lib.rs
+
+running 42 tests
+test invoice::rounds_vat_per_line ... <span class="c2">ok</span>
+test billing::splits_routes ... <span class="c2">ok</span>
+test tax::eu_rates ... <span class="c2">ok</span><span class="cursor"></span></div>
+        </div>
+      </div>
+
+      <div class="spotlight">
         <div class="spot-text">
           <h2>Password prompts are protected automatically.</h2>
           <p>On macOS, when a program asks for a password, Volt turns on Secure Keyboard Entry so other apps can't read what you type, and shows a lock while it's on. You can also switch it on yourself from the Volt menu.</p>
@@ -571,7 +617,7 @@ Password:<span class="cursor"></span></div>
       <div class="page section">
         <div class="section-intro">
           <h2 id="install-title">Install Volt.</h2>
-          <p>Download a release for your platform, or build from source. Each release lists SHA-256 checksums in <code>SHA256SUMS.txt</code>. On macOS, release builds aren't notarized yet, so the first launch needs one extra approval.</p>
+          <p>Download a release for your platform, or build from source. Each release lists SHA-256 checksums in <code>SHA256SUMS.txt</code>. Current macOS archives are ad-hoc signed, not notarized; macOS may block them until you explicitly approve the app.</p>
         </div>
         <div class="install-grid">
           <div>
@@ -591,8 +637,7 @@ Password:<span class="cursor"></span></div>
             </li>
             <li>
               <h3>Approve the first launch</h3>
-              <p>Open Volt. When macOS says it can't verify the app, go to System Settings ▸ Privacy &amp; Security and click Open Anyway. Or run this once in another terminal:</p>
-              <div class="code">xattr -dr com.apple.quarantine /Applications/Volt.app</div>
+              <p>After verifying the download and checksum, open Volt. If macOS blocks it, review the warning and use System Settings ▸ Privacy &amp; Security ▸ Open Anyway only if you trust this build. We do not recommend disabling quarantine globally.</p>
             </li>
           </ol>
           </div>

@@ -2575,7 +2575,10 @@ impl Renderer {
         }
 
         let overlay_start = (bg_verts.len(), glyph_verts.len());
-        if let Some(card) = self.workspace_card.clone() {
+        // A security/command confirmation must remain unobscured. Keep card
+        // geometry/reserved terminal width intact, but don't paint over it.
+        let confirmation = prompt.as_ref().is_some_and(|p| p.read_only);
+        if let Some(card) = self.workspace_card.clone().filter(|_| !confirmation) {
             self.draw_workspace_card(
                 &mut bg_verts,
                 &mut glyph_verts,
@@ -2586,7 +2589,7 @@ impl Renderer {
         }
 
         let search_start = (bg_verts.len(), glyph_verts.len());
-        if let Some(strip) = self.task_strip.clone() {
+        if let Some(strip) = self.task_strip.clone().filter(|_| !confirmation) {
             self.draw_task_strip(&mut bg_verts, &mut glyph_verts, &strip, theme);
         }
         if let Some(search) = self.search_palette.clone() {
