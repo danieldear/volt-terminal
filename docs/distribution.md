@@ -85,8 +85,11 @@ If an upload fails midway, secrets may be partially configured; the helper is
 safe to rerun with the same intended inputs. Never commit the export or keychain.
 
 The release job imports into a temporary keychain, grants codesign access only,
-and deletes the keychain/files on exit. It does not change the login/default
-keychain. Secrets are used only by the trusted release workflow, never PR jobs.
+validates the exact Developer ID identity, and deletes the keychain/files on
+exit. It temporarily adds the signing keychain to the user search list while
+preserving existing entries for certificate-chain discovery, and restores that
+list on exit. It does not change the login/default keychain's contents or default
+selection. Secrets are used only by the trusted release workflow, never PR jobs.
 Protect release tags and review workflow changes before creating a release.
 
 `macos-signing-status.txt` records the completed mode, and generated release
@@ -106,9 +109,11 @@ packaged ZIP was extracted and its signature, ticket and Gatekeeper assessment
 passed again. Submission: `e2f094d4-c382-441a-b0b5-d9baa5bcf261`.
 
 This proves the local signing/notarization path, not the hosted GitHub release
-path or a downloaded public install. GitHub still needs signing credentials,
-merged workflow support, a successful notarized release run and a downloaded
-artifact install test before the public release can be advertised as notarized.
+path or a downloaded public install. GitHub signing credentials and workflow
+support are configured; hosted signing validation must still succeed before
+notarized mode is enabled. A successful notarized release run and a downloaded
+artifact install test are also required before the public release can be
+advertised as notarized.
 
 References:
 - [Apple notarization documentation](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
