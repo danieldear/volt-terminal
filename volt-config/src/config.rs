@@ -32,6 +32,23 @@ pub struct ShellConfig {
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub integration: bool,
+    #[serde(default)]
+    pub prompt: PromptMode,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptMode {
+    #[default]
+    Existing,
+    Meow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SetupConfig {
+    #[serde(default)]
+    pub completed: bool,
 }
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
@@ -44,6 +61,8 @@ impl Default for ShellConfig {
         Self {
             program: default_shell(),
             args: default_shell_args(),
+            integration: false,
+            prompt: PromptMode::Existing,
         }
     }
 }
@@ -184,14 +203,22 @@ pub struct EditorConfig {
     pub filetypes: std::collections::BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
+    #[serde(default = "default_workspace_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub layout: WorkspaceLayout,
 }
 
+fn default_workspace_enabled() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    #[serde(default)]
+    pub setup: SetupConfig,
     #[serde(default, deserialize_with = "crate::keybindings::deserialize_bindings")]
     pub keybindings: Vec<crate::keybindings::KeyBinding>,
     #[serde(default)]
@@ -271,7 +298,7 @@ fn should_prefix_leading_zero(last_non_ws: Option<char>, prev_non_ws: Option<cha
     }
 }
 
-fn normalize_leading_dot_float_literals(input: &str) -> String {
+pub(crate) fn normalize_leading_dot_float_literals(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let chars: Vec<char> = input.chars().collect();
     let mut in_comment = false;
@@ -351,7 +378,7 @@ fn normalize_leading_dot_float_literals(input: &str) -> String {
     out
 }
 
-fn parse_config_with_compat(input: &str) -> Result<Config, toml::de::Error> {
+pub(crate) fn parse_config_with_compat(input: &str) -> Result<Config, toml::de::Error> {
     match toml::from_str(input) {
         Ok(cfg) => Ok(cfg),
         Err(primary_err) => {
@@ -577,7 +604,7 @@ impl Config {
 }
 
 /// Follow a managed dotfile symlink while refusing to replace a broken one.
-fn config_write_target(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn config_write_target(path: &Path) -> io::Result<PathBuf> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path),
         Ok(_) => Ok(path.to_path_buf()),
@@ -588,7 +615,7 @@ fn config_write_target(path: &Path) -> io::Result<PathBuf> {
 
 /// Config may contain [ai].api_key. Every replacement starts and stays private;
 /// never copy a pre-existing world-readable mode onto secret-bearing data.
-fn write_config_atomically(target: &Path, text: &str) -> io::Result<()> {
+pub(crate) fn write_config_atomically(target: &Path, text: &str) -> io::Result<()> {
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
     for attempt in 0..32 {

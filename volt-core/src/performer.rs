@@ -128,8 +128,8 @@ impl Performer {
     #[inline]
     fn sgr(&mut self, params: &vte::Params) {
         // SGR
-        let mut iter = params.iter().peekable();
-        if iter.peek().is_none() {
+        let mut iter = params.iter();
+        if params.is_empty() {
             self.reset_attrs();
             return;
         }
@@ -147,10 +147,10 @@ impl Performer {
                 27 => self.current_reverse = false,
                 30..=37 => self.current_fg = CellColor::Indexed(p as u8 - 30),
                 39 => self.current_fg = CellColor::Default,
-                40..=47 => self.current_bg = CellColor::Indexed(p as u8 - 40),
-                49 => self.current_bg = CellColor::Default,
+                40..=47 => self.set_background(CellColor::Indexed(p as u8 - 40)),
+                49 => self.set_background(CellColor::Default),
                 90..=97 => self.current_fg = CellColor::Indexed(p as u8 - 90 + 8),
-                100..=107 => self.current_bg = CellColor::Indexed(p as u8 - 100 + 8),
+                100..=107 => self.set_background(CellColor::Indexed(p as u8 - 100 + 8)),
                 38 | 48 => {
                     let is_fg = p == 38;
                     if subparams.len() >= 3 && subparams[1] == 5 {
@@ -158,7 +158,7 @@ impl Performer {
                         if is_fg {
                             self.current_fg = CellColor::Indexed(idx);
                         } else {
-                            self.current_bg = CellColor::Indexed(idx);
+                            self.set_background(CellColor::Indexed(idx));
                         }
                     } else if subparams.len() >= 5 && subparams[1] == 2 {
                         // ISO colon syntax includes an optional colour-space slot.
@@ -171,7 +171,7 @@ impl Performer {
                         if is_fg {
                             self.current_fg = CellColor::Rgb(c);
                         } else {
-                            self.current_bg = CellColor::Rgb(c);
+                            self.set_background(CellColor::Rgb(c));
                         }
                     } else if let Some(next) = iter.next() {
                         match next.first().copied().unwrap_or(0) {
@@ -181,7 +181,7 @@ impl Performer {
                                     if is_fg {
                                         self.current_fg = CellColor::Indexed(idx);
                                     } else {
-                                        self.current_bg = CellColor::Indexed(idx);
+                                        self.set_background(CellColor::Indexed(idx));
                                     }
                                 }
                             }
@@ -196,7 +196,7 @@ impl Performer {
                                 if is_fg {
                                     self.current_fg = CellColor::Rgb(c);
                                 } else {
-                                    self.current_bg = CellColor::Rgb(c);
+                                    self.set_background(CellColor::Rgb(c));
                                 }
                             }
                             _ => {}
@@ -206,7 +206,6 @@ impl Performer {
                 _ => {}
             }
         }
-        self.grid.set_erase_background(self.current_bg);
     }
 
     #[inline(never)]
@@ -738,6 +737,12 @@ impl Performer {
         }
     }
 
+    #[inline]
+    fn set_background(&mut self, bg: CellColor) {
+        self.current_bg = bg;
+        self.grid.set_erase_background(bg);
+    }
+
     fn reset_attrs(&mut self) {
         self.current_fg = CellColor::Default;
         self.current_bg = CellColor::Default;
@@ -1202,6 +1207,81 @@ mod tests {
             logical_lines.push(current);
         }
         logical_lines
+    }
+
+    #[test]
+    fn sgr_keeps_erase_background_in_sync_for_all_color_forms() {
+        for (sgr, expected) in [
+            ("40", CellColor::Indexed(0)),
+            ("47", CellColor::Indexed(7)),
+            ("100", CellColor::Indexed(8)),
+            ("107", CellColor::Indexed(15)),
+            ("48;5;123", CellColor::Indexed(123)),
+            ("48:5:123", CellColor::Indexed(123)),
+            ("48;2;12;34;56", CellColor::Rgb(Color::rgb(12, 34, 56))),
+            ("48:2:12:34:56", CellColor::Rgb(Color::rgb(12, 34, 56))),
+            ("48:2::12:34:56", CellColor::Rgb(Color::rgb(12, 34, 56))),
+            ("44;49", CellColor::Default),
+            ("44;0", CellColor::Default),
+            ("44;0;45;49;46", CellColor::Indexed(6)),
+        ] {
+            let mut p = Performer::new(8, 3);
+            feed(&mut p, format!("\x1b[{sgr}m").as_bytes());
+            assert_eq!(p.current_bg, expected, "{sgr}");
+            assert_eq!(p.grid.erase_cell.bg, expected, "{sgr}");
+            // Foreground/style-only sequences must leave the eraser unchanged.
+            feed(&mut p, b"\x1b[38;2;65;43;21;1;3;4;7m\x1b[2J");
+            for row in 0..3 {
+                for cell in p.grid.row_cells(row) {
+                    assert_eq!(cell.bg, expected, "{sgr}");
+                    assert!(!cell.bold && !cell.italic && !cell.underline && !cell.reverse);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn current_style_does_not_leak_character_width_or_link_metadata() {
+        let mut p = Performer::new(20, 4);
+        feed(&mut p, b"\x1b[1;3;4;7;38;2;12;34;56;48;2;65;43;21m");
+        let expected = p.make_cell('A');
+        assert_eq!(expected.fg, CellColor::Rgb(Color::rgb(12, 34, 56)));
+        assert_eq!(expected.bg, CellColor::Rgb(Color::rgb(65, 43, 21)));
+        assert!(expected.bold && expected.italic && expected.underline && expected.reverse);
+        feed(
+            &mut p,
+            "界\x1b]8;;https://example.com\x07B\x1b]8;;\x07".as_bytes(),
+        );
+        feed(&mut p, b"\x1b7\x1b[0mX\x1b8A");
+        // DEC save/restore keeps the style, not metadata from earlier glyphs.
+        assert_eq!(*p.grid.cell(3, 0), expected);
+        assert!(!p.grid.cell(3, 0).is_wide());
+        assert!(p.grid.extended_text(p.grid.cell(3, 0)).is_none());
+        assert!(p.grid.hyperlink(p.grid.cell(3, 0)).is_none());
+        feed(&mut p, b"\x1b[0mC");
+        let mut plain = Cell::default();
+        plain.set_char('C');
+        assert_eq!(*p.grid.cell(4, 0), plain);
+        feed(&mut p, b"\x1bcD");
+        plain.set_char('D');
+        assert_eq!(*p.grid.cell(0, 0), plain);
+    }
+
+    #[test]
+    fn current_style_survives_alt_screen_and_bytewise_sgr() {
+        let mut p = Performer::new(12, 3);
+        let mut parser = vte::Parser::new();
+        let input = b"\x1b[1;3;4;7;31;44mA\x1b[?1049h\x1b[0mZ\x1b[?1049lB";
+        for byte in input {
+            parser.advance(&mut p, std::slice::from_ref(byte));
+        }
+        let mut expected = *p.grid.cell(0, 0);
+        expected.set_char('B');
+        assert_eq!(*p.grid.cell(1, 0), expected);
+        assert!(expected.bold && expected.italic && expected.underline && expected.reverse);
+        assert_eq!(expected.fg, CellColor::Indexed(1));
+        assert_eq!(expected.bg, CellColor::Indexed(4));
+        assert_eq!(p.grid.erase_cell.bg, expected.bg);
     }
 
     #[test]

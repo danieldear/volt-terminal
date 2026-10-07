@@ -32,6 +32,7 @@ fn fixture(p: &mut Performer) {
         "\x1b[95m\u{e0b6}\x1b[30;105m folder \x1b[0;92m\u{e0b6}\x1b[30;102m 1/1 \x1b[0m",
         "\x1b[36m\u{e0b0}\u{e0b1}\u{e0b2}\u{e0b3}\u{e0b4}\u{e0b5}\u{e0b6}\u{e0b7}\u{e0b8}\u{e0b9}\u{e0ba}\u{e0bb}\u{e0bc}\u{e0bd}\u{e0be}\u{e0bf}\x1b[0m",
         "\x1b[4mUnderline, including spaces     \x1b[0m plain \x1b[1;3mBold italic\x1b[0m",
+        "Styles: é \x1b[1mé BOLD\x1b[0m \x1b[3mé ITALIC\x1b[0m \x1b[1;3mé BOTH\x1b[0m",
         "Wide: 日本語 中文 | marks: x\u{0301}\u{0308} e\u{0301} | ZWJ: 👩\u{200d}💻 👍🏽 🇺🇸",
         "\x1b[32m████ ▀▀▀▀ ▄▄▄▄ ▌▌▌▌ ▐▐▐▐\x1b[0m",
         "Nerd glyphs: \u{f07b} \u{e62b} \u{e0a0} | arrows: → ← ↔",
@@ -248,6 +249,16 @@ fn main() -> Result<()> {
                     anyhow::ensure!(
                         changed == renderer.read_offscreen_rgba()?,
                         "changed-row pixel mismatch"
+                    );
+                    // Font/scale updates must invalidate ASCII and extended
+                    // shape caches as well as atlas-dependent geometry.
+                    renderer.update_scale(scale, 15.0);
+                    draw(&mut renderer, &p, true);
+                    renderer.update_scale(scale, 14.0);
+                    draw(&mut renderer, &p, true);
+                    anyhow::ensure!(
+                        changed == renderer.read_offscreen_rgba()?,
+                        "font-size cache roundtrip mismatch"
                     );
                     tested += 1;
                 }

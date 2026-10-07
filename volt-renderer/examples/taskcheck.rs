@@ -176,6 +176,48 @@ fn main() -> Result<()> {
             "strip leaves pixels when hidden"
         );
 
+        // Status, label, notice and theme changes invalidate cached strip
+        // geometry. Compare every updated image with a cleared-atlas renderer.
+        let mut fresh =
+            pollster::block_on(Renderer::new_offscreen(w, h, 14., scale, "SF Mono", 1.2))?;
+        fresh.custom_tab_bar = r.custom_tab_bar;
+        for state in [
+            StripState::Idle,
+            StripState::Sent,
+            StripState::Running,
+            StripState::Succeeded,
+            StripState::Failed,
+            StripState::ReviewRequired,
+        ] {
+            let mut view = strip();
+            view.tasks[0].state = state;
+            view.tasks[0].name = format!("Build {state:?}");
+            view.message = Some(format!("Status {state:?}"));
+            for active_theme in [&theme, &Theme::by_name("nord")] {
+                r.task_strip = Some(view.clone());
+                draw(&mut r, &filled, active_theme);
+                let updated = r.read_offscreen_rgba()?;
+                draw(&mut r, &filled, active_theme);
+                anyhow::ensure!(
+                    updated == r.read_offscreen_rgba()?,
+                    "cached task strip changed pixels"
+                );
+                fresh.update_scale(scale, 14.);
+                fresh.task_strip = Some(view.clone());
+                draw(&mut fresh, &filled, active_theme);
+                anyhow::ensure!(
+                    updated == fresh.read_offscreen_rgba()?,
+                    "task state/theme cache became stale"
+                );
+            }
+        }
+        r.task_strip = None;
+        draw(&mut r, &filled, &theme);
+        anyhow::ensure!(
+            r.read_offscreen_rgba()? == baseline,
+            "updated strip leaves pixels"
+        );
+
         // The first-task affordance remains visible before any commands exist.
         r.task_strip = Some(TaskStripView {
             tasks: vec![],

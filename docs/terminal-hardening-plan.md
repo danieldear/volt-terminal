@@ -18,8 +18,10 @@ is not a claim of complete xterm compatibility or exhaustive daily-driver QA.
 6. Validate: fmt, tests, strict Clippy, MSRV, audit, GPU fixtures, release build,
    targeted performance checks; record outcomes and remaining external gates.
 
-External gates: Apple notarization credentials and CI signing secrets;
-physical input-to-photon equipment and controlled power/energy experiment.
+Original external gates included Apple notarization credentials and CI signing
+secrets; these were completed and validated by 2026-10-07 (see Distribution below).
+Remaining gates include public artifact acceptance, physical input-to-photon
+equipment and a controlled power/energy experiment.
 Do not equate CPU/GPU/PTY timings with those measurements.
 
 ## Implemented and verified
@@ -74,9 +76,12 @@ advertised as implemented. OSC 52 clipboard access remains intentionally absent.
 
 ### Distribution
 
-Optional credential-gated notarization is implemented; the local Developer ID
-signing/hardened-runtime/timestamp path passed strict verification. Apple service
-acceptance is **not** verified without credentials. See [distribution](distribution.md).
+Credential-gated notarization is implemented. Developer ID signing, hardened
+runtime, timestamp, Apple acceptance, stapling and extracted-ZIP Gatekeeper checks
+passed locally and in [hosted validation](https://github.com/danieldear/volt-terminal/actions/runs/37572203978).
+Future release mode is `notarized`. The existing public v0.1.10 archive remains
+ad-hoc signed; a new public release and downloaded-app acceptance are still
+required. See [distribution](distribution.md) for evidence and boundaries.
 
 ### CI / dependencies
 
@@ -124,7 +129,8 @@ credentials and an invalid signing mode were both rejected as expected.
 
 ## Still external or explicitly deferred
 
-- Notarization profile/API credentials, CI signing secrets, Apple acceptance.
+- New notarized public release and downloaded-app install/launch acceptance;
+  credential setup, CI secrets and Apple acceptance are already validated.
 - Hardware input-to-display measurement and controlled energy/power experiment
   (noninteractive powermetrics privileges were unavailable).
 - Exhaustive terminal conformance and multi-day real-world reliability cannot be

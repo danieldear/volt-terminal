@@ -3,6 +3,7 @@
 /// `TabLayout` is cheap to compute for the current window and tab count;
 /// pointer handlers use it for hit-testing and drag targets.
 pub struct TabLayout {
+    visible: bool,
     pub sc: f32,
     pub left_pad: f32,
     pub tab_w: f32,
@@ -29,6 +30,7 @@ impl TabLayout {
         let tab_h = (tab_bar_h - 8.0 * sc).max(24.0 * sc);
         let tab_y = ((tab_bar_h - tab_h) * 0.5).round().max(2.0 * sc);
         TabLayout {
+            visible: n_tabs > 1,
             sc,
             left_pad,
             tab_w,
@@ -62,7 +64,7 @@ impl TabLayout {
     }
 
     pub fn hit_tab(&self, mx: f32, my: f32, n: usize) -> Option<usize> {
-        if my < self.tab_y || my >= self.tab_y + self.tab_h {
+        if !self.visible || my < self.tab_y || my >= self.tab_y + self.tab_h {
             return None;
         }
         for i in 0..n {
@@ -75,11 +77,17 @@ impl TabLayout {
     }
 
     pub fn hit_close(&self, mx: f32, my: f32, i: usize) -> bool {
+        if !self.visible {
+            return false;
+        }
         let (x, y, w, h) = self.close_rect(i);
         mx >= x && mx < x + w && my >= y && my < y + h
     }
 
     pub fn hit_plus(&self, mx: f32, my: f32) -> bool {
+        if !self.visible {
+            return false;
+        }
         let (x, y, w, h) = self.plus_rect();
         mx >= x && mx < x + w && my >= y && my < y + h
     }
@@ -105,6 +113,24 @@ impl TabLayout {
 #[cfg(test)]
 mod tests {
     use super::TabLayout;
+
+    #[test]
+    fn single_tab_has_no_invisible_click_targets() {
+        for scale in [1.0, 1.5, 2.0] {
+            for count in [0, 1, 2] {
+                let layout = TabLayout::compute(900.0 * scale, 38.0 * scale, count, scale);
+                let y = layout.tab_y + layout.tab_h / 2.0;
+                assert_eq!(
+                    layout.hit_tab(layout.tab_x(0) + 20.0 * scale, y, count),
+                    (count > 1).then_some(0)
+                );
+                let (x, y, w, h) = layout.close_rect(0);
+                assert_eq!(layout.hit_close(x + w / 2.0, y + h / 2.0, 0), count > 1);
+                let (x, y, w, h) = layout.plus_rect();
+                assert_eq!(layout.hit_plus(x + w / 2.0, y + h / 2.0), count > 1);
+            }
+        }
+    }
 
     #[test]
     fn drag_crosses_neighbor_centers_and_clamps_at_edges() {

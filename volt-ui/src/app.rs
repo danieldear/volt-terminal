@@ -32,6 +32,11 @@ pub enum VoltEvent {
     /// PTY reader thread produced output — request a redraw.
     PtyData,
     WorkspaceUpdated,
+    PreferencesSaved,
+    SettingsAction {
+        window_id: WindowId,
+        action: crate::settings::Outcome,
+    },
     #[cfg(target_os = "macos")]
     NativeText {
         window_id: WindowId,
@@ -259,6 +264,7 @@ struct MainState {
     /// Open theme editor. While `Some`, `theme` is its live working copy and
     /// keyboard input goes to the editor.
     theme_editor: Option<crate::theme_editor::ThemeEditor>,
+    settings: Option<crate::settings::Settings>,
     /// The active pane's project tasks (`.volt/tasks.toml`).
     tasks: crate::tasks::TaskLoader,
     /// One exact task/file/pane snapshot awaiting explicit confirmation.
@@ -271,6 +277,258 @@ struct MainState {
 }
 
 impl MainState {
+    fn open_config(&mut self) {
+        self.open_settings(false);
+    }
+    fn open_settings(&mut self, onboarding: bool) {
+        if self.settings.is_some() {
+            self.cancel_settings();
+        }
+        self.cancel_theme_editor();
+        self.task_form = None;
+        self.renderer.task_form = None;
+        self.pending_task = None;
+        self.active_prompt = None;
+        self.workspace_search.close();
+        self.renderer.search_palette = None;
+        self.workspace_panel.focused = false;
+        let Some(path) = config_path_to_edit() else {
+            self.renderer
+                .set_top_alert(Some("Cannot locate the settings folder".into()));
+            return;
+        };
+        match crate::settings::Settings::open(
+            path,
+            &self.config,
+            &ThemeRegistry::load(),
+            self.renderer.installed_font_families(),
+            onboarding,
+        ) {
+            Ok(settings) => {
+                self.settings = Some(settings);
+                self.sync_settings();
+            }
+            Err(e) => {
+                self.renderer.set_top_alert(Some(format!(
+                    "Cannot open Settings: {e}. Open config.toml to repair it."
+                )));
+                self.begin_redraw();
+            }
+        }
+    }
+    fn sync_settings(&mut self) {
+        self.renderer.settings = self.settings.as_ref().map(|s| s.view());
+        if let Some(layout) = self.renderer.settings_layout() {
+            if let Some(s) = self.settings.as_mut() {
+                s.set_capacity(layout.rows);
+                self.renderer.settings = Some(s.view());
+            }
+        } else if self.settings.is_some() {
+            self.cancel_settings();
+            self.renderer
+                .set_top_alert(Some("Make the window larger to open Settings".into()));
+        }
+        self.begin_redraw();
+    }
+    fn cancel_settings(&mut self) {
+        if let Some(s) = self.settings.take() {
+            self.theme = ThemeRegistry::load().resolve(&s.initial.theme);
+            self.apply_config(&s.initial);
+        }
+        self.renderer.settings = None;
+        self.begin_redraw();
+    }
+    fn settings_outcome(&mut self, outcome: crate::settings::Outcome) {
+        use crate::settings::Outcome as O;
+        match outcome {
+            O::Preview => {
+                if let Some(mut c) = self.settings.as_ref().map(|s| s.draft.clone()) {
+                    // History truncation is irreversible: only commit it on Apply.
+                    c.terminal.scrollback_lines = self
+                        .settings
+                        .as_ref()
+                        .unwrap()
+                        .initial
+                        .terminal
+                        .scrollback_lines;
+                    c.shell = self.settings.as_ref().unwrap().initial.shell.clone();
+                    self.theme = ThemeRegistry::load().resolve(&c.theme);
+                    self.apply_config(&c);
+                }
+            }
+            O::Apply | O::Skip => {
+                let fresh = self
+                    .settings
+                    .as_ref()
+                    .is_some_and(|s| s.onboarding && s.transaction.is_new());
+                let result = self.settings.as_mut().map(|s| s.save(outcome == O::Skip));
+                match result {
+                    Some(Ok(())) => {
+                        let s = self.settings.take().unwrap();
+                        let c = s.draft.clone();
+                        self.renderer.settings = None;
+                        self.theme = ThemeRegistry::load().resolve(&c.theme);
+                        self.apply_config(&c);
+                        // Don't kill/restart existing jobs. Prompt/shell changes apply to new tabs.
+                        if fresh && outcome == O::Apply {
+                            self.new_tab();
+                        }
+                        let _ = self.proxy.send_event(VoltEvent::PreferencesSaved);
+                    }
+                    Some(Err(e)) => {
+                        if let Some(s) = self.settings.as_mut() {
+                            s.status = e;
+                        }
+                    }
+                    None => {}
+                }
+            }
+            O::Cancel => self.cancel_settings(),
+            O::Config => {
+                self.cancel_settings();
+                self.open_config_file();
+            }
+            O::Tasks => {
+                self.cancel_settings();
+                self.show_tasks_in_card();
+            }
+            O::AddTask => {
+                self.cancel_settings();
+                self.open_task_form();
+            }
+            O::Themes | O::Secure | O::GettingStarted => {
+                self.cancel_settings();
+                let _ = self.proxy.send_event(VoltEvent::SettingsAction {
+                    window_id: self.window.id(),
+                    action: outcome,
+                });
+            }
+            O::Redraw => {}
+        }
+        self.sync_settings();
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn settings_key(
+        &mut self,
+        key: PhysicalKey,
+        text: Option<&str>,
+        super_key: bool,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+    ) {
+        use crate::settings::Outcome as O;
+        let Some(s) = self.settings.as_mut() else {
+            return;
+        };
+        let primary = super_key || (cfg!(not(target_os = "macos")) && ctrl);
+        let code = match key {
+            PhysicalKey::Code(c) => c,
+            _ => return,
+        };
+        if s.recording_shortcut()
+            && !matches!(
+                code,
+                KeyCode::Escape
+                    | KeyCode::SuperLeft
+                    | KeyCode::SuperRight
+                    | KeyCode::ShiftLeft
+                    | KeyCode::ShiftRight
+                    | KeyCode::ControlLeft
+                    | KeyCode::ControlRight
+                    | KeyCode::AltLeft
+                    | KeyCode::AltRight
+            )
+        {
+            let name = format!("{code:?}");
+            let name = name
+                .strip_prefix("Key")
+                .or_else(|| name.strip_prefix("Digit"))
+                .unwrap_or(&name)
+                .strip_prefix("Arrow")
+                .unwrap_or(
+                    name.strip_prefix("Key")
+                        .or_else(|| name.strip_prefix("Digit"))
+                        .unwrap_or(&name),
+                )
+                .to_lowercase();
+            let chord = format!(
+                "{}{}{}{}{}",
+                if ctrl { "ctrl+" } else { "" },
+                if alt { "alt+" } else { "" },
+                if shift { "shift+" } else { "" },
+                if super_key { "super+" } else { "" },
+                name
+            );
+            let o = s.shortcut(chord);
+            self.settings_outcome(o);
+            return;
+        }
+        if primary && code == KeyCode::KeyC {
+            self.copy_selection();
+            self.sync_settings();
+            return;
+        }
+        if primary && code == KeyCode::KeyV {
+            self.paste_clipboard();
+            return;
+        }
+        let outcome = match code {
+            KeyCode::Escape => s.escape(),
+            KeyCode::KeyS if primary => O::Apply,
+            KeyCode::KeyA if primary => {
+                s.select_all();
+                O::Redraw
+            }
+            KeyCode::Tab => s.move_focus(if shift { -1 } else { 1 }),
+            KeyCode::Home if s.is_editing() => {
+                s.cursor_edge(false);
+                O::Redraw
+            }
+            KeyCode::End if s.is_editing() => {
+                s.cursor_edge(true);
+                O::Redraw
+            }
+            KeyCode::ArrowDown => s.move_focus(1),
+            KeyCode::ArrowUp => s.move_focus(-1),
+            KeyCode::ArrowLeft => {
+                if s.is_editing() {
+                    s.cursor(-1);
+                    O::Redraw
+                } else {
+                    s.adjust(-1)
+                }
+            }
+            KeyCode::ArrowRight => {
+                if s.is_editing() {
+                    s.cursor(1);
+                    O::Redraw
+                } else {
+                    s.adjust(1)
+                }
+            }
+            KeyCode::PageDown => s.section((s.section + 1) % s.sections().len()),
+            KeyCode::PageUp => s.section((s.section + s.sections().len() - 1) % s.sections().len()),
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                if s.is_editing() {
+                    s.commit()
+                } else {
+                    s.activate()
+                }
+            }
+            KeyCode::Backspace => s.erase(false),
+            KeyCode::Delete => s.erase(true),
+            _ => {
+                if !super_key && !ctrl && !alt {
+                    s.text(text.unwrap_or(""))
+                } else {
+                    O::Redraw
+                }
+            }
+        };
+        self.settings_outcome(outcome);
+    }
+
     /// Push the editor's view to the renderer. A window too small for the
     /// panel closes the editor instead of leaving an invisible modal.
     fn sync_theme_editor(&mut self) {
@@ -473,7 +731,7 @@ impl MainState {
     }
 
     /// Volt ▸ Settings… and Cmd+, : the config file, in the configured editor.
-    fn open_config(&mut self) {
+    fn open_config_file(&mut self) {
         let Some(path) = config_file_to_edit() else {
             return;
         };
@@ -1730,7 +1988,30 @@ impl MainState {
     /// Apply settings other than the theme, which callers resolve through
     /// the theme registry (font-size changes must not reset it).
     fn apply_config(&mut self, config: &Config) {
+        let metrics_changed = self.config.font.family != config.font.family
+            || self.config.font.size != config.font.size
+            || self.config.appearance.line_height != config.appearance.line_height;
+        let grid_changed = metrics_changed
+            || self.config.appearance.padding != config.appearance.padding
+            || self.config.workspace.layout != config.workspace.layout
+            || self.config.workspace.enabled != config.workspace.enabled;
+        let old_workspace_enabled = self.config.workspace.enabled;
+        let old_scrollback = self.config.terminal.scrollback_lines;
         self.config = config.clone();
+        if old_workspace_enabled != config.workspace.enabled {
+            self.workspace_panel.visible = config.workspace.enabled;
+            self.workspace_panel.focused = false;
+        }
+        if old_scrollback != config.terminal.scrollback_lines {
+            for tab in &mut self.tabs {
+                tab.tree.for_each_leaf_mut(&mut |_, pane| {
+                    if let Ok(mut p) = pane.performer.lock() {
+                        p.set_scrollback_limit(config.terminal.scrollback_lines);
+                    }
+                });
+            }
+        }
+        self.sync_workspace_card();
         self.keybindings = crate::keybindings::Bindings::compile(&config.keybindings);
         self.window
             .set_transparent(config.appearance.transparent_enabled());
@@ -1742,8 +2023,12 @@ impl MainState {
         self.renderer
             .set_background_opacity(config.appearance.effective_opacity());
         self.renderer.cursor_style = config.appearance.cursor_style;
-        self.renderer.update_scale(sc, config.font.size);
-        self.resize_all_tabs_to_current_grid();
+        if metrics_changed {
+            self.renderer.update_scale(sc, config.font.size);
+        }
+        if grid_changed {
+            self.resize_all_tabs_to_current_grid();
+        }
         if self.theme_editor.is_some() {
             self.sync_theme_editor();
         }
@@ -2071,7 +2356,12 @@ impl MainState {
     }
 
     fn copy_selection(&mut self) -> bool {
-        let Some(text) = self.selected_text() else {
+        let text = if let Some(s) = &self.settings {
+            s.selected_text()
+        } else {
+            self.selected_text()
+        };
+        let Some(text) = text else {
             return false;
         };
         #[cfg(target_os = "macos")]
@@ -2096,7 +2386,9 @@ impl MainState {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = text;
-        self.selection = None;
+        if self.settings.is_none() {
+            self.selection = None;
+        }
         true
     }
 
@@ -2105,7 +2397,7 @@ impl MainState {
     /// resetting the scroll view, a harmless local UI convenience) when the
     /// pane is marked read-only via the context menu.
     fn send_pty_input(&mut self, bytes: &[u8]) {
-        if self.workspace_search.visible {
+        if self.workspace_search.visible || self.settings.is_some() {
             return;
         }
         self.bump_cursor_blink();
@@ -2121,6 +2413,11 @@ impl MainState {
 
     fn insert_committed_text(&mut self, text: &str) {
         if text.is_empty() {
+            return;
+        }
+        if let Some(settings) = self.settings.as_mut() {
+            let outcome = settings.text(text);
+            self.settings_outcome(outcome);
             return;
         }
         if let Some(editor) = self.theme_editor.as_mut() {
@@ -2161,7 +2458,8 @@ impl MainState {
     fn paste_clipboard(&mut self) {
         #[cfg(target_os = "macos")]
         {
-            if self.theme_editor.is_none()
+            if self.settings.is_none()
+                && self.theme_editor.is_none()
                 && self.task_form.is_none()
                 && !self.workspace_search.visible
                 && self.workspace_panel.visible
@@ -2182,6 +2480,11 @@ impl MainState {
                     return;
                 }
             };
+            if let Some(settings) = self.settings.as_mut() {
+                let outcome = settings.text(&String::from_utf8_lossy(&data));
+                self.settings_outcome(outcome);
+                return;
+            }
             if let Some(editor) = self.theme_editor.as_mut() {
                 let outcome = editor.paste(&String::from_utf8_lossy(&data));
                 self.apply_editor_outcome(outcome);
@@ -2790,8 +3093,11 @@ impl App {
         let window = Arc::new(event_loop.create_window(window_attrs)?);
         // Capture native picker text without changing normal keyboard/IME handling.
         #[cfg(target_os = "macos")]
-        let native_text =
-            crate::native_text::NativeTextInput::install(window.clone(), proxy.clone())?;
+        let native_text = crate::native_text::NativeTextInput::install(
+            window.clone(),
+            proxy.clone(),
+            !self.config.appearance.native_tabs,
+        )?;
         #[cfg(target_os = "macos")]
         let native_tab_count = window.num_tabs().max(1);
         #[cfg(target_os = "macos")]
@@ -2880,7 +3186,11 @@ impl App {
             divider_drag: None,
             tab_drag: None,
             divider_hover_id: None,
-            workspace_panel: WorkspacePanel::default(),
+            workspace_panel: {
+                let mut panel = WorkspacePanel::default();
+                panel.visible = self.config.workspace.enabled;
+                panel
+            },
             workspace_search: crate::workspace_search::SearchPalette::default(),
             search_mouse_capture: None,
             last_click: None,
@@ -2895,6 +3205,7 @@ impl App {
             last_search_refresh: Instant::now(),
             show_inspector: false,
             theme_editor: None,
+            settings: None,
             tasks: crate::tasks::TaskLoader::default(),
             pending_task: None,
             task_message: None,
@@ -2906,6 +3217,12 @@ impl App {
         state.window.set_blur(self.config.appearance.blur_enabled());
         #[cfg(target_os = "macos")]
         state.sync_native_window_title();
+        if self.windows.is_empty()
+            && !self.config.setup.completed
+            && config_path_to_edit().is_some_and(|p| !p.exists())
+        {
+            state.open_settings(true);
+        }
         let id = state.id;
         self.windows.insert(id, state);
         Ok(id)
@@ -2923,6 +3240,16 @@ impl App {
         for state in self.windows.values_mut() {
             state.renderer.set_top_alert(config_alert.clone());
             state.cancel_theme_editor();
+            if let Some(settings) = state.settings.as_mut() {
+                // Another window saved/reloaded. Keep this window's draft, but
+                // cancellation must now restore the latest saved configuration.
+                settings.initial = new_cfg.clone();
+                settings.status =
+                    "Settings reloaded elsewhere. Your draft is retained; reopen before saving."
+                        .into();
+                state.sync_settings();
+                continue;
+            }
             state.theme = theme.clone();
             state.apply_config(&new_cfg);
         }
@@ -3141,6 +3468,17 @@ impl App {
     ) {
         use crate::menu::MenuAction as A;
 
+        if self
+            .target_window_id()
+            .and_then(|id| self.windows.get(&id))
+            .is_some_and(|s| s.settings.is_some())
+            && !matches!(
+                action,
+                A::OpenSettings | A::GettingStarted | A::Copy | A::Paste | A::OpenConfigFile
+            )
+        {
+            return;
+        }
         let context_tab_target = self.context_tab_target.take();
 
         if action == A::ToggleSecureInput {
@@ -3155,6 +3493,23 @@ impl App {
         match action {
             A::NewWindow => {
                 let _ = self.create_main_window(event_loop, None);
+                return;
+            }
+            A::OpenConfigFile => {
+                if let Some(id) = self.target_window_id() {
+                    if let Some(s) = self.windows.get_mut(&id) {
+                        s.cancel_settings();
+                        s.open_config_file();
+                    }
+                }
+                return;
+            }
+            A::GettingStarted => {
+                if let Some(id) = self.target_window_id() {
+                    if let Some(state) = self.windows.get_mut(&id) {
+                        state.open_settings(true);
+                    }
+                }
                 return;
             }
             A::OpenSettings => {
@@ -3338,6 +3693,8 @@ impl App {
             }
             A::NewWindow
             | A::OpenSettings
+            | A::GettingStarted
+            | A::OpenConfigFile
             | A::ReloadSettings
             | A::CloseWindow
             | A::CustomizeTheme
@@ -3538,6 +3895,30 @@ impl ApplicationHandler<VoltEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: VoltEvent) {
         match event {
             VoltEvent::WorkspaceUpdated => {}
+            VoltEvent::PreferencesSaved => self.reload_config(),
+            VoltEvent::SettingsAction {
+                window_id: id,
+                action,
+            } => {
+                if self.windows.contains_key(&id) {
+                    match action {
+                        crate::settings::Outcome::Themes => self.toggle_theme_editor(id),
+                        crate::settings::Outcome::GettingStarted => {
+                            if let Some(s) = self.windows.get_mut(&id) {
+                                s.open_settings(true);
+                            }
+                        }
+                        crate::settings::Outcome::Secure => {
+                            #[cfg(target_os = "macos")]
+                            self.handle_menu_action(
+                                _event_loop,
+                                crate::menu::MenuAction::ToggleSecureInput,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
             #[cfg(target_os = "macos")]
             VoltEvent::NativeText { window_id, text } => {
                 if let Some(state) = self.windows.get_mut(&window_id) {
@@ -3610,6 +3991,9 @@ impl ApplicationHandler<VoltEvent> for App {
                 if state.task_form.is_some() {
                     state.sync_task_form();
                 }
+                if state.settings.is_some() {
+                    state.sync_settings();
+                }
                 state.resize_all_tabs_to_current_grid();
                 #[cfg(target_os = "macos")]
                 {
@@ -3631,6 +4015,9 @@ impl ApplicationHandler<VoltEvent> for App {
                 }
                 if state.task_form.is_some() {
                     state.sync_task_form();
+                }
+                if state.settings.is_some() {
+                    state.sync_settings();
                 }
                 #[cfg(target_os = "macos")]
                 {
@@ -3691,6 +4078,10 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                if state.settings.is_some() {
+                    state.mouse_pos = (position.x as f32, position.y as f32);
+                    return;
+                }
                 let pointer_moved = state.mouse_pos != (position.x as f32, position.y as f32);
                 state.mouse_pos = (position.x as f32, position.y as f32);
                 if state
@@ -3876,6 +4267,24 @@ impl ApplicationHandler<VoltEvent> for App {
                 button,
                 ..
             } => {
+                if state.settings.is_some() {
+                    if btn_state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(layout) = state.renderer.settings_layout() {
+                            let sections = state
+                                .settings
+                                .as_ref()
+                                .map(|s| s.sections().len())
+                                .unwrap_or(0);
+                            let hit = layout.hit(state.mouse_pos.0, state.mouse_pos.1, sections);
+                            let outcome = state.settings.as_mut().map(|s| s.hit(hit));
+                            if let Some(o) = outcome {
+                                state.settings_outcome(o);
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 if state
                     .active_prompt
                     .as_ref()
@@ -4095,6 +4504,10 @@ impl ApplicationHandler<VoltEvent> for App {
                                 state.last_tab_bar_click = None;
                             } else {
                                 state.last_tab_bar_click = Some(now);
+                                // The custom content view owns tab-bar input.
+                                // Start native window dragging only over empty
+                                // chrome, never over tabs, close or + buttons.
+                                let _ = state.window.drag_window();
                             }
                         } else {
                             state.last_tab_bar_click = None;
@@ -4316,6 +4729,17 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                if state.settings.is_some() {
+                    let amount = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                    };
+                    if let Some(settings) = state.settings.as_mut() {
+                        settings.move_focus(if amount < 0. { 1 } else { -1 });
+                    }
+                    state.sync_settings();
+                    return;
+                }
                 if state
                     .active_prompt
                     .as_ref()
@@ -4478,6 +4902,19 @@ impl ApplicationHandler<VoltEvent> for App {
                 let super_key = state.super_down();
                 let shift = state.shift_down();
                 let alt = state.modifiers.alt_key();
+                if state.settings.is_some()
+                    && !(super_key && physical_key == PhysicalKey::Code(KeyCode::KeyQ))
+                {
+                    state.settings_key(
+                        physical_key,
+                        text.as_ref().map(|t| t.as_str()),
+                        super_key,
+                        shift,
+                        ctrl,
+                        alt,
+                    );
+                    return;
+                }
                 // The task form owns the keyboard while open; Cmd+Q still quits.
                 if state.task_form.is_some()
                     && !(super_key && physical_key == PhysicalKey::Code(KeyCode::KeyQ))
@@ -4592,6 +5029,16 @@ impl ApplicationHandler<VoltEvent> for App {
                         }
                         _ => state.run_keybinding(action),
                     }
+                    return;
+                }
+                if cfg!(not(target_os = "macos"))
+                    && defaults
+                    && ctrl
+                    && !alt
+                    && !shift
+                    && physical_key == PhysicalKey::Code(KeyCode::Comma)
+                {
+                    state.open_config();
                     return;
                 }
                 if defaults
@@ -5327,12 +5774,14 @@ impl ApplicationHandler<VoltEvent> for App {
                         state.set_window_title_cached(active_title);
                     }
 
+                    let snapshot_start = state.renderer.snapshot_timer();
                     let Some((render_grid, render_cursor_visible)) =
                         state.build_render_grid_for_active_tab()
                     else {
                         eprintln!("volt-ui: failed to snapshot panes for render");
                         return;
                     };
+                    state.renderer.finish_snapshot(snapshot_start);
                     let damage_rows = state.take_render_damage_rows();
                     let dividers: Vec<volt_renderer::PaneDivider> = state
                         .active_tab_dividers()

@@ -28,6 +28,8 @@ pub enum MenuAction {
     ToggleFullScreen,
     Zoom,
     OpenSettings,
+    GettingStarted,
+    OpenConfigFile,
     ReloadSettings,
     SplitRight,
     SplitLeft,
@@ -114,6 +116,8 @@ impl MenuAction {
             ToggleFullScreen => "volt.toggle_fullscreen",
             Zoom => "volt.zoom",
             OpenSettings => "volt.open_settings",
+            GettingStarted => "volt.getting_started",
+            OpenConfigFile => "volt.open_config_file",
             ReloadSettings => "volt.reload_settings",
             SplitRight => "volt.split_right",
             SplitLeft => "volt.split_left",
@@ -154,6 +158,8 @@ impl MenuAction {
             "volt.toggle_fullscreen" => ToggleFullScreen,
             "volt.zoom" => Zoom,
             "volt.open_settings" => OpenSettings,
+            "volt.getting_started" => GettingStarted,
+            "volt.open_config_file" => OpenConfigFile,
             "volt.reload_settings" => ReloadSettings,
             "volt.split_right" => SplitRight,
             "volt.split_left" => SplitLeft,
@@ -227,6 +233,7 @@ pub fn install_app_menu() -> AppMenu {
         &PredefinedMenuItem::about(Some("About Volt"), None),
         &PredefinedMenuItem::separator(),
         &MenuAction::OpenSettings.item("Settings…"),
+        &MenuAction::OpenConfigFile.item("Open Configuration File…"),
         &MenuAction::ReloadSettings.item("Reload Settings"),
         &theme_menu,
         &secure_input_item,
@@ -283,7 +290,16 @@ pub fn install_app_menu() -> AppMenu {
     // the live window list and handles Minimize/Zoom natively.
     window_menu.set_as_windows_menu_for_nsapp();
 
-    let _ = menu.append_items(&[&app_menu, &file_menu, &edit_menu, &view_menu, &window_menu]);
+    let help_menu = Submenu::new("Help", true);
+    let _ = help_menu.append(&MenuAction::GettingStarted.item("Getting Started…"));
+    let _ = menu.append_items(&[
+        &app_menu,
+        &file_menu,
+        &edit_menu,
+        &view_menu,
+        &window_menu,
+        &help_menu,
+    ]);
 
     menu.init_for_nsapp();
     AppMenu {

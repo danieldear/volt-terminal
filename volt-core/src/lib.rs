@@ -1,4 +1,5 @@
 pub mod cell;
+pub mod diagnostics;
 pub mod events;
 pub mod grid;
 pub mod hyperlink;

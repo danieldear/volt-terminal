@@ -30,3 +30,6 @@ mod links;
 
 #[cfg(any(target_os = "macos", test))]
 mod shell_integration;
+
+pub mod settings;
+mod shell_startup;

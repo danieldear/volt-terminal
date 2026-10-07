@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use vte::Parser;
 
+use crate::diagnostics::{Counter, PerfStats, Stage};
 use crate::events::CoreEvent;
 use crate::performer::Performer;
 
@@ -260,12 +261,21 @@ impl Pty {
         let stopped = Arc::new(AtomicBool::new(false));
         let reader_stopped = Arc::clone(&stopped);
         let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PIPELINE_QUEUE_BUFFERS);
+        let mut read_perf = PerfStats::from_env("pty-reader");
+        let mut parse_perf = PerfStats::from_env("pty-parser");
+        // Diagnostics count queued bytes plus at most one pending send. These
+        // atomics are absent unless profiling is explicitly enabled.
+        let pending_bytes = read_perf
+            .as_ref()
+            .map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let parser_pending_bytes = pending_bytes.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 64 * 1024];
             loop {
                 if reader_stopped.load(Ordering::Relaxed) {
                     break;
                 }
+                let wait_start = PerfStats::start(&read_perf);
                 #[cfg(target_os = "macos")]
                 {
                     match readiness.wait() {
@@ -304,13 +314,36 @@ impl Pty {
                         break;
                     }
                 }
-                match reader.read(&mut buf) {
+                if let (Some(stats), Some(start)) = (read_perf.as_mut(), wait_start) {
+                    stats.finish(Stage::ReadWait, start);
+                }
+                let read_start = PerfStats::start(&read_perf);
+                let read_result = reader.read(&mut buf);
+                if let (Some(stats), Some(start)) = (read_perf.as_mut(), read_start) {
+                    stats.finish(Stage::Read, start);
+                }
+                match read_result {
                     Ok(0) => break,
                     Err(err) if err.kind() == ErrorKind::Interrupted => continue,
                     Err(_) => break,
                     // Receiver gone means the parse thread ended; stop draining.
                     Ok(n) => {
-                        if buf_tx.send(buf[..n].to_vec()).is_err() {
+                        if let Some(stats) = read_perf.as_mut() {
+                            stats.add(Counter::Bytes, n as u64);
+                            stats.add(Counter::Reads, 1);
+                            if let Some(pending) = pending_bytes.as_ref() {
+                                stats.peak(
+                                    Counter::PendingBytesPeak,
+                                    (pending.fetch_add(n, Ordering::Relaxed) + n) as u64,
+                                );
+                            }
+                        }
+                        let send_start = PerfStats::start(&read_perf);
+                        let sent = buf_tx.send(buf[..n].to_vec());
+                        if let (Some(stats), Some(start)) = (read_perf.as_mut(), send_start) {
+                            stats.finish(Stage::QueueSend, start);
+                        }
+                        if sent.is_err() {
                             break;
                         }
                     }
@@ -325,9 +358,21 @@ impl Pty {
         std::thread::spawn(move || {
             let mut parser = Parser::new();
             'reader_loop: loop {
-                match buf_rx.recv() {
+                let queue_start = PerfStats::start(&parse_perf);
+                let received = buf_rx.recv();
+                if let (Some(stats), Some(start)) = (parse_perf.as_mut(), queue_start) {
+                    stats.finish(Stage::QueueWait, start);
+                }
+                match received {
                     Err(_) => break,
                     Ok(mut data) => {
+                        if let Some(pending) = parser_pending_bytes.as_ref() {
+                            pending.fetch_sub(data.len(), Ordering::Relaxed);
+                        }
+                        if let Some(stats) = parse_perf.as_mut() {
+                            stats.add(Counter::Batches, 1);
+                        }
+
                         if parser_stopped.load(Ordering::Relaxed) {
                             break;
                         }
@@ -337,7 +382,12 @@ impl Pty {
                         // dominates when parsing tiny buffers one at a time.
                         while data.len() < COALESCE_LIMIT_BYTES {
                             match buf_rx.try_recv() {
-                                Ok(more) => data.extend_from_slice(&more),
+                                Ok(more) => {
+                                    if let Some(pending) = parser_pending_bytes.as_ref() {
+                                        pending.fetch_sub(more.len(), Ordering::Relaxed);
+                                    }
+                                    data.extend_from_slice(&more);
+                                }
                                 Err(_) => break,
                             }
                         }
@@ -350,6 +400,7 @@ impl Pty {
                                 break 'reader_loop;
                             }
                             let (pending_events, pending_writes, chunk_dirty) = {
+                                let lock_start = PerfStats::start(&parse_perf);
                                 let mut p = match performer_clone.lock() {
                                     Ok(performer) => performer,
                                     Err(poisoned) => {
@@ -361,7 +412,20 @@ impl Pty {
                                         poisoned.into_inner()
                                     }
                                 };
+                                if let (Some(stats), Some(start)) =
+                                    (parse_perf.as_mut(), lock_start)
+                                {
+                                    stats.finish(Stage::ParseLock, start);
+                                }
+                                let parse_start = PerfStats::start(&parse_perf);
                                 parser.advance(&mut *p, chunk);
+                                if let (Some(stats), Some(start)) =
+                                    (parse_perf.as_mut(), parse_start)
+                                {
+                                    stats.finish(Stage::Parse, start);
+                                    stats.add(Counter::Chunks, 1);
+                                    stats.add(Counter::Bytes, chunk.len() as u64);
+                                }
                                 let pending_events = if p.pending_events.is_empty() {
                                     None
                                 } else {
@@ -432,6 +496,9 @@ impl Pty {
                         }
 
                         if notify_ui {
+                            if let Some(stats) = parse_perf.as_mut() {
+                                stats.add(Counter::Notifications, 1);
+                            }
                             on_data();
                         }
                     }

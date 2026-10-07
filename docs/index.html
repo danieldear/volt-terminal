@@ -24,7 +24,7 @@
       --line-strong: #38383f;
       --ink: #e2e2ea;
       --muted: #9898aa;
-      --quiet: #6e6e80;
+      --quiet: #8b8b9e;
       --amber: #f59e0b;
       --amber-bright: #fbbf24;
       --amber-dim: rgba(245, 158, 11, .14);
@@ -37,6 +37,8 @@
     }
     * { box-sizing: border-box; }
     html { scroll-behavior: smooth; }
+    /* Full-bleed background layers must not widen the page. */
+    html, body { overflow-x: clip; }
     body {
       margin: 0;
       background: var(--black);
@@ -290,6 +292,33 @@
     .status-foot a { color: var(--amber); }
     .status-foot a:hover { color: var(--amber-bright); }
 
+    /* Roadmap */
+    .now-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 56px; margin-bottom: 64px; }
+    .now-grid .next-title { margin: 0 0 14px; }
+    .now-grid .status-table th { width: 30%; }
+    .shipped { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+    .shipped li { position: relative; padding: 9px 0 9px 28px; border-bottom: 1px solid rgba(255, 255, 255, .04); font-size: 14.5px; }
+    .shipped li::before { content: "✓"; position: absolute; left: 2px; color: #34d399; font-weight: 700; }
+    .roadmap { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+    .lane { position: relative; padding: 22px 22px 8px; border: 1px solid var(--line); border-radius: 14px; background: rgba(15, 15, 19, .82); }
+    .lane::before { content: ""; position: absolute; top: -1px; left: 22px; right: 22px; height: 2px; border-radius: 2px; background: var(--lane); }
+    .lane-next { --lane: var(--amber); border-color: rgba(245, 158, 11, .32); box-shadow: 0 24px 60px -30px rgba(245, 158, 11, .35); }
+    .lane-planned { --lane: rgba(245, 158, 11, .45); }
+    .lane-later { --lane: var(--line-strong); }
+    .lane-title { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 600; color: var(--ink); margin-bottom: 8px; }
+    .lane-title::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--lane); }
+    .lane-next .lane-title { color: var(--amber); }
+    .lane-next .lane-title::before { box-shadow: 0 0 0 4px var(--amber-dim); }
+    .item { padding: 14px 0; border-top: 1px solid var(--line); }
+    .item h4 { font-size: 14.5px; font-weight: 600; margin: 0 0 4px; }
+    .item p { margin: 0; color: var(--muted); font-size: 13.5px; line-height: 1.6; }
+    .roadmap-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 28px; }
+    .roadmap-link {
+      display: inline-flex; align-items: center; gap: 10px; padding: 10px 16px; border-radius: 10px;
+      border: 1px solid var(--amber-line); background: var(--amber-dim); color: var(--amber-bright); font-weight: 600; text-decoration: none;
+    }
+    .status-foot a.roadmap-link:hover { background: rgba(245, 158, 11, .22); color: #fff; }
+
     /* Install band */
     .install { background: var(--raised); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
     .install-grid { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, .95fr); gap: clamp(40px, 6vw, 80px); align-items: start; }
@@ -331,6 +360,127 @@
     .foot .brand { color: var(--ink); font-size: 16px; }
     .foot .brand img { width: 26px; height: 26px; }
 
+    /* ── Atmosphere: grain, cell grid, glows ─────────────── */
+    body::after {
+      content: ""; position: fixed; inset: 0; z-index: 50; pointer-events: none; opacity: .05;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 .55 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }
+    header { position: relative; z-index: 2; background: rgba(8, 8, 11, .72); backdrop-filter: blur(10px); }
+    main, footer { position: relative; z-index: 1; }
+    .hero { position: relative; isolation: isolate; }
+    /* Terminal cells: a faint amber grid that fades out around the hero. */
+    .hero::before {
+      content: ""; position: absolute; z-index: -2; inset: -120px -50vw 20% -50vw;
+      background-image:
+        linear-gradient(rgba(245, 158, 11, .07) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(245, 158, 11, .07) 1px, transparent 1px);
+      background-size: 28px 28px;
+      -webkit-mask-image: radial-gradient(ellipse 55% 60% at 50% 30%, #000 25%, transparent 75%);
+      mask-image: radial-gradient(ellipse 55% 60% at 50% 30%, #000 25%, transparent 75%);
+    }
+    /* A slow amber aurora behind the headline. */
+    .hero::after {
+      content: ""; position: absolute; z-index: -1; width: 900px; height: 520px; left: 50%; top: -60px;
+      translate: -50% 0; border-radius: 50%; filter: blur(70px); opacity: .55;
+      background:
+        radial-gradient(closest-side at 30% 45%, rgba(245, 158, 11, .55), transparent),
+        radial-gradient(closest-side at 72% 55%, rgba(234, 88, 12, .40), transparent),
+        radial-gradient(closest-side at 52% 30%, rgba(251, 191, 36, .30), transparent);
+      animation: drift 18s ease-in-out infinite alternate;
+    }
+    @keyframes drift {
+      from { transform: translate(-6%, 0) scale(1); }
+      to { transform: translate(6%, 30px) scale(1.12); }
+    }
+    h1 { background: linear-gradient(180deg, #fff 0%, #f1e6cf 55%, #d8c7a3 100%); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    h1 .caret { -webkit-text-fill-color: initial; }
+    /* The product window: tilted back, glowing, flat on hover. */
+    .shot { position: relative; }
+    .shot::before {
+      content: ""; position: absolute; z-index: -1; inset: 6% 4% -6%;
+      background:
+        radial-gradient(ellipse 55% 60% at 50% 40%, rgba(245, 158, 11, .28), transparent 70%),
+        radial-gradient(ellipse 40% 50% at 15% 85%, rgba(234, 88, 12, .18), transparent 70%),
+        radial-gradient(ellipse 40% 50% at 85% 85%, rgba(251, 191, 36, .14), transparent 70%);
+      filter: blur(40px);
+    }
+    .shot .window {
+      transform: perspective(2400px) rotateX(7deg);
+      transform-origin: 50% 0;
+      transition: transform .7s cubic-bezier(.2, .7, .2, 1), background-color .35s ease, color .35s ease;
+    }
+    .shot:hover .window { transform: none; }
+
+    /* Shortcut band */
+    .keys-band { margin-top: clamp(56px, 7vw, 88px); display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 12px 28px; color: var(--muted); font-size: 13.5px; }
+    .keys-band span { display: inline-flex; align-items: center; gap: 9px; }
+    .keys-band kbd { border-color: var(--amber-line); color: var(--amber-bright); background: rgba(245, 158, 11, .07); }
+
+    /* Feature tiles */
+    .features { position: relative; isolation: isolate; }
+    .features::before {
+      content: ""; position: absolute; z-index: -1; inset: 0 -50vw;
+      background-image: radial-gradient(rgba(245, 158, 11, .13) 1px, transparent 1.3px);
+      background-size: 22px 22px;
+      -webkit-mask-image: linear-gradient(180deg, transparent, #000 25%, #000 70%, transparent);
+      mask-image: linear-gradient(180deg, transparent, #000 25%, #000 70%, transparent);
+    }
+    .tile-group + .tile-group { margin-top: 40px; }
+    .tile-group > h3 { font-size: 14px; font-weight: 600; color: var(--amber); margin-bottom: 16px; }
+    .tile-group > h3::before { content: "# "; color: var(--quiet); }
+    .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
+    .tile {
+      position: relative; padding: 22px 22px 24px; border-radius: 12px;
+      background: linear-gradient(180deg, rgba(255, 255, 255, .035), rgba(255, 255, 255, .01));
+      box-shadow: inset 0 0 0 1px var(--line);
+      transition: box-shadow .25s ease, transform .25s ease;
+    }
+    .tile:hover { box-shadow: inset 0 0 0 1px var(--amber-line), 0 18px 40px -22px rgba(245, 158, 11, .45); transform: translateY(-2px); }
+    .tile .icon {
+      width: 40px; height: 40px; border-radius: 10px; display: grid; place-items: center; margin-bottom: 16px;
+      background: radial-gradient(circle at 30% 25%, rgba(251, 191, 36, .28), rgba(245, 158, 11, .07) 70%);
+      box-shadow: inset 0 0 0 1px var(--amber-line); color: var(--amber-bright);
+    }
+    .tile .icon svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+    .tile h4 { margin: 0 0 6px; font-size: 15.5px; font-weight: 700; letter-spacing: -0.02em; }
+    .tile p { color: var(--muted); font-size: 14px; line-height: 1.65; }
+
+    /* Spotlights: each mock sits in its own colored glow */
+    /* The glow sits on the section, behind whichever side holds the mock
+       (mocks clip their own overflow, so it can't live inside them). */
+    .spotlight { position: relative; }
+    .spotlight::before {
+      content: ""; position: absolute; z-index: -1; top: -22%; bottom: -22%; right: -10%; width: 70%;
+      filter: blur(36px); pointer-events: none;
+      background: radial-gradient(ellipse 62% 58% at 50% 50%, var(--glow, rgba(245, 158, 11, .42)), transparent 75%);
+    }
+    .spotlight.flip::before { right: auto; left: -10%; }
+    .spotlight.glow-green { --glow: rgba(184, 187, 38, .40); }
+    .spotlight.glow-gold { --glow: rgba(234, 88, 12, .40); }
+    .highlights { isolation: isolate; }
+    .spot-text h2 { background: linear-gradient(180deg, #fff, #d9cfbb); -webkit-background-clip: text; background-clip: text; color: transparent; }
+
+    /* Status: platform cards on a hatched band */
+    .status-wrap { position: relative; isolation: isolate; }
+    .status-wrap::before {
+      content: ""; position: absolute; z-index: -1; inset: -40px -50vw;
+      background: repeating-linear-gradient(135deg, rgba(255, 255, 255, .018) 0 1px, transparent 1px 14px);
+      -webkit-mask-image: linear-gradient(180deg, transparent, #000 20%, #000 80%, transparent);
+      mask-image: linear-gradient(180deg, transparent, #000 20%, #000 80%, transparent);
+    }
+
+    /* Install band: amber horizon glow */
+    .install { position: relative; overflow: hidden; isolation: isolate; border-top: 0; }
+    .install::before {
+      content: ""; position: absolute; z-index: -1; left: 50%; bottom: -380px; width: 1400px; height: 620px; translate: -50% 0;
+      border-radius: 50%; filter: blur(60px);
+      background: radial-gradient(closest-side, rgba(245, 158, 11, .26), rgba(234, 88, 12, .08) 60%, transparent);
+    }
+    .install::after {
+      content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+      background: linear-gradient(90deg, transparent, var(--amber-line), transparent);
+    }
+
     /* ── Responsive ──────────────────────────────────────── */
     @media (max-width: 1000px) {
       .hero-text, .section-intro, .spotlight, .spotlight.flip, .install-grid { grid-template-columns: 1fr; gap: 32px; }
@@ -338,6 +488,8 @@
       .spec-group { grid-template-columns: 1fr; gap: 18px; }
       .tab { width: 180px; }
       .next { grid-template-columns: 1fr; gap: 22px; }
+      .now-grid, .roadmap { grid-template-columns: 1fr; gap: 32px; }
+      .roadmap { gap: 16px; }
     }
     @media (max-width: 720px) {
       :root { --page: calc(100% - 32px); }
@@ -367,8 +519,15 @@
       .steps li { padding-left: 48px; }
       .source { padding: 22px 18px; }
     }
+    @media (max-width: 720px) {
+      .shot .window { transform: none; }
+      .hero::after { width: 520px; height: 420px; }
+    }
     @media (prefers-reduced-motion: reduce) {
       html { scroll-behavior: auto; }
+      .hero::after { animation: none; }
+      .shot .window, .tile { transition: none; }
+      .tile:hover { transform: none; }
       .cursor, h1 .caret { animation: none; }
       .window, .window *, .button { transition: none; }
     }
@@ -381,7 +540,7 @@
     <a class="brand" href="#main" aria-label="Volt home"><img src="assets/icon.svg" alt="" width="34" height="34">Volt</a>
     <nav aria-label="Main">
       <a class="optional" href="#features">Features</a>
-      <a class="optional" href="#status">Status</a>
+      <a class="optional" href="#status">Roadmap</a>
       <a href="https://github.com/danieldear/volt-terminal">GitHub</a>
       <a class="button button-primary" href="#install">Download</a>
     </nav>
@@ -458,39 +617,46 @@
           <span class="themes-note">In Volt, choose Theme ▸ Customize Theme… to edit any color with a live preview and save it as your own.</span>
         </figcaption>
       </figure>
+
+      <p class="keys-band" aria-label="Keyboard shortcuts">
+        <span><kbd>⌘ F</kbd>Search everything</span>
+        <span><kbd>⌘ ⇧ A</kbd>Workspace card</span>
+        <span><kbd>⌘ T</kbd>New tab</span>
+        <span><kbd>⌘ D</kbd>Split pane</span>
+        <span><kbd>⌘ ,</kbd>Settings</span>
+      </p>
     </section>
 
     <!-- ── Features ─────────────────────────────────────── -->
-    <section class="page section" id="features" aria-labelledby="features-title">
+    <section class="page section features" id="features" aria-labelledby="features-title">
       <div class="section-intro">
         <h2 id="features-title">Built for a full day in the terminal.</h2>
         <p>A renderer that keeps up with whatever you run, and a look you can make your own.</p>
       </div>
 
-      <div class="spec-group">
+      <div class="tile-group">
         <h3>Performance</h3>
-        <div class="spec-rows">
-          <div class="spec"><div><h4>GPU rendering</h4><p>Text is drawn on the GPU through wgpu: Metal on macOS, Vulkan or OpenGL on Linux. Glyphs are cached and unchanged lines are reused, so heavy output stays smooth.</p></div></div>
-          <div class="spec"><div><h4>Paced to your display</h4><p>Frames are synchronized with the display's refresh rate, so scrolling and redraws don't tear.</p></div></div>
-          <div class="spec"><div><h4>Any monospaced font</h4><p>Nerd Font icons and powerline symbols fall back automatically. Font size, line height and padding are adjustable.</p></div></div>
+        <div class="tiles">
+          <div class="tile"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg></span><h4>GPU rendering</h4><p>Text is drawn on the GPU through wgpu: Metal on macOS, Vulkan or OpenGL on Linux. Glyphs are cached and unchanged lines are reused, so heavy output stays smooth.</p></div>
+          <div class="tile"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4M6 12l2.5-3 3 4 2.5-3L18 12"/></svg></span><h4>Paced to your display</h4><p>Frames are synchronized with the display's refresh rate, so scrolling and redraws don't tear.</p></div>
+          <div class="tile"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 18 8 6l5 12M4.8 14h6.4M17.5 18v-5.5a2.5 2.5 0 1 0-5 0v.5M17.5 15.5c-1.5-1-5-.8-5 1.2 0 1.6 2.5 1.8 5-.2"/></svg></span><h4>Any monospaced font</h4><p>Nerd Font icons and powerline symbols fall back automatically. Font size, line height and padding are adjustable.</p></div>
         </div>
       </div>
 
-      <div class="spec-group">
+      <div class="tile-group">
         <h3>Appearance and settings</h3>
-        <div class="spec-rows">
-          <div class="spec"><div><h4>Five built-in themes</h4><p>Catppuccin Mocha, Tokyo Night Storm, Gruvbox Dark Hard, Nord and Dracula. Switching applies to every window at once.</p></div></div>
-          <div class="spec"><div><h4>Live theme editor</h4><p>Change any of the 22 colors and watch your terminal update as you type. Save the result as your own theme.</p></div></div>
-          <div class="spec"><div><h4>Themes as plain files</h4><p>Saved themes are small TOML files in <code>~/.config/volt/themes</code>, easy to share or keep with your dotfiles.</p></div></div>
-          <div class="spec"><div><h4>One settings file</h4><p>Everything lives in a commented <code>config.toml</code>. Edit it and reload without restarting. Keyboard shortcuts can be remapped there too.</p></div></div>
-          <div class="spec"><div><h4>Your editor, per file type</h4><p>Choose nvim, nano or any editor, per file type. Search results open in it at the matching line, right in the current tab.</p></div></div>
+        <div class="tiles">
+          <div class="tile"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="8.5" cy="9.5" r="1.3"/><circle cx="12" cy="7.5" r="1.3"/><circle cx="15.5" cy="9.5" r="1.3"/><path d="M12 21c-1.5 0-2-1.2-1.4-2.3.7-1.3-.2-2.7-1.7-2.7H7.5"/></svg></span><h4>Five built-in themes</h4><p>Catppuccin Mocha, Tokyo Night Storm, Gruvbox Dark Hard, Nord and Dracula. Switching applies to every window at once.</p></div>
+          <div class="tile"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h7M4 18h5"/><circle cx="16" cy="12" r="2"/><circle cx="12" cy="18" r="2"/><path d="M14 12h6M18 6v0M14 18h6"/></svg></span><h4>Live theme editor</h4><p>Change any of the 22 colors and watch your terminal update as you type. Save the result as your own theme.</p></div>
+          <div class="tile"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg></span><h4>Themes as plain files</h4><p>Saved themes are small TOML files in <code>~/.config/volt/themes</code>, easy to share or keep with your dotfiles.</p></div>
+          <div class="tile"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></span><h4>One settings file</h4><p>Everything lives in a commented <code>config.toml</code>. Edit it and reload without restarting. Keyboard shortcuts can be remapped there too.</p></div>
+          <div class="tile"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg></span><h4>Your editor, per file type</h4><p>Choose nvim, nano or any editor, per file type. Search results open in it at the matching line, right in the current tab.</p></div>
         </div>
       </div>
-
     </section>
 
     <!-- ── Spotlights ───────────────────────────────────── -->
-    <section class="page section" aria-label="Highlights" style="padding-top: 0">
+    <section class="page section highlights" aria-label="Highlights" style="padding-top: 0">
       <div class="spotlight">
         <div class="spot-text">
           <h2>Search the whole project without leaving the prompt.</h2>
@@ -533,7 +699,7 @@ c8a55f0 Split billing routes
         </div>
       </div>
 
-      <div class="spotlight flip">
+      <div class="spotlight flip glow-green">
         <div class="spot-text">
           <h2>Your project's commands, one click away.</h2>
           <p>Save build, test, run and deploy commands in <code>.volt/tasks.toml</code>. They appear as buttons and run right in your current tab, with ✓ or ✗ when they finish if shell integration is on. Enable it for Zsh or Bash from View → Enable Shell Integration (This Tab).</p>
@@ -561,7 +727,7 @@ test tax::eu_rates ... <span class="c2">ok</span><span class="cursor"></span></d
         </div>
       </div>
 
-      <div class="spotlight">
+      <div class="spotlight glow-gold">
         <div class="spot-text">
           <h2>Password prompts are protected automatically.</h2>
           <p>On macOS, when a program asks for a password, Volt turns on Secure Keyboard Entry so other apps can't read what you type, and shows a lock while it's on. You can also switch it on yourself from the Volt menu.</p>
@@ -589,27 +755,70 @@ Password:<span class="cursor"></span></div>
       </div>
     </section>
 
-    <!-- ── Status ───────────────────────────────────────── -->
+    <!-- ── Status & roadmap ─────────────────────────────── -->
     <section class="page section" id="status" aria-labelledby="status-title" style="padding-top: 0">
       <div class="section-intro">
-        <h2 id="status-title">Where Volt is today.</h2>
-        <p>Volt is an early public preview, before version 1.0. Settings and shortcuts may still change between releases.</p>
+        <h2 id="status-title">Status and roadmap.</h2>
+        <p>Volt 0.1.11 is an early public preview. Here is what works in the current release, and what we are building next. Settings and shortcuts may still change before 1.0.</p>
       </div>
-      <table class="status-table">
-        <tbody>
-          <tr><th scope="row">macOS 13 and later</th><td><span class="state">Supported</span>Downloadable builds for Apple silicon. Intel Macs can build from source.</td></tr>
-          <tr><th scope="row">Linux</th><td><span class="state">Supported</span>Builds for x86_64. Copy and paste, the menu bar and secure keyboard entry are macOS-only for now.</td></tr>
-          <tr><th scope="row">Windows</th><td><span class="state no">Not planned</span></td></tr>
-        </tbody>
-      </table>
-      <h3 class="next-title">Coming next</h3>
-      <div class="next">
-        <div><h3>Notarized releases</h3><p>Developer ID signing, so macOS opens Volt without an extra step.</p></div>
-        <div><h3>Wider compatibility</h3><p>More terminal protocols, so every program renders exactly as intended.</p></div>
-        <div><h3>Linux at full parity</h3><p>Copy, paste and menus on Linux, matching the Mac.</p></div>
+
+      <div class="now-grid">
+        <div>
+          <h3 class="next-title">Available today</h3>
+          <ul class="shipped">
+            <li>GPU rendering with a cached glyph atlas</li>
+            <li>Tabs and splits, with colored, reorderable tabs</li>
+            <li>⌘F search across scrollback, files and folders</li>
+            <li>Project tasks from <code>.volt/tasks.toml</code></li>
+            <li>Workspace card for the current folder and Git status</li>
+            <li>Themes and a live theme editor</li>
+            <li>Shell integration: prompt jumps, task status, inherited folders</li>
+            <li>Clickable links, including OSC 8</li>
+            <li>Configurable shortcuts and a per-file-type editor</li>
+            <li>Secure keyboard entry for passwords</li>
+          </ul>
+        </div>
+        <div>
+          <h3 class="next-title">Platforms</h3>
+          <table class="status-table">
+            <tbody>
+              <tr><th scope="row">macOS 13+</th><td><span class="state">Supported</span>Apple silicon builds; Intel from source.</td></tr>
+              <tr><th scope="row">Linux</th><td><span class="state partial">Partial</span>x86_64 builds. Clipboard, menu bar and secure entry are Mac-only for now.</td></tr>
+              <tr><th scope="row">Windows</th><td><span class="state no">Not planned</span></td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
-      <p class="status-foot">Every change to <code>main</code> goes through a pull request and CI: tests, a dependency audit and a secret scan. These checks can't prove Volt is free of vulnerabilities; the <a href="https://github.com/danieldear/volt-terminal/blob/main/docs/publication-security.md">publication review</a> explains their limits.</p>
-      <p class="status-foot">Found a bug or missing something? <a href="https://github.com/danieldear/volt-terminal/issues">Open an issue on GitHub</a>.</p>
+
+      <div class="status-wrap">
+        <div class="roadmap">
+          <div class="lane lane-next">
+            <h3 class="lane-title">Next up</h3>
+            <div class="item"><h4>Linux at full parity</h4><p>Copy and paste, menus and secure entry, matching the Mac.</p></div>
+            <div class="item"><h4>Select command output</h4><p>Pick up a whole command’s output in one action, using shell integration marks.</p></div>
+            <div class="item"><h4>Key sequences</h4><p>Multi-key bindings and key tables on top of today’s single shortcuts.</p></div>
+          </div>
+          <div class="lane lane-planned">
+            <h3 class="lane-title">Planned</h3>
+            <div class="item"><h4>Synchronized output</h4><p>Full-screen apps redraw in one frame, without tearing.</p></div>
+            <div class="item"><h4>Kitty keyboard protocol</h4><p>Precise key reporting for editors and TUIs that ask for it.</p></div>
+            <div class="item"><h4>Clipboard for programs</h4><p>OSC 52 copy with deny, ask or allow per pane. Reads denied by default.</p></div>
+            <div class="item"><h4>Restore your layout</h4><p>Reopen windows, tabs, splits and folders. Never commands or output.</p></div>
+          </div>
+          <div class="lane lane-later">
+            <h3 class="lane-title">Later</h3>
+            <div class="item"><h4>Programming ligatures</h4><p>Shaped runs that keep cursor and selection on cell boundaries.</p></div>
+            <div class="item"><h4>Inline images</h4><p>The Kitty graphics protocol, with bounded decoding and memory.</p></div>
+            <div class="item"><h4>Quick terminal</h4><p>A drop-down terminal on a global shortcut.</p></div>
+            <div class="item"><h4>Accessibility</h4><p>VoiceOver support and broader IME validation.</p></div>
+          </div>
+        </div>
+      </div>
+
+      <p class="status-foot roadmap-foot">
+        <a class="roadmap-link" href="https://github.com/danieldear/volt-terminal/blob/main/docs/ROADMAP.md">Read the full roadmap</a>
+        <span>Missing something? <a href="https://github.com/danieldear/volt-terminal/issues">Open an issue on GitHub</a>.</span>
+      </p>
     </section>
 
     <!-- ── Install ──────────────────────────────────────── -->
@@ -617,7 +826,7 @@ Password:<span class="cursor"></span></div>
       <div class="page section">
         <div class="section-intro">
           <h2 id="install-title">Install Volt.</h2>
-          <p>Download a release for your platform, or build from source. Each release lists SHA-256 checksums in <code>SHA256SUMS.txt</code>. Current macOS archives are ad-hoc signed, not notarized; macOS may block them until you explicitly approve the app.</p>
+          <p>Download a release for your platform, or build from source. Each release lists SHA-256 checksums in <code>SHA256SUMS.txt</code>. New macOS releases require Developer ID signing and Apple notarization before publication. Check the signing status included with your download; older preview archives were ad-hoc signed.</p>
         </div>
         <div class="install-grid">
           <div>
@@ -637,7 +846,7 @@ Password:<span class="cursor"></span></div>
             </li>
             <li>
               <h3>Approve the first launch</h3>
-              <p>After verifying the download and checksum, open Volt. If macOS blocks it, review the warning and use System Settings ▸ Privacy &amp; Security ▸ Open Anyway only if you trust this build. We do not recommend disabling quarantine globally.</p>
+              <p>Verify the download and checksum, then open Volt. The release includes its verified signing status. If macOS warns about an older preview or a damaged download, stop and review the release guidance; do not disable Gatekeeper or quarantine globally.</p>
             </li>
           </ol>
           </div>

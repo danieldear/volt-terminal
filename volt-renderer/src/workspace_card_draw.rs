@@ -186,7 +186,7 @@ impl Renderer {
             }
         }
     }
-    fn card_icon(
+    pub(super) fn card_icon(
         &self,
         bg: &mut Vec<BgVertex>,
         icon: CardIcon,
@@ -296,6 +296,9 @@ impl Renderer {
             ],
             CardIcon::Minimize => &[&[[3., 8.], [13., 8.]]],
             CardIcon::Expand => &[&[[3., 8.], [13., 8.]], &[[8., 3.], [8., 13.]]],
+            CardIcon::Check => &[&[[2., 8.], [6., 12.], [14., 4.]]],
+            CardIcon::ArrowLeft => &[&[[10., 3.], [5., 8.], [10., 13.]]],
+            CardIcon::ArrowRight => &[&[[6., 3.], [11., 8.], [6., 13.]]],
             CardIcon::Close => &[&[[4., 4.], [12., 12.]], &[[12., 4.], [4., 12.]]],
             CardIcon::Refresh => &[
                 &[

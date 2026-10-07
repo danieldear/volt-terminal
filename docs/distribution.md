@@ -96,7 +96,7 @@ Protect release tags and review workflow changes before creating a release.
 notes reflect it. Packaging runs only after validation succeeds. Setting mode
 `notarized` with any missing credentials is an error, not an unsigned release.
 
-## Current public release / external gate
+## Earlier public release and signing readiness
 
 The public [v0.1.10 release](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.10)
 is **ad-hoc signed, not Developer ID signed or notarized**. Gatekeeper may block

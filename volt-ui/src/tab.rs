@@ -297,20 +297,15 @@ impl TerminalPane {
         wake_pending: Arc<AtomicBool>,
         cwd: Option<&Path>,
     ) -> anyhow::Result<Self> {
-        let (pty, performer, event_rx) = Pty::spawn_in(
-            &config.shell.program,
-            &config.shell.args,
-            cols,
-            rows,
-            cwd,
-            move || {
+        let (shell_program, shell_args) = crate::shell_startup::prepare(config)?;
+        let (pty, performer, event_rx) =
+            Pty::spawn_in(&shell_program, &shell_args, cols, rows, cwd, move || {
                 if !wake_pending.swap(true, Ordering::AcqRel) {
                     if let Err(err) = proxy.send_event(VoltEvent::PtyData) {
                         eprintln!("volt-ui: failed to send PtyData event: {err}");
                     }
                 }
-            },
-        )?;
+            })?;
         if let Ok(mut p) = performer.lock() {
             p.set_scrollback_limit(config.terminal.scrollback_lines);
         }
@@ -523,6 +518,7 @@ mod tests {
         assert_eq!(status.tab_status(), TabStatus::Running);
         status.observe_foreground(false);
         assert_eq!(status.last_exit_code, None);
+        assert_eq!(status.tab_status(), TabStatus::Idle);
         status.started();
         status.finished(2);
         assert_eq!(status.tab_status(), TabStatus::Failed);
@@ -530,10 +526,12 @@ mod tests {
         assert_eq!(status.tab_status(), TabStatus::Failed);
         status.started();
         assert_eq!(status.last_exit_code, None);
+        assert_eq!(status.tab_status(), TabStatus::Running);
         status.finished(0);
         assert_eq!(status.tab_status(), TabStatus::Idle);
         status.finished(-1);
         assert_eq!(status.last_exit_code, None);
+        assert_eq!(status.tab_status(), TabStatus::Idle);
     }
 
     #[test]
