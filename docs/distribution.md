@@ -30,12 +30,59 @@ Repository variables:
 - `MACOS_SIGNING_MODE=notarized` (default when absent is `adhoc`)
 - `MACOS_SIGNING_IDENTITY=Developer ID Application: Your Name (TEAMID)`
 
-Repository secrets (set through GitHub settings, not committed files):
+Signing secrets (set through GitHub settings, never committed):
 - `MACOS_CERTIFICATE_P12_BASE64`: base64 PKCS#12 export including private key
 - `MACOS_CERTIFICATE_PASSWORD`
-- `APPLE_API_KEY`: contents of the team App Store Connect `.p8` private key
-- `APPLE_API_KEY_ID`
-- `APPLE_API_ISSUER`
+
+Choose exactly one notarization method:
+
+**Apple Account / app-specific password** (also supported by the local setup):
+- Secrets: `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`
+- Variable: `MACOS_TEAM_ID`
+
+**Team App Store Connect API key**:
+- Secrets: `APPLE_API_KEY` (team `.p8` contents), `APPLE_API_KEY_ID`, `APPLE_API_ISSUER`
+- Leave Apple Account credentials and `MACOS_TEAM_ID` unset for this method.
+
+Partial or mixed credentials fail closed. The Apple Account method stores a
+validated profile in the same disposable CI keychain used for signing, not in a
+runner's default keychain. The local `volt-notary` profile is never exported.
+
+### Secure interactive GitHub setup
+
+1. In Keychain Access, select **My Certificates** and locate the **Developer ID
+   Application** identity used for Volt. Expand it and verify its private key is
+   present. Export **only this identity**, including its private key, as a
+   password-protected `.p12`; do not export the whole keychain. Save outside the
+   checkout in a private location.
+2. From the checkout, run this in your own terminal:
+   ```sh
+   bash scripts/macos/setup_github_signing.sh
+   ```
+   The helper is fixed to `danieldear/volt-terminal`. It asks for the export path,
+   signing identity (automatically detected when unique), team and email, validates notarization through Apple's own
+   secure prompt, and asks for hidden password inputs for the GitHub upload.
+   Export-password verification uses a file descriptor; GitHub secret values go
+   through stdin rather than `gh --body` arguments. No private values enter Git
+   or script output. Never run it with terminal recording enabled or share a
+   screenshot containing credentials.
+3. The helper leaves `MACOS_SIGNING_MODE` unchanged. Merge the updated workflows
+   and signing scripts. Run **macOS signing validation** from main; it forces
+   notarized mode for its own test, verifies the extracted ZIP, and uploads a
+   seven-day validation artifact without publishing or replacing a release:
+   ```sh
+   gh workflow run signing-validation.yml --repo danieldear/volt-terminal --ref main
+   ```
+   Only after this succeeds, enable notarized mode for future release tags:
+   ```sh
+   gh variable set MACOS_SIGNING_MODE --repo danieldear/volt-terminal --body notarized
+   ```
+4. Create a new versioned release from reviewed main. Its macOS job must complete
+   notarization, staple validation and Gatekeeper assessment before packaging.
+   Validate the downloaded ZIP as well. Existing ad-hoc releases are not changed.
+
+If an upload fails midway, secrets may be partially configured; the helper is
+safe to rerun with the same intended inputs. Never commit the export or keychain.
 
 The release job imports into a temporary keychain, grants codesign access only,
 and deletes the keychain/files on exit. It does not change the login/default
@@ -48,19 +95,20 @@ notes reflect it. Packaging runs only after validation succeeds. Setting mode
 
 ## Current public release / external gate
 
-The public [v0.1.8 release](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.8)
-is **ad-hoc signed, not Developer ID signed or notarized**. Its release notes
-and `macos-signing-status.txt` say so explicitly. Gatekeeper may prevent the
-downloaded macOS app from opening. A locally available Developer ID Application
-identity has signed a validation bundle with hardened runtime and a secure
-timestamp, and strict signature verification passed. That local test is **not**
-a notarization result and does not change the published v0.1.8 artifact.
+The public [v0.1.10 release](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.10)
+is **ad-hoc signed, not Developer ID signed or notarized**. Gatekeeper may block
+that downloaded app. Do not relabel an older ad-hoc release as notarized.
 
-The new public repository does not yet have the Apple signing and notarization
-credentials configured. The workflow's real notarization path still needs an
-end-to-end run and an install test using the downloaded artifact before a
-future release can be described as notarized. Do not relabel an older ad-hoc
-release as notarized.
+A separate local validation build (including pending changes) was Developer ID
+signed with hardened runtime and secure timestamp, **Accepted** by Apple's
+notary service, and stapled. Gatekeeper reported `Notarized Developer ID`; the
+packaged ZIP was extracted and its signature, ticket and Gatekeeper assessment
+passed again. Submission: `e2f094d4-c382-441a-b0b5-d9baa5bcf261`.
+
+This proves the local signing/notarization path, not the hosted GitHub release
+path or a downloaded public install. GitHub still needs signing credentials,
+merged workflow support, a successful notarized release run and a downloaded
+artifact install test before the public release can be advertised as notarized.
 
 References:
 - [Apple notarization documentation](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
