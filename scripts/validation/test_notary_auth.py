@@ -6,6 +6,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 AUTH = ROOT / 'scripts/macos/notary_auth.sh'
+KEYCHAIN = ROOT / 'scripts/macos/ci_keychain.sh'
 NAMES = ('APPLE_API_KEY', 'APPLE_API_KEY_ID', 'APPLE_API_ISSUER', 'APPLE_ID',
          'APPLE_APP_SPECIFIC_PASSWORD', 'APPLE_TEAM_ID')
 API = dict(zip(NAMES[:3], ('synthetic-key', 'KEY1234567', 'synthetic-issuer')))
@@ -95,10 +96,80 @@ volt_store_notary_profile
         self.assertIn('interactively', result.stderr)
 
     def test_shell_syntax(self):
-        for script in ('notary_auth.sh', 'ci_sign_app.sh', 'sign_app.sh', 'setup_github_signing.sh'):
+        for script in ('notary_auth.sh', 'ci_keychain.sh', 'ci_sign_app.sh', 'sign_app.sh', 'setup_github_signing.sh'):
             result = subprocess.run(['bash', '-n', str(ROOT / 'scripts/macos' / script)],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ci_search_list_preserves_spaces_and_restores_original_entries(self):
+        script = '''
+security() {
+  if [[ "$*" == 'list-keychains -d user' ]]; then
+    printf '    "/original/login.keychain-db"\n    "/original/path with spaces.keychain-db"\n'
+  else
+    [[ "$1 $2 $3 $4" == 'list-keychains -d user -s' ]] || return 1
+    shift 4
+    printf '<%s>\n' "$@"
+  fi
+}
+SIGNING_KEYCHAIN='/temporary/signing keychain-db'
+volt_capture_keychain_search_list
+volt_add_signing_keychain
+printf 'RESTORE\n'
+volt_restore_keychain_search_list
+'''
+        result = subprocess.run(['bash', '-c', f'set -eu; source "{KEYCHAIN}"; {script}'],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '</temporary/signing keychain-db>\n' +
+                         '</original/login.keychain-db>\n</original/path with spaces.keychain-db>\n'
+                         'RESTORE\n</original/login.keychain-db>\n</original/path with spaces.keychain-db>\n')
+
+    def test_ci_identity_requires_exact_valid_developer_id(self):
+        identity = 'Developer ID Application: Test Developer (TEAM123456)'
+        for detected, valid in ((identity, True), (identity + ' extra', False),
+                                ('Apple Development: Test Developer (TEAM123456)', False),
+                                ('', False)):
+            env = os.environ.copy()
+            env.update(SIGNING_IDENTITY=identity, SIGNING_KEYCHAIN='/temporary/test.keychain-db',
+                       TEST_DETECTED=detected)
+            script = '''
+security() {
+  [[ "$1" == find-identity ]] || return 1
+  if [[ -n "$TEST_DETECTED" ]]; then
+    printf '  1) ABCDEF "%s"\n     1 valid identities found\n' "$TEST_DETECTED"
+  else
+    printf '     0 valid identities found\n'
+  fi
+}
+volt_validate_ci_identity
+'''
+            result = subprocess.run(['bash', '-c', f'set -eu; source "{KEYCHAIN}"; {script}'],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode == 0, valid, result.stderr)
+
+    def test_ci_capture_rejects_unexpected_output(self):
+        result = subprocess.run(['bash', '-c', f'set -eu; source "{KEYCHAIN}"; '
+                                 'security() { echo unexpected; }; volt_capture_keychain_search_list'],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_ci_search_list_can_restore_empty_original_list(self):
+        script = '''
+security() {
+  if [[ "$*" == 'list-keychains -d user' ]]; then return 0; fi
+  [[ "$1 $2 $3 $4" == 'list-keychains -d user -s' ]]
+  if [[ "$#" == 5 ]]; then [[ "$5" == /temporary/test.keychain-db ]];
+  else [[ "$#" == 4 ]]; fi
+}
+SIGNING_KEYCHAIN=/temporary/test.keychain-db
+volt_capture_keychain_search_list
+volt_add_signing_keychain
+volt_restore_keychain_search_list
+'''
+        result = subprocess.run(['bash', '-c', f'set -eu; source "{KEYCHAIN}"; {script}'],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':

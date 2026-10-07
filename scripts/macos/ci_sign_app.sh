@@ -1,5 +1,6 @@
 #!/bin/bash
-# Release jobs only: ephemeral keychain, no changes to login/default keychain.
+# Release jobs only: ephemeral keychain, restored search list; login/default
+# keychain contents and selection remain unchanged.
 set +x
 set -euo pipefail
 app=${1:?usage: ci_sign_app.sh APP}
@@ -11,12 +12,16 @@ case "$mode" in
     : "${MACOS_CERTIFICATE_PASSWORD:?missing certificate password}"
     : "${SIGNING_IDENTITY:?missing Developer ID identity}"
     source scripts/macos/notary_auth.sh
+    source scripts/macos/ci_keychain.sh
     volt_validate_notary_auth
     # Never inherit a runner-local profile or select an unintended auth method.
     unset NOTARYTOOL_PROFILE NOTARYTOOL_KEYCHAIN APPLE_API_KEY_PATH
+    # Capture before create-keychain, which may itself alter the search list.
+    volt_capture_keychain_search_list
     temp=$(mktemp -d)
     export SIGNING_KEYCHAIN="$temp/release.keychain-db"
     cleanup() {
+      volt_restore_keychain_search_list >/dev/null 2>&1 || true
       /usr/bin/security delete-keychain "$SIGNING_KEYCHAIN" >/dev/null 2>&1 || true
       rm -rf "$temp"
     }
@@ -27,10 +32,14 @@ case "$mode" in
     /usr/bin/security create-keychain -p "$password" "$SIGNING_KEYCHAIN"
     /usr/bin/security set-keychain-settings -lut 1800 "$SIGNING_KEYCHAIN"
     /usr/bin/security unlock-keychain -p "$password" "$SIGNING_KEYCHAIN"
+    # codesign still consults the search list even with an explicit --keychain.
+    # Preserve existing entries so Apple's certificate chain remains available.
+    volt_add_signing_keychain
     /usr/bin/security import "$temp/certificate.p12" -k "$SIGNING_KEYCHAIN" \
       -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null
     /usr/bin/security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
       -k "$password" "$SIGNING_KEYCHAIN" >/dev/null
+    volt_validate_ci_identity
     if [[ "$VOLT_NOTARY_AUTH" == api ]]; then
       printf '%s' "$APPLE_API_KEY" > "$temp/notary.p8"
       export APPLE_API_KEY_PATH="$temp/notary.p8"
