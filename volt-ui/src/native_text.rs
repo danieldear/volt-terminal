@@ -1,9 +1,11 @@
-//! Bridge AppKit's out-of-band text insertion (Emoji & Symbols) into Volt.
+//! Route native content-view input into Volt, including Emoji & Symbols.
 //!
 //! winit 0.30 only commits `insertText:replacementRange:` with marked text.
 //! The character picker has no marked text and no keyboard event, so it is
 //! otherwise lost. Subclass only our view; never swizzle all NSViews. Keyboard
 //! and composed input remain owned by winit to avoid inserting text twice.
+//! Custom tabs route titlebar hit-tests to the content view without changing
+//! AppKit's drawing order. Native traffic lights remain above GPU content.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -11,7 +13,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use objc::declare::ClassDecl;
-use objc::runtime::{Class, Object, Sel, BOOL, YES};
+use objc::runtime::{Class, Object, Sel, BOOL, NO, YES};
 use objc::{class, msg_send, sel, sel_impl, Encode, Encoding};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::event_loop::EventLoopProxy;
@@ -20,6 +22,19 @@ use winit::window::{Window, WindowId};
 use crate::app::VoltEvent;
 
 const CLASS_NAME: &str = "VoltNativeTextInputView";
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSPoint {
+    x: f64,
+    y: f64,
+}
+
+unsafe impl Encode for NSPoint {
+    fn encode() -> Encoding {
+        unsafe { Encoding::from_str("{CGPoint=dd}") }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -44,11 +59,13 @@ struct Context {
     window_id: WindowId,
     proxy: EventLoopProxy<VoltEvent>,
     key_depth: Cell<usize>,
+    custom_tab_bar: bool,
 }
 
 thread_local! {
     // Main-thread only. Rc cloning does not clone EventLoopProxy / wake CFRunLoop.
     static CONTEXTS: RefCell<HashMap<usize, Rc<Context>>> = RefCell::default();
+    static CHROME_CONTEXTS: RefCell<HashMap<usize, ChromeContext>> = RefCell::default();
 }
 
 fn context(view: &Object) -> Option<Rc<Context>> {
@@ -62,6 +79,151 @@ fn context(view: &Object) -> Option<Rc<Context>> {
 
 fn forwards_direct_text(key_depth: usize, marked: bool) -> bool {
     key_depth == 0 && !marked
+}
+
+fn native_chrome_contains(x: f64, y: f64) -> bool {
+    // Logical points, matching the renderer's 78-point traffic-light reserve.
+    // WinitView is flipped, so its local y=0 is the top of the window.
+    (0.0..78.0).contains(&x) && (0.0..38.0).contains(&y)
+}
+
+extern "C" fn hit_test(view: &Object, _selector: Sel, point: NSPoint) -> *mut Object {
+    if context(view).is_some_and(|c| c.custom_tab_bar) {
+        let parent: *mut Object = unsafe { msg_send![view, superview] };
+        let local: NSPoint = unsafe { msg_send![view, convertPoint: point fromView: parent] };
+        if native_chrome_contains(local.x, local.y) {
+            // Leave the real traffic lights (and macOS sharing controls) in
+            // AppKit's titlebar. Everything else reaches the content view.
+            return std::ptr::null_mut();
+        }
+    }
+    Class::get(CLASS_NAME)
+        .and_then(Class::superclass)
+        .map_or(std::ptr::null_mut(), |superclass| unsafe {
+            msg_send![super(view, superclass), hitTest: point]
+        })
+}
+
+// An empty, nonopaque NSView routes titlebar input without moving the Metal
+// view or subclassing AppKit-owned frame/titlebar classes. It never draws.
+#[derive(Clone, Copy)]
+struct ChromeContext {
+    content: *mut Object,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSSize {
+    width: f64,
+    height: f64,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSRect {
+    origin: NSPoint,
+    size: NSSize,
+}
+unsafe impl Encode for NSRect {
+    fn encode() -> Encoding {
+        unsafe { Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
+    }
+}
+
+const CHROME_CLASS_NAME: &str = "VoltChromeInputView";
+extern "C" fn chrome_hit_test(overlay: &Object, _selector: Sel, point: NSPoint) -> *mut Object {
+    let route = CHROME_CONTEXTS.with(|contexts| {
+        contexts
+            .borrow()
+            .get(&(overlay as *const Object as usize))
+            .copied()
+    });
+    let Some(route) = route else {
+        return std::ptr::null_mut();
+    };
+    unsafe {
+        let parent: *mut Object = msg_send![overlay, superview];
+        let local: NSPoint = msg_send![route.content, convertPoint: point fromView: parent];
+        if local.x < 78.0 || !(0.0..38.0).contains(&local.y) {
+            return std::ptr::null_mut();
+        }
+        // Preserve native controls beyond the left reserve too (e.g. sharing).
+        // Ask siblings only, never the parent, to avoid recursing into ourselves.
+        let siblings: *mut Object = msg_send![parent, subviews];
+        let count: usize = msg_send![siblings, count];
+        for i in (0..count).rev() {
+            let sibling: *mut Object = msg_send![siblings, objectAtIndex: i];
+            if std::ptr::eq(sibling, overlay) || sibling == route.content {
+                continue;
+            }
+            let hit: *mut Object = msg_send![sibling, hitTest: point];
+            let mut ancestor = hit;
+            while !ancestor.is_null() && ancestor != parent {
+                let control: BOOL = msg_send![ancestor, isKindOfClass: class!(NSControl)];
+                if control == YES {
+                    return std::ptr::null_mut();
+                }
+                ancestor = msg_send![ancestor, superview];
+            }
+        }
+        msg_send![route.content, hitTest: point]
+    }
+}
+
+struct ChromeInput {
+    overlay: *mut Object,
+}
+impl ChromeInput {
+    unsafe fn install(content: *mut Object) -> anyhow::Result<Self> {
+        let parent: *mut Object = msg_send![content, superview];
+        anyhow::ensure!(
+            !parent.is_null(),
+            "content view has no parent for chrome routing"
+        );
+        let subclass = if let Some(class) = Class::get(CHROME_CLASS_NAME) {
+            class
+        } else {
+            let mut decl = ClassDecl::new(CHROME_CLASS_NAME, class!(NSView))
+                .ok_or_else(|| anyhow::anyhow!("cannot register chrome input view"))?;
+            decl.add_method(
+                sel!(hitTest:),
+                chrome_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> *mut Object,
+            );
+            decl.register()
+        };
+        let bounds: NSRect = msg_send![parent, bounds];
+        let overlay: *mut Object = msg_send![subclass, alloc];
+        let overlay: *mut Object = msg_send![overlay, initWithFrame: bounds];
+        anyhow::ensure!(!overlay.is_null(), "cannot create chrome input view");
+        let _: () = msg_send![overlay, setAutoresizingMask: 18usize]; // width + height
+        CHROME_CONTEXTS.with(|contexts| {
+            contexts
+                .borrow_mut()
+                .insert(overlay as usize, ChromeContext { content })
+        });
+        let _: () = msg_send![parent, addSubview: overlay positioned: 1isize relativeTo: std::ptr::null_mut::<Object>()];
+        Ok(Self { overlay })
+    }
+}
+impl Drop for ChromeInput {
+    fn drop(&mut self) {
+        unsafe {
+            CHROME_CONTEXTS.with(|contexts| contexts.borrow_mut().remove(&(self.overlay as usize)));
+            let _: () = msg_send![self.overlay, removeFromSuperview];
+            let _: () = msg_send![self.overlay, release];
+        }
+    }
+}
+
+extern "C" fn mouse_down_can_move_window(view: &Object, _selector: Sel) -> BOOL {
+    if context(view).is_some_and(|c| c.custom_tab_bar) {
+        NO
+    } else {
+        Class::get(CLASS_NAME)
+            .and_then(Class::superclass)
+            .map_or(NO, |superclass| unsafe {
+                msg_send![super(view, superclass), mouseDownCanMoveWindow]
+            })
+    }
 }
 
 extern "C" fn key_down(view: &Object, _selector: Sel, event: *mut Object) {
@@ -145,6 +307,7 @@ extern "C" fn insert_text(view: &Object, _selector: Sel, value: *mut Object, ran
 pub(crate) struct NativeTextInput {
     view: *mut Object,
     original_class: &'static Class,
+    chrome_input: Option<ChromeInput>,
     _window: Arc<Window>,
     _context: Rc<Context>,
 }
@@ -153,6 +316,7 @@ impl NativeTextInput {
     pub(crate) fn install(
         window: Arc<Window>,
         proxy: EventLoopProxy<VoltEvent>,
+        custom_tab_bar: bool,
     ) -> anyhow::Result<Self> {
         let is_main: BOOL = unsafe { msg_send![class!(NSThread), isMainThread] };
         anyhow::ensure!(
@@ -176,6 +340,14 @@ impl NativeTextInput {
                 .ok_or_else(|| anyhow::anyhow!("cannot register native text input view"))?;
             unsafe {
                 declaration.add_method(
+                    sel!(hitTest:),
+                    hit_test as extern "C" fn(&Object, Sel, NSPoint) -> *mut Object,
+                );
+                declaration.add_method(
+                    sel!(mouseDownCanMoveWindow),
+                    mouse_down_can_move_window as extern "C" fn(&Object, Sel) -> BOOL,
+                );
+                declaration.add_method(
                     sel!(insertText:),
                     insert_text_legacy as extern "C" fn(&Object, Sel, *mut Object),
                 );
@@ -194,15 +366,23 @@ impl NativeTextInput {
             window_id: window.id(),
             proxy,
             key_depth: Cell::new(0),
+            custom_tab_bar,
         });
+        // Install chrome routing before replacing the content class so a failed
+        // installation leaves both the original view and context map untouched.
+        let chrome_input = if custom_tab_bar {
+            Some(unsafe { ChromeInput::install(view)? })
+        } else {
+            None
+        };
         CONTEXTS.with(|contexts| contexts.borrow_mut().insert(view as usize, context.clone()));
-        // No ivars are added: the subclass has exactly the original layout.
         unsafe {
             object_setClass(view, subclass);
         }
         Ok(Self {
             view,
             original_class,
+            chrome_input,
             _window: window,
             _context: context,
         })
@@ -211,6 +391,8 @@ impl NativeTextInput {
 
 impl Drop for NativeTextInput {
     fn drop(&mut self) {
+        // Remove frame routing while the content view and window are still alive.
+        self.chrome_input.take();
         CONTEXTS.with(|contexts| contexts.borrow_mut().remove(&(self.view as usize)));
         // The retained Window keeps view valid during restoration. Don't undo
         // another component's later subclass if one was installed on top of us.
@@ -225,6 +407,15 @@ impl Drop for NativeTextInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traffic_lights_keep_native_input_but_tabs_do_not() {
+        assert!(native_chrome_contains(20.0, 18.0));
+        assert!(native_chrome_contains(77.99, 37.99));
+        assert!(!native_chrome_contains(78.0, 18.0));
+        assert!(!native_chrome_contains(20.0, 38.0));
+        assert!(!native_chrome_contains(-1.0, 18.0));
+    }
 
     #[test]
     fn only_out_of_band_unmarked_text_is_forwarded() {

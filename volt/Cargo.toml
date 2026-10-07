@@ -22,3 +22,6 @@ anyhow = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 volt-ui = { path = "../volt-ui" }
 volt-config = { path = "../volt-config" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

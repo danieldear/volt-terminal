@@ -14,11 +14,11 @@ in Rust, for macOS and Linux.
 
 > ⚠️ **Early development.** Volt is functional on macOS, but it has not been validated as a daily driver; APIs and config formats may change before v1.0.
 
-**Public preview (October 2026):** [Volt v0.1.10](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.10)
-is available with macOS and Linux archives and SHA-256 checksums. The macOS
-archive is **ad-hoc signed, not Developer ID signed or notarized**. macOS
-Gatekeeper may prevent it from opening; a notarized public build is planned,
-not yet released. You can also [build from source](#building-from-source).
+**Public preview (October 2026):** [Volt v0.1.11](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.11)
+includes macOS and Linux archives with SHA-256 checksums. The macOS release
+workflow requires **Developer ID signing, Apple notarization and a stapled
+ticket** before publication. Check the release's `macos-signing-status.txt`
+for its verified signing mode. You can also [build from source](#building-from-source).
 
 ---
 
@@ -26,12 +26,12 @@ not yet released. You can also [build from source](#building-from-source).
 
 - **GPU-accelerated rendering** — Metal-backed via `wgpu`, smooth at any size
 - **VTE-based parsing** — common ANSI/xterm sequences; advanced DCS and some OSC features remain unsupported
-- **Tabs + pane splits** — a flat tab bar with color-tinted tabs, drag-to-reorder, split right/left/up/down, drag-resizable dividers
+- **Tabs + pane splits** — a flat tab bar with color-tinted tabs, drag-to-reorder, split right/left/up/down, drag-resizable dividers. Small status lights stay separate from tab colors: a gray ring when idle, green while busy, red after a shell-reported failure.
 - **Full mouse support** — click, scroll, Shift-click extension, drag selection with edge auto-scroll through retained history, double-click word / triple-click line select
 - **Native macOS menu bar** — File/Edit/View/Window menus and a dynamic Services submenu; keyboard shortcuts are handled by Volt, not menu-item accelerators
 - **Native right-click context menu** — Copy/Paste, split in any direction, reset terminal, read-only toggle, rename tab/terminal, and choose a tab color
 - **Project tasks** — one-click build/run/test commands per project in `.volt/tasks.toml`, run in the current tab with ✓ / ✗ status. Add them from a form or import suggestions from your project files; shared task files are reviewed before anything runs. [Details](#project-tasks)
-- **Your editor** — set nvim, nano or any editor per file type in `[editor]`; search results open in it at the matching line, and `Cmd+,` opens the settings in it. [Details](#configuration)
+- **Your editor** — set nvim, nano or any editor per file type in `[editor]`; search results open in it at the matching line, and advanced configuration can still be opened in it. [Details](#configuration)
 - **Search** (`Cmd+F`) — one local search box for this terminal's full scrollback and the project's file names, file contents, terminal output, branches, worktrees and tasks, with matches highlighted as you type. Enter opens files in your editor, at the matching line, or jumps to matching output. [Scope and limits](docs/workspace-search.md).
 - **In-terminal Find** — Enter on an output result highlights every match in the terminal; Enter / Shift+Enter step between them (capped at 100,000 matches)
 - **Alternate screen buffer** — vim, htop, etc. work correctly
@@ -107,10 +107,11 @@ Pushing a `v*` tag runs the release workflow. It builds and uploads:
 - a macOS `Volt.app` zip archive
 - `SHA256SUMS.txt`
 
-The public [v0.1.10 release](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.10)
-is ad-hoc signed on macOS, **not notarized**. The workflow defaults to that
-mode until Apple credentials are configured; it never silently substitutes an
-ad-hoc build for a requested notarized build. See [distribution setup](docs/distribution.md).
+The repository's macOS release workflow is configured for **notarized** builds:
+Developer ID signing, hardened runtime, Apple acceptance, staple validation and
+Gatekeeper assessment must pass before packaging. It never silently substitutes
+an ad-hoc build when notarization fails. Older v0.1.10 archives remain ad-hoc
+signed. See [distribution setup](docs/distribution.md).
 Release notes and `macos-signing-status.txt` identify the actual mode for each
 release. Verify downloads against the accompanying `SHA256SUMS.txt`.
 
@@ -118,11 +119,24 @@ release. Verify downloads against the accompanying `SHA256SUMS.txt`.
 
 ## Configuration
 
-Volt reads `~/.config/volt/config.toml`. Press **`Cmd+,`** (or Volt ▸
-Settings…) to open it in your `[editor]` (or the system's default app if none
-is set) — the file is written with fully-commented defaults the first time you
-do this. Press **`Cmd+Shift+R`**
-(or Volt ▸ Reload Settings) to reload without restarting.
+Volt reads `~/.config/volt/config.toml` (or `$XDG_CONFIG_HOME/volt/config.toml`).
+Press **`Cmd+,`** (Volt ▸ Settings…) for the graphical settings panel. Theme,
+font, spacing and transparency preview live. **Apply** saves; **Cancel / Esc**
+restores the previous appearance. The panel also covers shell/prompt selection,
+terminal behavior, workspace placement, project-task access and shortcuts.
+**Open config** keeps manual editing available through your configured editor.
+Press **`Cmd+Shift+R`** to reload external edits without restarting.
+
+A fresh installation opens a skippable introduction: appearance, shortcuts,
+tasks and shell setup. Existing configurations keep their current prompt and
+aren't automatically enrolled. Reopen it through **Help ▸ Getting Started…**.
+Meow is bundled for Bash, Zsh and Fish; choose **Existing** to retain your own
+prompt. Volt does not edit `.zshrc`, `.bashrc` or Fish configuration files.
+Shell changes affect new tabs/panes, never restart running jobs.
+
+See [Settings and first-run setup](docs/settings.md) for controls, persistence,
+shell compatibility and testing. Settings, onboarding and bundled Meow are
+included starting with v0.1.11.
 
 ```toml
 # Volt Terminal — Configuration
@@ -138,6 +152,8 @@ size = 14.0
 [shell]
 program = "/bin/zsh"
 args = ["-l"]
+prompt = "existing" # existing | meow
+integration = false # automatic app-scoped hooks in new shells
 
 [appearance]
 padding = 8

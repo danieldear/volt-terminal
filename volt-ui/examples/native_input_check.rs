@@ -46,22 +46,107 @@ fn main() {
                 return;
             }
             // Repeated installation exercises reuse of the registered subclass.
-            for _ in 0..3 {
-                let window = Arc::new(
-                    event_loop
-                        .create_window(Window::default_attributes().with_visible(false))
-                        .unwrap(),
-                );
+            for custom_tab_bar in [false, true, true] {
+                use winit::platform::macos::WindowAttributesExtMacOS;
+                let mut attributes = Window::default_attributes().with_visible(false);
+                if custom_tab_bar {
+                    attributes = attributes
+                        .with_titlebar_transparent(true)
+                        .with_title_hidden(true)
+                        .with_fullsize_content_view(true);
+                }
+                let window = Arc::new(event_loop.create_window(attributes).unwrap());
                 let RawWindowHandle::AppKit(handle) = window.window_handle().unwrap().as_raw()
                 else {
                     unreachable!()
                 };
                 let view = handle.ns_view.as_ptr().cast::<Object>();
                 let original = unsafe { (&*view).class() };
-                let bridge =
-                    native_text::NativeTextInput::install(window.clone(), self.proxy.clone())
-                        .unwrap();
+                let original_move: objc::runtime::BOOL =
+                    unsafe { msg_send![view, mouseDownCanMoveWindow] };
+                let parent: *mut Object = unsafe { msg_send![view, superview] };
+                let original_parent_class = unsafe { (&*parent).class() };
+                let original_siblings: Vec<*mut Object> = unsafe {
+                    let subviews: *mut Object = msg_send![parent, subviews];
+                    let count: usize = msg_send![subviews, count];
+                    (0..count)
+                        .map(|i| msg_send![subviews, objectAtIndex: i])
+                        .collect()
+                };
+                let original_top: *mut Object = unsafe {
+                    let subviews: *mut Object = msg_send![parent, subviews];
+                    msg_send![subviews, lastObject]
+                };
+                let bridge = native_text::NativeTextInput::install(
+                    window.clone(),
+                    self.proxy.clone(),
+                    custom_tab_bar,
+                )
+                .unwrap();
                 assert_ne!(unsafe { (&*view).class() }, original);
+                unsafe {
+                    #[repr(C)]
+                    #[derive(Clone, Copy)]
+                    struct Point(f64, f64);
+                    unsafe impl objc::Encode for Point {
+                        fn encode() -> objc::Encoding {
+                            unsafe { objc::Encoding::from_str("{CGPoint=dd}") }
+                        }
+                    }
+                    let movable: objc::runtime::BOOL = msg_send![view, mouseDownCanMoveWindow];
+                    let subviews: *mut Object = msg_send![parent, subviews];
+                    let top: *mut Object = msg_send![subviews, lastObject];
+                    if custom_tab_bar {
+                        assert_eq!(movable, objc::runtime::NO);
+                        assert_ne!(
+                            top, view,
+                            "GPU content must stay behind native traffic lights"
+                        );
+                        assert_eq!(
+                            (&*parent).class(),
+                            original_parent_class,
+                            "AppKit-owned frame must not be subclassed"
+                        );
+                        let opaque: objc::runtime::BOOL = msg_send![top, isOpaque];
+                        assert_eq!(opaque, objc::runtime::NO);
+                        for (i, expected) in original_siblings.iter().enumerate() {
+                            let sibling: *mut Object = msg_send![subviews, objectAtIndex: i];
+                            assert_eq!(sibling, *expected, "original native drawing order changed");
+                        }
+                        let p: Point =
+                            msg_send![view, convertPoint: Point(110.0, 18.0) toView: parent];
+                        let hit: *mut Object = msg_send![parent, hitTest: p];
+                        assert_eq!(hit, view, "tab-center hit still goes to native titlebar");
+                        let p: Point =
+                            msg_send![view, convertPoint: Point(20.0, 18.0) toView: parent];
+                        let hit: *mut Object = msg_send![view, hitTest: p];
+                        assert!(
+                            hit.is_null(),
+                            "traffic-light area intercepted by content view"
+                        );
+                        let ns_window: *mut Object = msg_send![view, window];
+                        for button_kind in 0usize..3 {
+                            let button: *mut Object =
+                                msg_send![ns_window, standardWindowButton: button_kind];
+                            assert!(!button.is_null());
+                            let local: Point =
+                                msg_send![view, convertPoint: Point(7.0, 7.0) fromView: button];
+                            let p: Point = msg_send![view, convertPoint: local toView: parent];
+                            let hit: *mut Object = msg_send![parent, hitTest: p];
+                            assert_eq!(
+                                hit, button,
+                                "native traffic-light button no longer receives hits"
+                            );
+                            let hidden: objc::runtime::BOOL = msg_send![button, isHidden];
+                            let alpha: f64 = msg_send![button, alphaValue];
+                            assert_eq!(hidden, objc::runtime::NO);
+                            assert_eq!(alpha, 1.0, "native button was dimmed by custom chrome");
+                        }
+                    } else {
+                        assert_eq!(movable, original_move, "native view drag policy changed");
+                        assert_eq!(top, original_top, "native window view order changed");
+                    }
+                }
                 for text in ["😀", "👍🏽", "👩‍💻", "🇮🇳", "❤️"] {
                     unsafe {
                         let string: *mut Object = msg_send![class!(NSString), alloc];
@@ -109,8 +194,15 @@ fn main() {
                         let _: () = msg_send![chars, release];
                     }
                 }
+                window.set_title("Updated directory — 😀");
                 drop(bridge);
                 assert_eq!(unsafe { (&*view).class() }, original);
+                assert_eq!(unsafe { (&*parent).class() }, original_parent_class);
+                unsafe {
+                    let subviews: *mut Object = msg_send![parent, subviews];
+                    let top: *mut Object = msg_send![subviews, lastObject];
+                    assert_eq!(top, original_top, "input overlay was not removed on drop");
+                }
                 self.windows.push(window);
             }
         }
@@ -152,7 +244,7 @@ fn main() {
     assert_eq!(check.received, 30);
     assert_eq!(check.keyboard_received, 6);
     assert!(check.expected.is_empty());
-    println!("PASS: 30 native insertions, 3 window identities, NSString + NSAttributedString, both selectors, 6 nonduplicated keyboard inputs, subclass restoration");
+    println!("PASS: custom/native tab hit routing, unchanged native drawing order and all 3 traffic lights, 30 native insertions, 3 window identities, NSString + NSAttributedString, both selectors, 6 nonduplicated keyboard inputs, subclass restoration");
 }
 
 #[cfg(not(target_os = "macos"))]

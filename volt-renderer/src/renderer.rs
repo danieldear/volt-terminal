@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ use crate::atlas::CpuAtlas;
 use crate::pipeline::{bg_pipeline, glyph_pipeline, BgVertex, GlyphVertex};
 use volt_config::{CursorStyle, Theme};
 use volt_core::cell::CellColor;
+use volt_core::diagnostics::{Counter, PerfStats, Stage};
 use volt_core::grid::Grid;
 
 use crate::tab_color::TabColor;
@@ -33,6 +35,21 @@ const TAB_BAR_TAB_BOTTOM_INSET: f32 = 4.0;
 const TAB_BAR_BUTTON_INSET: f32 = 4.0;
 const TAB_BAR_BUTTON_PADDING: f32 = 5.0;
 
+// Constant samples keep the tiny tab lights independent of fonts and avoid
+// per-frame trigonometry. Also shared by the rounded HUD backgrounds.
+const QUARTER_CIRCLE: [(f32, f32); 7] = [
+    (1.0, 0.0),
+    (0.965_925_8, 0.258_819_04),
+    (0.866_025_4, 0.5),
+    (
+        std::f32::consts::FRAC_1_SQRT_2,
+        std::f32::consts::FRAC_1_SQRT_2,
+    ),
+    (0.5, 0.866_025_4),
+    (0.258_819_04, 0.965_925_8),
+    (0.0, 1.0),
+];
+
 /// Positioned glyph from a shaped Buffer run — everything needed to place it
 /// in the atlas and emit vertices, WITHOUT the colour (which varies per cell).
 #[derive(Clone)]
@@ -43,6 +60,36 @@ struct CachedGlyph {
     glyph_y: i32,
     /// Baseline y within the cell (physical pixels).
     line_y: f32,
+}
+
+/// Split styles from the owned text key so cache hits can borrow `str`.
+/// Retain randomized hashing for untrusted terminal text.
+struct StyledTextCache<T> {
+    styles: [HashMap<Box<str>, T>; 4],
+}
+impl<T> StyledTextCache<T> {
+    fn new() -> Self {
+        Self {
+            styles: std::array::from_fn(|_| HashMap::new()),
+        }
+    }
+    fn style(bold: bool, italic: bool) -> usize {
+        usize::from(bold) | (usize::from(italic) << 1)
+    }
+    fn get(&self, text: &str, bold: bool, italic: bool) -> Option<&T> {
+        self.styles[Self::style(bold, italic)].get(text)
+    }
+    fn insert(&mut self, text: &str, bold: bool, italic: bool, value: T) {
+        self.styles[Self::style(bold, italic)].insert(text.into(), value);
+    }
+    fn len(&self) -> usize {
+        self.styles.iter().map(HashMap::len).sum()
+    }
+    fn clear(&mut self) {
+        for cache in &mut self.styles {
+            cache.clear();
+        }
+    }
 }
 
 /// Match cosmic-text's Buffer::draw placement: the shaped physical offsets
@@ -349,10 +396,13 @@ pub struct Renderer {
     /// Theme editor panel; drawn in the top layer, above the search palette.
     pub theme_editor: Option<crate::theme_editor::ThemeEditorView>,
     theme_editor_cache: Option<theme_editor_draw::EditorGeometry>,
+    pub settings: Option<crate::settings::SettingsView>,
+    settings_cache: Option<settings_draw::SettingsGeometry>,
     pub task_form: Option<crate::task_form::TaskFormView>,
     /// Task buttons where the workspace card sits while it's closed.
     pub task_strip: Option<crate::task_strip::TaskStripView>,
     task_form_cache: Option<task_form_draw::FormGeometry>,
+    task_strip_cache: Option<task_strip_draw::StripGeometry>,
     row_cache: Vec<CachedRow>,
     cache_context: Option<([f32; 8], Theme, CursorStyle)>,
     row_cache_enabled: bool,
@@ -386,10 +436,11 @@ pub struct Renderer {
     pub padding: f32,
     pub line_height: f32,
     /// Per-character shape cache: avoids re-shaping the same glyph every frame.
-    /// Per-character shape cache: avoids re-shaping the same glyph every frame.
     /// Keyed by (char, bold, italic); cleared when font family/size/scale changes.
     shape_cache: HashMap<(char, bool, bool), Vec<CachedGlyph>>,
-    extended_shape_cache: HashMap<(String, bool, bool), Vec<CachedGlyph>>,
+    // ASCII has a bounded alphabet: direct lookup avoids hashing hot glyphs.
+    ascii_shape_cache: Box<[Option<Vec<CachedGlyph>>; 128 * 4]>,
+    extended_shape_cache: StyledTextCache<Vec<CachedGlyph>>,
     symbol_font_family: Option<String>,
     top_alert: Option<String>,
     /// True only when macOS confirmed Secure Event Input is enabled.
@@ -398,11 +449,23 @@ pub struct Renderer {
     bg_vertex_capacity: usize,
     glyph_vertex_buffer: wgpu::Buffer,
     glyph_vertex_capacity: usize,
+    perf: Option<PerfStats>,
     frame_bg_verts: Vec<BgVertex>,
     frame_glyph_verts: Vec<GlyphVertex>,
 }
 
 impl Renderer {
+    /// Snapshot timing includes performer-lock waiting; separate parser-lock
+    /// timing makes contention visible. Disabled mode never reads the clock.
+    pub fn snapshot_timer(&self) -> Option<std::time::Instant> {
+        PerfStats::start(&self.perf)
+    }
+    pub fn finish_snapshot(&mut self, start: Option<std::time::Instant>) {
+        if let (Some(stats), Some(start)) = (self.perf.as_mut(), start) {
+            stats.finish(Stage::Snapshot, start);
+        }
+    }
+
     fn glyph_layout_metrics(font_size_phys: f32, line_height: f32) -> Metrics {
         Metrics::new(font_size_phys, font_size_phys * line_height)
     }
@@ -743,9 +806,12 @@ impl Renderer {
             workspace_card_cache: None,
             theme_editor: None,
             theme_editor_cache: None,
+            settings: None,
+            settings_cache: None,
             task_form: None,
             task_strip: None,
             task_form_cache: None,
+            task_strip_cache: None,
             tab_bar_height,
             custom_tab_bar: true,
             scale_factor,
@@ -759,7 +825,8 @@ impl Renderer {
             padding,
             line_height,
             shape_cache: HashMap::new(),
-            extended_shape_cache: HashMap::new(),
+            ascii_shape_cache: Box::new(std::array::from_fn(|_| None)),
+            extended_shape_cache: StyledTextCache::new(),
             symbol_font_family,
             top_alert: None,
             secure_input_active: false,
@@ -767,6 +834,7 @@ impl Renderer {
             bg_vertex_capacity: INITIAL_BG_VERT_CAPACITY,
             glyph_vertex_buffer,
             glyph_vertex_capacity: INITIAL_GLYPH_VERT_CAPACITY,
+            perf: PerfStats::from_env("renderer"),
             frame_bg_verts: Vec::with_capacity(INITIAL_BG_VERT_CAPACITY),
             frame_glyph_verts: Vec::with_capacity(INITIAL_GLYPH_VERT_CAPACITY),
         })
@@ -936,7 +1004,10 @@ impl Renderer {
         self.search_palette_cache = None;
         self.theme_editor_cache = None;
         self.task_form_cache = None;
+        self.settings_cache = None;
+        self.task_strip_cache = None;
         self.shape_cache.clear();
+        self.ascii_shape_cache.fill(None);
         self.extended_shape_cache.clear();
         self.row_cache.clear();
     }
@@ -1261,22 +1332,10 @@ impl Renderer {
         ];
         // Unit quarter-circle samples. Keeping these constant avoids trig on
         // every frame while Secure Event Input is active.
-        const ARC: [(f32, f32); 7] = [
-            (1.0, 0.0),
-            (0.965_925_8, 0.258_819_04),
-            (0.866_025_4, 0.5),
-            (
-                std::f32::consts::FRAC_1_SQRT_2,
-                std::f32::consts::FRAC_1_SQRT_2,
-            ),
-            (0.5, 0.866_025_4),
-            (0.258_819_04, 0.965_925_8),
-            (0.0, 1.0),
-        ];
         let mut first = None;
         let mut previous = None;
         for (corner, (cx, cy)) in corners.into_iter().enumerate() {
-            for (c, s) in ARC {
+            for (c, s) in QUARTER_CIRCLE {
                 let (dx, dy) = match corner {
                     0 => (-c, -s), // top-left: left to top
                     1 => (s, -c),  // top-right: top to right
@@ -1305,6 +1364,45 @@ impl Renderer {
                 BgVertex { pos: last, color },
                 BgVertex { pos: first, color },
             ]);
+        }
+    }
+
+    /// An actual annulus, not a filled circle with its center painted over:
+    /// the idle light preserves active-tab tint and window transparency.
+    fn draw_circle_outline(
+        &self,
+        bg: &mut Vec<BgVertex>,
+        center: [f32; 2],
+        radius: f32,
+        stroke: f32,
+        color: [f32; 4],
+    ) {
+        let inner = (radius - stroke).max(0.0);
+        for quadrant in 0..4 {
+            for pair in QUARTER_CIRCLE.windows(2) {
+                let point = |(c, s): (f32, f32), r: f32| {
+                    let (x, y) = match quadrant {
+                        0 => (c, s),
+                        1 => (-s, c),
+                        2 => (-c, -s),
+                        _ => (s, -c),
+                    };
+                    [center[0] + r * x, center[1] + r * y]
+                };
+                let a = point(pair[0], radius);
+                let b = point(pair[1], radius);
+                let c = point(pair[0], inner);
+                let d = point(pair[1], inner);
+                for p in [a, b, c, b, d, c] {
+                    bg.push(BgVertex {
+                        pos: [
+                            p[0] / self.config.width as f32 * 2.0 - 1.0,
+                            1.0 - p[1] / self.config.height as f32 * 2.0,
+                        ],
+                        color,
+                    });
+                }
+            }
         }
     }
 
@@ -1594,6 +1692,8 @@ impl Renderer {
             self.search_palette_cache = None;
             self.theme_editor_cache = None;
             self.task_form_cache = None;
+            self.settings_cache = None;
+            self.task_strip_cache = None;
             self.row_cache.clear();
         }
         if self.extended_shape_cache.len() > 4096 {
@@ -1602,19 +1702,41 @@ impl Renderer {
         if self.shape_cache.len() > 65_536 {
             self.shape_cache.clear();
         }
+        let drawable_start = PerfStats::start(&self.perf);
         let output = if let Some(surface) = self.surface.as_ref() {
             match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(o)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(o) => Some(o),
-                wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                    surface.configure(&self.device, &self.config);
+                failed => {
+                    if let Some(stats) = self.perf.as_mut() {
+                        let counter = match failed {
+                            wgpu::CurrentSurfaceTexture::Timeout => Counter::SurfaceTimeout,
+                            wgpu::CurrentSurfaceTexture::Occluded => Counter::SurfaceOccluded,
+                            wgpu::CurrentSurfaceTexture::Outdated => Counter::SurfaceOutdated,
+                            wgpu::CurrentSurfaceTexture::Lost => Counter::SurfaceLost,
+                            _ => Counter::SurfaceValidation,
+                        };
+                        stats.add(counter, 1);
+                        if let Some(start) = drawable_start {
+                            stats.finish(Stage::Drawable, start);
+                        }
+                    }
+                    if matches!(
+                        failed,
+                        wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated
+                    ) {
+                        surface.configure(&self.device, &self.config);
+                    }
                     return;
                 }
-                _ => return,
             }
         } else {
             None
         };
+        if let (Some(stats), Some(start)) = (self.perf.as_mut(), drawable_start) {
+            stats.finish(Stage::Drawable, start);
+        }
+        let geometry_start = PerfStats::start(&self.perf);
         let texture = output
             .as_ref()
             .map(|o| &o.texture)
@@ -1892,13 +2014,12 @@ impl Renderer {
                     }
                     continue;
                 }
-                let cache_key = (c, cell.bold, cell.italic);
-                let extended_key = extended.map(|text| (text.to_string(), cell.bold, cell.italic));
-                if let Some(key) = extended_key.as_ref() {
-                    if !self.extended_shape_cache.contains_key(key) {
-                        let glyphs = Self::shape_text(
+                let glyph_infos: Cow<'_, [CachedGlyph]> = if let Some(text) = extended {
+                    match self.extended_shape_cache.get(text, cell.bold, cell.italic) {
+                        Some(glyphs) => Cow::Borrowed(glyphs),
+                        None => Cow::Owned(Self::shape_text(
                             &mut self.font_system,
-                            &key.0,
+                            text,
                             metrics,
                             cw,
                             ch,
@@ -1907,35 +2028,36 @@ impl Renderer {
                             &mut self.swash_cache,
                             cell.bold,
                             cell.italic,
-                        );
-                        self.extended_shape_cache.insert(key.clone(), glyphs);
+                        )),
                     }
-                } else if !self.shape_cache.contains_key(&cache_key) {
-                    let glyphs = Self::shape_char(
-                        &mut self.font_system,
-                        c,
-                        metrics,
-                        cw,
-                        ch,
-                        &fam_name,
-                        self.symbol_font_family.as_deref(),
-                        &mut self.swash_cache,
-                        cell.bold,
-                        cell.italic,
-                    );
-                    self.shape_cache.insert(cache_key, glyphs);
-                }
-
-                let glyph_infos = match extended_key
-                    .as_ref()
-                    .and_then(|key| self.extended_shape_cache.get(key))
-                    .or_else(|| self.shape_cache.get(&cache_key))
-                {
-                    Some(v) => v,
-                    None => continue,
+                } else {
+                    let shape = || {
+                        Self::shape_char(
+                            &mut self.font_system,
+                            c,
+                            metrics,
+                            cw,
+                            ch,
+                            &fam_name,
+                            self.symbol_font_family.as_deref(),
+                            &mut self.swash_cache,
+                            cell.bold,
+                            cell.italic,
+                        )
+                    };
+                    let glyphs = if c.is_ascii() {
+                        let index =
+                            c as usize * 4 + StyledTextCache::<()>::style(cell.bold, cell.italic);
+                        self.ascii_shape_cache[index].get_or_insert_with(shape)
+                    } else {
+                        self.shape_cache
+                            .entry((c, cell.bold, cell.italic))
+                            .or_insert_with(shape)
+                    };
+                    Cow::Borrowed(glyphs)
                 };
 
-                for gi in glyph_infos {
+                for gi in glyph_infos.iter() {
                     let Some(region) = self.atlas.get_or_rasterize(
                         gi.cache_key,
                         &mut self.font_system,
@@ -1957,6 +2079,12 @@ impl Renderer {
                     let gx = Self::snap_to_pixel(gx);
                     let gy = Self::snap_to_pixel(gy);
                     append_glyph_quad(&mut glyph_verts, sw, sh, gx, gy, region, color);
+                }
+                // Move missed shapes into the cache after drawing. Hits do
+                // not allocate text or clone glyphs, and use one lookup.
+                if let (Some(text), Cow::Owned(glyphs)) = (extended, glyph_infos) {
+                    self.extended_shape_cache
+                        .insert(text, cell.bold, cell.italic, glyphs);
                 }
             }
             let cached = &mut self.row_cache[row];
@@ -2060,16 +2188,26 @@ impl Renderer {
                 }
 
                 // Status stays independent of the user's tab accent: green
-                // while running, red on a reported error, blank when idle.
+                // while running, red on a reported error, a neutral ring idle.
                 let d = 7.0 * sc;
                 let (dx, dy) = (tx + 12.0 * sc, tab_y + (tab_h - d) / 2.0);
-                let status_color = match tab.status {
-                    TabStatus::Idle => None,
-                    TabStatus::Running => Some(theme.ansi[2].to_f32()),
-                    TabStatus::Failed => Some(theme.ansi[1].to_f32()),
-                };
-                if let Some(color) = status_color {
-                    self.draw_rounded_rect(&mut bg_verts, dx, dy, d, d, d / 2.0, color);
+                match tab.status {
+                    TabStatus::Idle => self.draw_circle_outline(
+                        &mut bg_verts,
+                        [dx + d / 2.0, dy + d / 2.0],
+                        d / 2.0,
+                        1.5 * sc,
+                        theme.foreground.to_f32_alpha(0.48),
+                    ),
+                    TabStatus::Running | TabStatus::Failed => {
+                        let color = theme.ansi[if tab.status == TabStatus::Running {
+                            2
+                        } else {
+                            1
+                        }]
+                        .to_f32();
+                        self.draw_rounded_rect(&mut bg_verts, dx, dy, d, d, d / 2.0, color);
+                    }
                 }
 
                 let close_w = TAB_BAR_CLOSE_W * sc;
@@ -2579,6 +2717,15 @@ impl Renderer {
         if let Some(editor) = self.theme_editor.clone() {
             self.draw_theme_editor(&mut bg_verts, &mut glyph_verts, &editor);
         }
+        if let Some(settings) = self.settings.clone() {
+            self.draw_settings(&mut bg_verts, &mut glyph_verts, &settings, theme);
+        }
+        if let (Some(stats), Some(start)) = (self.perf.as_mut(), geometry_start) {
+            stats.finish(Stage::Geometry, start);
+            stats.add(Counter::Frames, 1);
+            stats.add(Counter::ReusedRows, self.last_frame_reused_rows as u64);
+        }
+        let submit_start = PerfStats::start(&self.perf);
         self.submit_frame(
             view,
             output,
@@ -2595,6 +2742,9 @@ impl Renderer {
             overlay_start,
             search_start,
         );
+        if let (Some(stats), Some(start)) = (self.perf.as_mut(), submit_start) {
+            stats.finish(Stage::Submit, start);
+        }
         self.frame_bg_verts = bg_verts;
         self.frame_glyph_verts = glyph_verts;
     }
@@ -2605,6 +2755,41 @@ mod workspace_card_draw;
 
 #[cfg(test)]
 mod placement_tests {
+    #[test]
+    fn ascii_style_slots_are_bounded_and_unique() {
+        let mut seen = [false; 128 * 4];
+        for code in 0..128usize {
+            for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+                let index = code * 4 + super::StyledTextCache::<()>::style(bold, italic);
+                assert!(!seen[index]);
+                seen[index] = true;
+            }
+        }
+        assert!(seen.into_iter().all(|slot| slot));
+    }
+
+    #[test]
+    fn styled_text_cache_borrows_keys_and_separates_all_styles() {
+        let mut cache = super::StyledTextCache::new();
+        let styles = [(false, false), (true, false), (false, true), (true, true)];
+        for (index, (bold, italic)) in styles.into_iter().enumerate() {
+            cache.insert("👩🏽‍💻", bold, italic, vec![index]);
+        }
+        assert_eq!(cache.len(), 4);
+        for (index, (bold, italic)) in styles.into_iter().enumerate() {
+            let text = String::from("👩🏽‍💻");
+            let first = cache.get(&text, bold, italic).unwrap();
+            assert_eq!(first, &[index]);
+            assert!(std::ptr::eq(first, cache.get("👩🏽‍💻", bold, italic).unwrap()));
+        }
+        assert!(cache.get("é", false, false).is_none());
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        for (bold, italic) in styles {
+            assert!(cache.get("👩🏽‍💻", bold, italic).is_none());
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -2680,6 +2865,8 @@ mod placement_tests {
 #[path = "search_palette_draw.rs"]
 mod search_palette_draw;
 
+#[path = "settings_draw.rs"]
+mod settings_draw;
 #[path = "task_form_draw.rs"]
 mod task_form_draw;
 #[path = "task_strip_draw.rs"]

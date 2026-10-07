@@ -55,12 +55,20 @@ class Shell:
         return self.read_until_idle()
 
     def close(self):
+        # Close the PTY master first: on macOS a killed Fish can remain in
+        # kernel terminal teardown while waitpid blocks and the master is open.
+        os.close(self.fd)
         try:
             os.kill(self.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        os.waitpid(self.pid, 0)
-        os.close(self.fd)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if os.waitpid(self.pid, os.WNOHANG)[0]:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError('PTY child did not terminate within cleanup budget')
 
 
 class NativeFish:
@@ -90,30 +98,42 @@ class NativeFish:
             self.close()
             raise
 
-    def read_until(self, marker):
+    def read_until(self, marker, after=None):
         result = b''
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
             if select.select([self.fd], [], [], 0.2)[0]:
                 data = os.read(self.fd, 65536)
                 result += data
-                if marker in result:
+                # Fish can redraw the old prompt (including OSC 133;B) while
+                # processing input. Only a prompt after command completion is
+                # evidence that a newly submitted command actually finished.
+                start = result.find(after) if after is not None else 0
+                if start >= 0 and marker in result[start:]:
                     return result
         raise AssertionError(f'Fish did not emit {marker!r}; tail={result[-300:]!r}')
 
     def command(self, command):
         os.write(self.fd, command.encode() + b'\r')
-        output = self.read_until(self.B)
+        output = self.read_until(self.B, after=b'\x1b]133;D;')
         os.write(self.fd, self.PROMPT_REPLIES)
         return output
 
     def close(self):
+        # Close the PTY master first: on macOS a killed Fish can remain in
+        # kernel terminal teardown while waitpid blocks and the master is open.
+        os.close(self.fd)
         try:
             os.kill(self.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        os.waitpid(self.pid, 0)
-        os.close(self.fd)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if os.waitpid(self.pid, os.WNOHANG)[0]:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError('PTY child did not terminate within cleanup budget')
         self.tempdir.cleanup()
 
 
@@ -158,7 +178,8 @@ class Hooks(unittest.TestCase):
             self.assertEqual(len(re.findall(rb'\x1b\]133;C(?:;[^\x1b]*)?\x1b\\', output)), 1, output)
             self.assertIn(b'\x1b]133;D;1\x1b\\', output)
             self.assertEqual(output.count(b'\x1b]133;A;click_events=1\x1b\\'), 1, output)
-            self.assertEqual(output.count(b'\x1b]133;B\x1b\\'), 1, output)
+            completed_prompt = output.split(b'\x1b]133;D;1\x1b\\', 1)[1]
+            self.assertEqual(completed_prompt.count(b'\x1b]133;B\x1b\\'), 1, output)
             next_output = fish.command('echo RET=$status')
             self.assertIn(b'RET=1', next_output)
         finally:

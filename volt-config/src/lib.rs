@@ -1,5 +1,6 @@
 pub mod config;
 pub mod keybindings;
+pub mod preferences;
 pub mod tasks;
 pub mod theme;
 pub mod themes;
