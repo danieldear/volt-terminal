@@ -108,12 +108,17 @@ notary service, and stapled. Gatekeeper reported `Notarized Developer ID`; the
 packaged ZIP was extracted and its signature, ticket and Gatekeeper assessment
 passed again. Submission: `e2f094d4-c382-441a-b0b5-d9baa5bcf261`.
 
-This proves the local signing/notarization path, not the hosted GitHub release
-path or a downloaded public install. GitHub signing credentials and workflow
-support are configured; hosted signing validation must still succeed before
-notarized mode is enabled. A successful notarized release run and a downloaded
-artifact install test are also required before the public release can be
-advertised as notarized.
+Hosted [macOS signing validation](https://github.com/danieldear/volt-terminal/actions/runs/37572203978)
+also passed on reviewed main commit `133d96ae93d0ee8b3ea07b4dda7267076688fc7e`.
+The GitHub runner signed, notarized and stapled the app, revalidated the extracted
+ZIP, and uploaded a validation artifact. The downloaded artifact's SHA-256,
+strict signature, staple and Gatekeeper assessment passed again locally;
+Gatekeeper reported `Notarized Developer ID`.
+
+`MACOS_SIGNING_MODE=notarized` is now enabled for future release tags. This
+validation did not publish, replace or relabel v0.1.10. A new versioned release
+must still complete the release workflow; its downloaded public artifact needs
+an install/launch test before that release is advertised as fully validated.
 
 References:
 - [Apple notarization documentation](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
