@@ -4,6 +4,8 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StripState {
     Idle,
+    /// Sent or completed without a verifiable shell exit code.
+    Sent,
     ReviewRequired,
     Running,
     Succeeded,

@@ -1,5 +1,6 @@
 #!/bin/bash
 # Sign an already-built app. Never silently downgrade a requested trust level.
+set +x
 set -euo pipefail
 app=${1:?usage: sign_app.sh APP adhoc|developer-id|notarized}
 mode=${2:?usage: sign_app.sh APP adhoc|developer-id|notarized}
@@ -30,6 +31,9 @@ if [[ "$mode" == notarized ]]; then
   /usr/bin/ditto -c -k --keepParent "$app" "$temp/Volt.zip"
   if [[ -n "${NOTARYTOOL_PROFILE:-}" ]]; then
     auth=(--keychain-profile "$NOTARYTOOL_PROFILE")
+    if [[ -n "${NOTARYTOOL_KEYCHAIN:-}" ]]; then
+      auth+=(--keychain "$NOTARYTOOL_KEYCHAIN")
+    fi
   else
     : "${APPLE_API_KEY_PATH:?notarization needs NOTARYTOOL_PROFILE or App Store Connect API credentials}"
     : "${APPLE_API_KEY_ID:?missing API key ID}"

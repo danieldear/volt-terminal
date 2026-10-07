@@ -27,3 +27,6 @@ mod secure_input;
 mod keybindings;
 
 mod links;
+
+#[cfg(any(target_os = "macos", test))]
+mod shell_integration;

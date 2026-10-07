@@ -1,0 +1,77 @@
+name: macOS signing validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-signing-validation
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate notarized macOS archive
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Require reviewed main source
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo 'Signing validation is only allowed from main.' >&2
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Validate source and authentication scripts
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+          python3 -m unittest discover -s scripts/validation -p 'test_notary_auth.py'
+
+      - name: Build macOS app
+        run: scripts/macos/build_app.sh --release
+
+      - name: Validate Developer ID signing and notarization
+        env:
+          MACOS_SIGNING_MODE: notarized
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+        run: scripts/macos/ci_sign_app.sh target/macos/Volt.app
+
+      - name: Package and revalidate archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(cat dist/macos-signing-status.txt)" == notarized ]]
+          /usr/bin/ditto -c -k --keepParent target/macos/Volt.app dist/Volt-notarized-validation.zip
+          mkdir -p target/archive-validation
+          /usr/bin/ditto -x -k dist/Volt-notarized-validation.zip target/archive-validation
+          codesign --verify --deep --strict target/archive-validation/Volt.app
+          xcrun stapler validate target/archive-validation/Volt.app
+          /usr/sbin/spctl --assess --type execute --verbose=2 target/archive-validation/Volt.app
+          (cd dist && shasum -a 256 Volt-notarized-validation.zip > SHA256SUMS.txt)
+          echo 'Developer ID, Apple acceptance, staple, Gatekeeper and extracted ZIP validated.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Validation artifact only. No public release was changed.' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: notarized-validation-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7

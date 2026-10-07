@@ -53,6 +53,7 @@ pub struct WorkspacePanel {
     pub requested_tasks_root: Option<PathBuf>,
     /// The last task typed into the active pane, for its ✓ / ✗ status.
     pub task_run: Option<crate::tasks::TaskRun>,
+    pub task_results: Vec<crate::tasks::TaskRun>,
     /// Why the last task action didn't happen.
     pub task_message: Option<String>,
     pub selected_item: Option<usize>,
@@ -86,6 +87,7 @@ impl Default for WorkspacePanel {
             custom_tasks: None,
             requested_tasks_root: None,
             task_run: None,
+            task_results: Vec::new(),
             task_message: None,
             selected_item: None,
             pull_request: None,
@@ -575,7 +577,14 @@ impl WorkspacePanel {
                             for (i, task) in custom.tasks.iter().enumerate() {
                                 row(
                                     &task.name,
-                                    "Review",
+                                    crate::tasks::find_run(
+                                        self.task_run.as_ref(),
+                                        &self.task_results,
+                                        &custom.root,
+                                        task,
+                                    )
+                                    .map(|r| crate::tasks::state_label(r.state))
+                                    .unwrap_or("Review"),
                                     CardIcon::Play,
                                     Some(TASK_ROWS + i),
                                     false,
@@ -601,17 +610,14 @@ impl WorkspacePanel {
                             );
                         } else {
                             for (i, task) in custom.tasks.iter().enumerate() {
-                                let status = self
-                                    .task_run
-                                    .as_ref()
-                                    .filter(|r| r.name == task.name && r.root == custom.root)
-                                    .map(|r| match r.state {
-                                        crate::tasks::RunState::Sent => "",
-                                        crate::tasks::RunState::Running => "Running…",
-                                        crate::tasks::RunState::Finished(0) => "✓ Done",
-                                        crate::tasks::RunState::Finished(_) => "✗ Failed",
-                                    })
-                                    .unwrap_or("");
+                                let status = crate::tasks::find_run(
+                                    self.task_run.as_ref(),
+                                    &self.task_results,
+                                    &custom.root,
+                                    task,
+                                )
+                                .map(|r| crate::tasks::state_label(r.state))
+                                .unwrap_or("");
                                 row(
                                     &task.name,
                                     status,

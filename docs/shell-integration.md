@@ -5,14 +5,23 @@ Ghostty parity or completion of phase 3**.
 
 ## Try it
 
-Rebuild/relaunch Volt. Zsh and Bash require an explicit hook **inside Volt**:
+Rebuild/relaunch Volt. For Zsh or Bash, choose **View → Enable Shell Integration
+(This Tab)**. This explicitly installs Volt's compiled-in hooks in the current
+shell only; it does not read project scripts or edit startup files. Repeat setup
+is safe. Run tasks after enabling it to get their actual running/exit status.
+
+Alternatively, source the packaged hook **inside Volt**:
 
 ```sh
 # zsh
-source /Users/neo/workspace/rust/terminal/scripts/shell-integration/volt.zsh
+source /Applications/Volt.app/Contents/Resources/shell-integration/volt.zsh
 # bash
-source /Users/neo/workspace/rust/terminal/scripts/shell-integration/volt.bash
+source /Applications/Volt.app/Contents/Resources/shell-integration/volt.bash
 ```
+
+For a source build, use `scripts/shell-integration/volt.zsh` or `volt.bash`
+from the checkout. For persistent setup, source the packaged hook at the end of
+your startup file yourself.
 
 Fish 4.9.3 emits OSC 133 markers natively. **Do not source a `volt.fish` hook;
 there is none.** Start Fish inside Volt or configure it as Volt’s shell.

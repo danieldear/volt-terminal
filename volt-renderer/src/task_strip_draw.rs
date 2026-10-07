@@ -33,7 +33,7 @@ impl Renderer {
             let r = *r;
             let edge = match task.state {
                 StripState::Failed => red,
-                StripState::Running => c.accent,
+                StripState::Running | StripState::Sent => c.accent,
                 StripState::ReviewRequired => c.accent,
                 _ => c.border,
             };
@@ -63,6 +63,17 @@ impl Renderer {
                     self.card_line(bg, p(-3., -4.5), p(-3., 4.5), 1.6 * s, c.accent);
                     self.card_line(bg, p(-3., -4.5), p(4., 0.), 1.6 * s, c.accent);
                     self.card_line(bg, p(-3., 4.5), p(4., 0.), 1.6 * s, c.accent);
+                }
+                StripState::Sent => {
+                    // Hollow amber marker: sent/unknown is not success or idle.
+                    let d = 7. * s;
+                    self.card_round(bg, [mx - d / 2., my - d / 2., d, d], d / 2., c.accent);
+                    self.card_round(
+                        bg,
+                        [mx - d / 2. + s, my - d / 2. + s, d - 2. * s, d - 2. * s],
+                        (d - 2. * s) / 2.,
+                        c.panel,
+                    );
                 }
                 StripState::Running => {
                     let d = 7. * s;

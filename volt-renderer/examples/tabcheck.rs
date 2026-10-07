@@ -3,7 +3,7 @@
 use anyhow::{ensure, Result};
 use volt_config::Theme;
 use volt_core::grid::Grid;
-use volt_renderer::{tab_color::TabColor, Renderer, TabEntry};
+use volt_renderer::{tab_color::TabColor, Renderer, TabEntry, TabStatus};
 
 fn pixel(rgba: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
     let at = ((y * width + x) * 4) as usize;
@@ -23,7 +23,7 @@ fn main() -> Result<()> {
             color: Some(TabColor::Red),
             active: false,
             index: 1,
-            busy: false,
+            status: TabStatus::Failed,
             pane_count: 1,
         },
         TabEntry {
@@ -31,7 +31,7 @@ fn main() -> Result<()> {
             color: Some(TabColor::Blue),
             active: true,
             index: 2,
-            busy: true,
+            status: TabStatus::Running,
             pane_count: 1,
         },
         TabEntry {
@@ -39,7 +39,7 @@ fn main() -> Result<()> {
             color: None,
             active: false,
             index: 3,
-            busy: false,
+            status: TabStatus::Idle,
             pane_count: 1,
         },
     ];
@@ -67,6 +67,24 @@ fn main() -> Result<()> {
     let blue = pixel(&rgba, width, left_pad + tab_w + tab_gap + 1, 18);
     ensure!(red[0] > red[2], "red accent missing: {red:?}");
     ensure!(blue[2] > blue[0], "blue accent missing: {blue:?}");
+
+    let red_status = pixel(&rgba, width, left_pad + 15, 18);
+    let green_status = pixel(&rgba, width, left_pad + tab_w + tab_gap + 15, 18);
+    let idle_x = left_pad + 2 * (tab_w + tab_gap) + 15;
+    let idle_status = pixel(&rgba, width, idle_x, 18);
+    let idle_background = pixel(&rgba, width, idle_x, 11);
+    ensure!(
+        red_status[0] > red_status[1],
+        "failed status isn't red: {red_status:?}"
+    );
+    ensure!(
+        green_status[1] > green_status[0],
+        "running status isn't green: {green_status:?}"
+    );
+    ensure!(
+        idle_status == idle_background,
+        "idle tab still draws a ring: {idle_status:?}"
+    );
 
     std::fs::create_dir_all("target/tabcheck")?;
     let file = std::fs::File::create("target/tabcheck/tab-colors.png")?;

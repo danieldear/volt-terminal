@@ -217,6 +217,7 @@ struct MainState {
     force_full_redraw: bool,
     blink_state: bool,
     next_cursor_blink: Instant,
+    next_context_poll: Instant,
     #[cfg(target_os = "macos")]
     display_link: Option<DisplayLinkScheduler>,
     #[cfg(target_os = "macos")]
@@ -407,7 +408,10 @@ impl MainState {
         if pane.read_only {
             return Err("This terminal is read-only.".into());
         }
-        if pane.running {
+        if self.renderer.secure_input_active {
+            return Err("Secure input is active; task input was not sent.".into());
+        }
+        if pane.status.running {
             return Err(
                 "A command is running. Wait for it to finish before starting a task.".into(),
             );
@@ -540,11 +544,14 @@ impl MainState {
             crate::tasks::command_line(&tasks, &task, &self.config.shell.program, here.as_deref());
         match self.type_into_shell(&line) {
             Ok(()) => {
-                self.active_pane_mut().task_run = Some(Box::new(crate::tasks::TaskRun {
-                    name: task.name,
-                    root: tasks.root,
-                    state: crate::tasks::RunState::Sent,
-                }));
+                self.active_pane_mut()
+                    .set_task_run(Some(crate::tasks::TaskRun {
+                        name: task.name,
+                        command: task.run,
+                        cwd: task.cwd,
+                        root: tasks.root,
+                        state: crate::tasks::RunState::Sent,
+                    }));
             }
             Err(message) => self.set_task_message(message),
         }
@@ -741,7 +748,7 @@ impl MainState {
     /// Task buttons for where the closed workspace card sits. Only for a
     /// project's own tasks, never over a full-screen app or another panel.
     fn task_strip_view(&self) -> Option<volt_renderer::task_strip::TaskStripView> {
-        use volt_renderer::task_strip::{StripState, StripTask, TaskStripView, MAX_BUTTONS};
+        use volt_renderer::task_strip::{StripTask, TaskStripView, MAX_BUTTONS};
         let tasks = self.tasks.tasks.as_ref()?;
         if (tasks.tasks.is_empty()
             && !self.tasks.project_context
@@ -773,17 +780,25 @@ impl MainState {
                 .take(MAX_BUTTONS)
                 .map(|t| StripTask {
                     name: t.name.clone(),
-                    state: match run.filter(|r| r.name == t.name).map(|r| r.state) {
-                        Some(crate::tasks::RunState::Running) => StripState::Running,
-                        _ if !tasks.trusted => StripState::ReviewRequired,
-                        Some(crate::tasks::RunState::Finished(0)) => StripState::Succeeded,
-                        Some(crate::tasks::RunState::Finished(_)) => StripState::Failed,
-                        _ => StripState::Idle,
-                    },
+                    state: crate::tasks::strip_state(
+                        crate::tasks::find_run(run, &pane.task_results, &tasks.root, t)
+                            .map(|r| r.state),
+                        tasks.trusted,
+                    ),
                 })
                 .collect(),
             more: tasks.tasks.len() > MAX_BUTTONS,
-            message: self.task_note(),
+            message: self.task_note().or_else(|| {
+                run.filter(|r| {
+                    matches!(
+                        r.state,
+                        crate::tasks::RunState::Sent
+                            | crate::tasks::RunState::Unknown
+                            | crate::tasks::RunState::Finished(-1)
+                    )
+                })
+                .map(|_| "Exit status unavailable. View → Enable Shell Integration.".into())
+            }),
         })
     }
 
@@ -938,6 +953,7 @@ impl MainState {
         self.workspace_panel.custom_tasks = self.tasks.tasks.clone();
         self.workspace_panel.task_run =
             self.active_tab().active_pane().task_run.as_deref().cloned();
+        self.workspace_panel.task_results = self.active_tab().active_pane().task_results.clone();
         self.workspace_panel.task_message = self.task_note();
         self.renderer.workspace_card = self.workspace_panel.presentation_card();
         if let Some(card) = self.renderer.workspace_card.as_mut() {
@@ -2853,6 +2869,7 @@ impl App {
             pending_damage_rows: None,
             force_full_redraw: true,
             blink_state: true,
+            next_context_poll: Instant::now(),
             next_cursor_blink: Instant::now() + CURSOR_BLINK_INTERVAL,
             #[cfg(target_os = "macos")]
             display_link,
@@ -3226,6 +3243,22 @@ impl App {
             A::SearchWorkspace => state.toggle_search(),
             A::ShowTasks => state.show_tasks_in_card(),
             A::AddTask => state.open_task_form(),
+            A::EnableShellIntegration => {
+                match crate::shell_integration::enable_command(&state.config.shell.program) {
+                    Some(command) => {
+                        if let Err(message) = state.type_into_shell(&command) {
+                            state.set_task_message(message);
+                        } else {
+                            // A setup command's exit must not be attributed to an old task.
+                            state.active_pane_mut().set_task_run(None);
+                        }
+                    }
+                    None => state.set_task_message(
+                        "Enable OSC 133 in this shell; Zsh and Bash are supported by this menu.",
+                    ),
+                }
+                state.begin_redraw();
+            }
             A::Find => state.toggle_search(),
             A::ToggleWorkspaceLayout => state.toggle_workspace_layout(),
             A::ToggleChatPanel => {
@@ -5207,13 +5240,13 @@ impl ApplicationHandler<VoltEvent> for App {
                                     pane.title = t;
                                 }
                                 CoreEvent::CommandStarted => {
-                                    pane.running = true;
+                                    pane.status.started();
                                     if let Some(run) = pane.task_run.as_mut() {
                                         run.started();
                                     }
                                 }
                                 CoreEvent::CommandFinished { exit_code, .. } => {
-                                    pane.running = false;
+                                    pane.status.finished(exit_code);
                                     if let Some(run) = pane.task_run.as_mut() {
                                         run.finished(exit_code);
                                     }
@@ -5285,7 +5318,7 @@ impl ApplicationHandler<VoltEvent> for App {
                             color: state.tabs[i].color,
                             active: i == state.active_tab,
                             index: i + 1,
-                            busy: state.tabs[i].is_busy(),
+                            status: state.tabs[i].status(),
                             pane_count: state.tabs[i].pane_count(),
                         })
                         .collect();
@@ -5397,6 +5430,43 @@ impl ApplicationHandler<VoltEvent> for App {
         let mut windows_to_close = Vec::new();
 
         for (window_id, state) in self.windows.iter_mut() {
+            // Once per 250 ms, not per output chunk/frame. This also works for
+            // shells without OSC 7 and inactive tabs, without reading their files.
+            if Instant::now() >= state.next_context_poll {
+                state.next_context_poll = Instant::now() + Duration::from_millis(250);
+                let mut changed = false;
+                for tab in &mut state.tabs {
+                    tab.tree.for_each_leaf_mut(&mut |_, pane| {
+                        if let Some(cwd) = pane.local_cwd() {
+                            if pane.cwd.as_ref() != Some(&cwd) {
+                                pane.cwd = Some(cwd);
+                                changed = true;
+                            }
+                        }
+                        #[cfg(unix)]
+                        if !pane.status.shell_reports {
+                            if let Some(running) = pane.pty.foreground_job_running() {
+                                let old = pane.status;
+                                pane.status.observe_foreground(running);
+                                changed |= old != pane.status;
+                                if let Some(run) = pane.task_run.as_mut() {
+                                    let old = run.state;
+                                    run.observe_foreground(running);
+                                    changed |= old != run.state;
+                                }
+                            }
+                        }
+                    });
+                }
+                if changed {
+                    state.sync_workspace_card();
+                    state.begin_redraw();
+                }
+            }
+            next_blink_deadline = Some(
+                next_blink_deadline
+                    .map_or(state.next_context_poll, |d| d.min(state.next_context_poll)),
+            );
             let cwd = state.active_tab().active_pane().cwd.clone();
             let pid = state.active_tab().active_pane().pty.child_pid();
             if state.workspace_search.visible
@@ -5433,10 +5503,7 @@ impl ApplicationHandler<VoltEvent> for App {
                 }
             }
             let pane_cwd = cwd.clone();
-            let task_cwd = move || {
-                pid.and_then(crate::workspace_panel::local_process_cwd)
-                    .or(pane_cwd)
-            };
+            let task_cwd = move || pane_cwd;
             if state.tasks.tick(task_cwd, &state.proxy) {
                 state.sync_workspace_card();
                 state.begin_redraw();
@@ -5514,13 +5581,17 @@ impl ApplicationHandler<VoltEvent> for App {
                                     }
                                 }
                                 CoreEvent::CommandStarted => {
-                                    pane.running = true;
+                                    pane.status.started();
+                                    needs_redraw = true;
+                                    needs_full_redraw = true;
                                     if let Some(run) = pane.task_run.as_mut() {
                                         run.started();
                                     }
                                 }
                                 CoreEvent::CommandFinished { exit_code, .. } => {
-                                    pane.running = false;
+                                    pane.status.finished(exit_code);
+                                    needs_redraw = true;
+                                    needs_full_redraw = true;
                                     if let Some(run) = pane.task_run.as_mut() {
                                         run.finished(exit_code);
                                     }

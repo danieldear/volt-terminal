@@ -846,7 +846,9 @@ impl Grid {
     #[inline]
     fn clear_physical_row(&mut self, physical: usize) {
         if self.blank_row.len() != self.cols {
-            self.blank_row = vec![self.erase_cell; self.cols];
+            // Changing background invalidates length, not capacity. Refill the
+            // retained template instead of allocating another row on each scroll.
+            self.blank_row.resize(self.cols, self.erase_cell);
         }
         let start = physical * self.cols;
         self.cells[start..start + self.cols].copy_from_slice(&self.blank_row);
@@ -908,7 +910,16 @@ impl Grid {
             }
         }
 
-        self.row_map[top..=bottom].rotate_left(count);
+        let region = &mut self.row_map[top..=bottom];
+        if count == 1 {
+            // The overwhelmingly common newline case: one overlapping move,
+            // rather than the generic rotation algorithm's multiple copies.
+            let first = region[0];
+            region.copy_within(1.., 0);
+            region[region_rows - 1] = first;
+        } else {
+            region.rotate_left(count);
+        }
         let clear_start_row = bottom + 1 - count;
         for row in clear_start_row..=bottom {
             let physical = self.row_map[row];
@@ -1093,6 +1104,46 @@ impl Grid {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn colored_scroll_reuses_blank_template_allocation() {
+        let mut grid = Grid::new(40, 3);
+        grid.scroll_up(0, 2, 1);
+        let ptr = grid.blank_row.as_ptr();
+        for color in 0..30 {
+            grid.set_erase_background(CellColor::Indexed(color));
+            grid.scroll_up(0, 2, 1);
+            assert_eq!(grid.blank_row.as_ptr(), ptr);
+            assert!(grid
+                .row_cells(2)
+                .iter()
+                .all(|c| c.bg == CellColor::Indexed(color) && c.c() == ' '));
+        }
+    }
+
+    #[test]
+    fn single_row_scroll_matches_general_rotation_for_every_region() {
+        for rows in 1..10 {
+            for top in 0..rows {
+                for bottom in top..rows {
+                    let mut grid = Grid::new(5, rows);
+                    for row in 0..rows {
+                        for col in 0..5 {
+                            grid.put_ascii(col, row, Cell::default());
+                        }
+                    }
+                    let old = grid.row_map.clone();
+                    let mut expected = old.clone();
+                    expected[top..=bottom].rotate_left(1);
+                    grid.scroll_up(top, bottom, 1);
+                    assert_eq!(grid.row_map, expected);
+                    for row in 0..rows {
+                        assert_eq!(grid.row_cells(row).len(), 5);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn linked_text_compaction_preserves_identity_and_budgets() {
         let mut g = super::Grid::new(10, 2);
