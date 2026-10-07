@@ -245,7 +245,9 @@ confirm = true          # optional: show the command and ask before each run
   full-screen app, a password prompt, or a read-only pane blocks the task, and
   a short note says why.
 - With shell integration enabled, each task shows running, ✓ or ✗ from its
-  exit code. Without it, the task is marked **Sent** rather than claiming to run.
+  exit code. Without an exit report, the task is marked **Sent / Exit unknown** rather
+  than claiming success. **View → Enable Shell Integration (This Tab)** enables
+  the built-in Zsh/Bash hooks without changing your startup files.
 - Write `./program` for a compiled executable (not `zsh ./program`). Volt
   never adds `&` or runs tasks in the background.
 

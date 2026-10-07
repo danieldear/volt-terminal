@@ -27,3 +27,5 @@ mod secure_input;
 mod keybindings;
 
 mod links;
+
+mod shell_integration;

@@ -21,13 +21,49 @@ pub enum PaneSplitDirection {
     Horizontal,
 }
 
+/// Shell-reported exit codes and a throttled foreground fallback. A native
+/// process-group observation can prove busy/idle, never success/failure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommandStatus {
+    pub running: bool,
+    pub last_exit_code: Option<i32>,
+    pub shell_reports: bool,
+}
+impl CommandStatus {
+    pub fn started(&mut self) {
+        self.running = true;
+        self.last_exit_code = None;
+        self.shell_reports = true;
+    }
+    pub fn finished(&mut self, code: i32) {
+        self.running = false;
+        self.last_exit_code = (code >= 0).then_some(code);
+        self.shell_reports = true;
+    }
+    pub fn observe_foreground(&mut self, running: bool) {
+        if !self.shell_reports {
+            self.running = running;
+            self.last_exit_code = None;
+        }
+    }
+    pub fn tab_status(self) -> volt_renderer::TabStatus {
+        if self.running {
+            volt_renderer::TabStatus::Running
+        } else if self.last_exit_code.is_some_and(|code| code > 0) {
+            volt_renderer::TabStatus::Failed
+        } else {
+            volt_renderer::TabStatus::Idle
+        }
+    }
+}
+
 pub struct TerminalPane {
     pub pty: Pty,
     pub performer: Arc<Mutex<Performer>>,
     pub event_rx: tokio::sync::mpsc::UnboundedReceiver<CoreEvent>,
     pub title: String,
     pub cwd: Option<PathBuf>,
-    pub running: bool,
+    pub status: CommandStatus,
     /// How many lines the user has scrolled back into the scrollback buffer.
     /// 0 means the live view (bottom of output).
     pub scroll_view_offset: usize,
@@ -40,6 +76,7 @@ pub struct TerminalPane {
     /// The last project task typed into this pane, and how it went.
     /// Boxed: most panes never run a task, and panes are moved around in trees.
     pub task_run: Option<Box<crate::tasks::TaskRun>>,
+    pub task_results: Vec<crate::tasks::TaskRun>,
 }
 
 pub struct TerminalTab {
@@ -285,12 +322,20 @@ impl TerminalPane {
             cwd: cwd
                 .map(Path::to_path_buf)
                 .or_else(|| std::env::current_dir().ok()),
-            running: false,
+            status: CommandStatus::default(),
             scroll_view_offset: 0,
             custom_title: None,
             read_only: false,
             task_run: None,
+            task_results: Vec::new(),
         })
+    }
+
+    pub fn set_task_run(&mut self, next: Option<crate::tasks::TaskRun>) {
+        if let Some(previous) = self.task_run.take() {
+            crate::tasks::remember_run(&mut self.task_results, *previous);
+        }
+        self.task_run = next.map(Box::new);
     }
 
     /// OSC 7 may describe a remote machine. Only the owned local process is
@@ -319,30 +364,32 @@ impl TerminalPane {
     }
 
     fn fallback_title(&self) -> String {
-        let title = self.title.trim();
-        if !title.is_empty() && title != "~" {
-            return title.to_string();
-        }
-        self.cwd
-            .as_deref()
-            .map(|p| {
-                if let Some(home) = dirs::home_dir() {
-                    if p == home {
-                        return "~".to_string();
-                    }
-                    if let Ok(rel) = p.strip_prefix(&home) {
-                        if let Some(name) = rel.file_name() {
-                            return format!("~/{}", name.to_string_lossy());
-                        }
-                        return "~".to_string();
-                    }
-                }
-                p.file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_else(|| p.to_string_lossy().to_string())
-            })
-            .unwrap_or_else(|| "~".to_string())
+        pane_fallback_title(&self.title, self.cwd.as_deref(), self.status.running)
     }
+}
+
+fn pane_fallback_title(title: &str, cwd: Option<&Path>, running: bool) -> String {
+    let title = title.trim();
+    if running && !title.is_empty() && title != "~" {
+        return title.to_string();
+    }
+    cwd.map(|p| {
+        if let Some(home) = dirs::home_dir() {
+            if p == home {
+                return "~".to_string();
+            }
+            if let Ok(rel) = p.strip_prefix(&home) {
+                if let Some(name) = rel.file_name() {
+                    return format!("~/{}", name.to_string_lossy());
+                }
+                return "~".to_string();
+            }
+        }
+        p.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| p.to_string_lossy().to_string())
+    })
+    .unwrap_or_else(|| "~".to_string())
 }
 
 /// Truncate `s` to its last `max_chars` characters, prefixed with `...` if
@@ -396,7 +443,15 @@ impl TerminalTab {
         self.tree
             .leaf_ids()
             .into_iter()
-            .any(|id| self.tree.find_leaf(id).is_some_and(|p| p.running))
+            .any(|id| self.tree.find_leaf(id).is_some_and(|p| p.status.running))
+    }
+
+    pub fn status(&self) -> volt_renderer::TabStatus {
+        if self.is_busy() {
+            volt_renderer::TabStatus::Running
+        } else {
+            self.active_pane().status.tab_status()
+        }
     }
 
     pub fn active_pane(&self) -> &TerminalPane {
@@ -437,6 +492,48 @@ mod tests {
             cell.set_char(ch);
             grid.put_char(col, row, cell);
         }
+    }
+
+    #[test]
+    fn directory_title_tracks_cwd_without_overriding_custom_or_busy_titles() {
+        assert_eq!(
+            pane_fallback_title("old prompt title", Some(Path::new("/tmp/first")), false),
+            "first"
+        );
+        assert_eq!(
+            pane_fallback_title("old prompt title", Some(Path::new("/tmp/second")), false),
+            "second"
+        );
+        assert_eq!(
+            pane_fallback_title("nvim", Some(Path::new("/tmp/second")), true),
+            "nvim"
+        );
+        assert_eq!(
+            tab_display_title(Some("Pinned title"), "second", 1),
+            "Pinned title"
+        );
+    }
+
+    #[test]
+    fn command_status_preserves_errors_and_never_guesses_success() {
+        use volt_renderer::TabStatus;
+        let mut status = CommandStatus::default();
+        assert_eq!(status.tab_status(), TabStatus::Idle);
+        status.observe_foreground(true);
+        assert_eq!(status.tab_status(), TabStatus::Running);
+        status.observe_foreground(false);
+        assert_eq!(status.last_exit_code, None);
+        status.started();
+        status.finished(2);
+        assert_eq!(status.tab_status(), TabStatus::Failed);
+        status.observe_foreground(false);
+        assert_eq!(status.tab_status(), TabStatus::Failed);
+        status.started();
+        assert_eq!(status.last_exit_code, None);
+        status.finished(0);
+        assert_eq!(status.tab_status(), TabStatus::Idle);
+        status.finished(-1);
+        assert_eq!(status.last_exit_code, None);
     }
 
     #[test]

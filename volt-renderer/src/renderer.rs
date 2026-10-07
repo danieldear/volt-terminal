@@ -259,13 +259,21 @@ fn default_symbol_font_family(font_system: &FontSystem, primary_family: &str) ->
     None
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TabStatus {
+    #[default]
+    Idle,
+    Running,
+    Failed,
+}
+
 /// One entry for the tab bar
 pub struct TabEntry<'a> {
     pub title: &'a str,
     pub color: Option<TabColor>,
     pub active: bool,
     pub index: usize,
-    pub busy: bool,
+    pub status: TabStatus,
     pub pane_count: usize,
 }
 
@@ -2025,16 +2033,6 @@ impl Renderer {
                 // Inactive tabs are just their label; the active tab gets a
                 // soft rounded fill. A colored tab is tinted with its color
                 // (stronger when active) and keeps a bar on its left edge.
-                // `under` tracks the resulting fill for the idle dot's middle.
-                let blend = |u: [f32; 4], c: [f32; 4], a: f32| {
-                    [
-                        u[0] * (1.0 - a) + c[0] * a,
-                        u[1] * (1.0 - a) + c[1] * a,
-                        u[2] * (1.0 - a) + c[2] * a,
-                        1.0,
-                    ]
-                };
-                let mut under = [base[0] * 0.78, base[1] * 0.78, base[2] * 0.78, 1.0];
                 if active {
                     self.card_round(
                         &mut bg_verts,
@@ -2042,7 +2040,6 @@ impl Renderer {
                         7.0 * sc,
                         theme.foreground.to_f32_alpha(0.09),
                     );
-                    under = blend(under, theme.foreground.to_f32(), 0.09);
                 }
                 if let Some(color) = tab.color {
                     let [r, g, b] = color.rgb();
@@ -2053,7 +2050,6 @@ impl Renderer {
                         7.0 * sc,
                         [r, g, b, tint],
                     );
-                    under = blend(under, [r, g, b, 1.0], tint);
                     let bar_w = (3.0 * sc).max(2.0);
                     self.card_round(
                         &mut bg_verts,
@@ -2063,35 +2059,17 @@ impl Renderer {
                     );
                 }
 
-                // Status dot, drawn as a shape so it stays round at any size:
-                // filled in the theme's green while busy, a ring when idle.
+                // Status stays independent of the user's tab accent: green
+                // while running, red on a reported error, blank when idle.
                 let d = 7.0 * sc;
                 let (dx, dy) = (tx + 12.0 * sc, tab_y + (tab_h - d) / 2.0);
-                if tab.busy {
-                    self.draw_rounded_rect(
-                        &mut bg_verts,
-                        dx,
-                        dy,
-                        d,
-                        d,
-                        d / 2.0,
-                        theme.ansi[2].to_f32(),
-                    );
-                } else {
-                    let ring = theme.foreground.to_f32_alpha(0.46);
-                    let inner = (1.4 * sc).max(1.0);
-                    self.draw_rounded_rect(&mut bg_verts, dx, dy, d, d, d / 2.0, ring);
-                    let fill = under;
-                    let id = d - 2.0 * inner;
-                    self.draw_rounded_rect(
-                        &mut bg_verts,
-                        dx + inner,
-                        dy + inner,
-                        id,
-                        id,
-                        id / 2.0,
-                        fill,
-                    );
+                let status_color = match tab.status {
+                    TabStatus::Idle => None,
+                    TabStatus::Running => Some(theme.ansi[2].to_f32()),
+                    TabStatus::Failed => Some(theme.ansi[1].to_f32()),
+                };
+                if let Some(color) = status_color {
+                    self.draw_rounded_rect(&mut bg_verts, dx, dy, d, d, d / 2.0, color);
                 }
 
                 let close_w = TAB_BAR_CLOSE_W * sc;

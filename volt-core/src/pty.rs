@@ -131,8 +131,8 @@ pub struct Pty {
 
 impl Pty {
     /// A foreground job owns input when the terminal's process group differs
-    /// from the shell's. Works without shell-integration hooks; only queried on
-    /// explicit task execution, never in the PTY parsing or rendering loops.
+    /// from the shell's. Works without shell-integration hooks; queried on
+    /// explicit execution and a throttled UI timer, never in parsing/render loops.
     #[cfg(unix)]
     pub fn foreground_job_running(&self) -> Option<bool> {
         let fd = self.master.as_raw_fd()?;
@@ -389,6 +389,9 @@ impl Pty {
                             }
                         }
 
+                        // OSC title/cwd/status can arrive without printable
+                        // output. Wake the UI for these too, not just grid damage.
+                        let notify_ui = read_dirty || !read_events.is_empty();
                         for event in read_events {
                             send_event(&event_tx_clone, event);
                         }
@@ -428,7 +431,7 @@ impl Pty {
                             }
                         }
 
-                        if read_dirty {
+                        if notify_ui {
                             on_data();
                         }
                     }
@@ -516,6 +519,23 @@ impl Drop for Pty {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_only_output_wakes_the_ui_before_any_grid_text() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let args = vec![
+            "-c".into(),
+            "printf '\\033]133;C\\007'; read -r reply; printf '\\033]133;D;1\\007'".into(),
+        ];
+        let (mut pty, _, mut events) = Pty::spawn("/bin/sh", &args, 20, 2, move || {
+            let _ = tx.send(());
+        })
+        .unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a pure OSC command event must wake the UI");
+        assert!(matches!(events.try_recv(), Ok(CoreEvent::CommandStarted)));
+        pty.write(b"done\n").unwrap();
+    }
 
     #[test]
     fn foreground_job_detection_recovers_without_osc_hooks() {
