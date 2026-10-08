@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+volt-ui-kit = { version = "0.1.0", path = "../vendor/volt-ui-kit" }
 anyhow = { workspace = true }
 wgpu = "29"
 winit = "0.30"

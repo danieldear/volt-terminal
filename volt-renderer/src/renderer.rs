@@ -2873,3 +2873,61 @@ mod task_form_draw;
 mod task_strip_draw;
 #[path = "theme_editor_draw.rs"]
 mod theme_editor_draw;
+
+/// Map terminal theme values at the embedding boundary, not inside widgets.
+fn ui_kit_theme(theme: &Theme) -> volt_ui_kit::Theme {
+    volt_ui_kit::Theme {
+        background: theme.background.to_f32(),
+        foreground: theme.foreground.to_f32(),
+        ansi: theme.ansi.map(|c| c.to_f32()),
+    }
+}
+impl volt_ui_kit::Painter for Renderer {
+    type Shape = BgVertex;
+    type Glyph = GlyphVertex;
+    fn viewport(&self) -> volt_ui_kit::Viewport {
+        volt_ui_kit::Viewport {
+            width: self.config.width as f32,
+            height: self.config.height as f32,
+            scale: self.scale_factor,
+            top: self.workspace_card_top_offset(),
+        }
+    }
+    fn draw_rect(&self, out: &mut Vec<BgVertex>, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
+        Renderer::draw_rect(self, out, x, y, w, h, color);
+    }
+    fn card_triangle(&self, out: &mut Vec<BgVertex>, points: [[f32; 2]; 3], color: [f32; 4]) {
+        for p in points {
+            out.push(BgVertex {
+                pos: [
+                    p[0] / self.config.width as f32 * 2. - 1.,
+                    1. - p[1] / self.config.height as f32 * 2.,
+                ],
+                color,
+            });
+        }
+    }
+    fn card_text(
+        &mut self,
+        out: &mut Vec<GlyphVertex>,
+        text: &str,
+        x: f32,
+        y: f32,
+        size: f32,
+        color: [f32; 4],
+    ) {
+        self.draw_text_with_line_height(out, text, x, y, size, 1.2, color);
+    }
+    fn draw_text_colored(
+        &mut self,
+        out: &mut Vec<GlyphVertex>,
+        text: &str,
+        x: f32,
+        y: f32,
+        size: f32,
+        line_height: f32,
+        color_at: &dyn Fn(usize) -> [f32; 4],
+    ) {
+        Renderer::draw_text_colored(self, out, text, x, y, size, line_height, color_at);
+    }
+}

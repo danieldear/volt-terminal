@@ -1,0 +1,32 @@
+{
+  "files": {
+    "CHANGELOG.md": "f656a01cee510bfca51bec45cafd7befce04b73236865f85ca6c01ae0c0f324f",
+    "Cargo.toml": "0b2b4babbed4d3fa0a074e4168938211a46aa9f9cbd87940e04a8ac3776e6fbb",
+    "LICENSE": "a517fa270019693ec3df06f01e49b98437808e199c7d0b7f8ae01d7a04e3a87b",
+    "README.md": "1aff999b37e28480e120d5bcb61d9d6c16c99bf7f74e1264aca581237e9ed5c8",
+    "ROADMAP.md": "721a1b17aecd7eb08441fc48bd674fe88200ac1c8034ab0023066e02bea5a883",
+    "examples/gallery.rs": "9ef310e67e96b595c1578b43e185320121a69fd16b50feeba48a623d8ad17cff",
+    "src/button.rs": "29b71b877b252a8636679ce3da9cb697ef102193919d9be196a7a3e48a927375",
+    "src/card_paint.rs": "7cd004da00537bdc8aa1b5a18f9acb63dbaf4642c2517fb9baccd7a407be28c0",
+    "src/form_paint.rs": "4489daec881feb2045c95bfeb5c34e2f839b7ac1ad5ee2a7f8d063e383cf5665",
+    "src/geometry.rs": "01d8254b652ee8ac28cd2d8f6c602aa575963430447255dc12075d58c94a9d9c",
+    "src/lib.rs": "0f29870f9093d6e8fa4b2619c73018205ccc180ab5101491ecb15c94e87807da",
+    "src/paint.rs": "75d6c5bf36def47474ddf18b5a95ba4ab3abaeb79a195ca5e8367a3e238e9945",
+    "src/panel.rs": "9fe8a3999184c6901b0b2eaab334b1c10fc7bf20a7ac0e6e2bfe5c37310a6583",
+    "src/search_paint.rs": "a241ad89812128e3e2fe1e935680ec6ff3eb88232096dfb8b79e01a587de82df",
+    "src/search_palette.rs": "f634ddfb2c45a74f00f3d6f8ac4fa7c21d3f5f4c0f21b5697e6397eb386d87f5",
+    "src/settings.rs": "7a2f3dbe75f94981103f88049fbfa0e4c5036e57f67d2fe8057154cb2965e0ef",
+    "src/settings_paint.rs": "eeda149199e120eda7efaebdf2aa1aeb55d6ea9d00d4077a0fd3770dd53a9595",
+    "src/strip_paint.rs": "402f121031d2dd4989fd5c8674fea5ef9740a3578956ee99872343abe8befcbb",
+    "src/style.rs": "53373daacfafcaf6f6576416a57926dec7cab5731b321cabdf12483853029912",
+    "src/surface.rs": "74816670ea6e517687ecd0cd67dd0aa1c652fe654f83009ac5985e6cf2afcd86",
+    "src/svg.rs": "262cda4cc727b54077c031875ae080f2b72e2d197f3258de714e68a53d17ae36",
+    "src/tab_color.rs": "22188ea196eade07433b7267728a019782ce33550edf1cd6cfcea7b1f0a246d7",
+    "src/tab_layout.rs": "462ccdd5053f9f8f4a13c3300c7a818f2f58580ae10b2e8df9d31ed3a0c31f6a",
+    "src/task_form.rs": "469f210b28d9d5763ef9b3a68ad952da5c0b1da28839c2d2c6d48a8561cd8ed9",
+    "src/task_strip.rs": "ecff9cdc349d55fae18e86cefeb52f46ce2ebad6b1023a8789add0665ee89215",
+    "src/workspace_card.rs": "5e7836a9ef070dc5b968f9fda6e94cb1dcee71577788203f130c9b78c47eb8f0"
+  },
+  "project": "volt-ui-kit",
+  "version": "0.1.0"
+}

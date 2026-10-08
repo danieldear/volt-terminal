@@ -156,9 +156,19 @@ pub struct TaskRun {
     pub command: String,
     pub cwd: Option<String>,
     pub state: RunState,
+    pub sent_at: Instant,
 }
 
 impl TaskRun {
+    /// A brief hint while awaiting a shell report, never a persistent warning
+    /// on a completed task. Unknown completion must not imply success/failure.
+    pub fn integration_notice(&self, now: Instant) -> Option<&'static str> {
+        (self.state == RunState::Sent && now < self.notice_deadline())
+            .then_some("Exit status unavailable. View → Enable Shell Integration.")
+    }
+    pub fn notice_deadline(&self) -> Instant {
+        self.sent_at + Duration::from_secs(6)
+    }
     pub fn started(&mut self) {
         if self.state == RunState::Sent {
             self.state = RunState::Running;
@@ -511,6 +521,7 @@ mod tests {
             command: "true".into(),
             cwd: None,
             state: RunState::Finished(0),
+            sent_at: Instant::now(),
         };
         remember_run(&mut history, build.clone());
         let test = TaskRun {
@@ -592,14 +603,49 @@ mod tests {
             command: "true".into(),
             cwd: None,
             state: RunState::Sent,
+            sent_at: Instant::now(),
         };
         run.observe_foreground(true);
         assert_eq!(run.state, RunState::Running);
+        assert!(run.integration_notice(Instant::now()).is_none());
         run.observe_foreground(false);
         assert_eq!(run.state, RunState::Unknown);
+        assert!(run.integration_notice(Instant::now()).is_none());
         run.started();
         run.finished(0);
         assert_eq!(run.state, RunState::Unknown);
+    }
+
+    #[test]
+    fn integration_notice_expires_and_never_reappears_after_completion() {
+        let sent_at = Instant::now();
+        let mut run = TaskRun {
+            name: "Build".into(),
+            root: "/w".into(),
+            command: "true".into(),
+            cwd: None,
+            state: RunState::Sent,
+            sent_at,
+        };
+        assert!(run.integration_notice(sent_at).is_some());
+        assert!(run
+            .integration_notice(sent_at + Duration::from_millis(5999))
+            .is_some());
+        assert!(run
+            .integration_notice(sent_at + Duration::from_secs(6))
+            .is_none());
+        assert!(run
+            .integration_notice(sent_at + Duration::from_secs(60))
+            .is_none());
+        run.started();
+        for code in [0, 1, -1] {
+            let mut finished = run.clone();
+            finished.finished(code);
+            assert!(finished.integration_notice(sent_at).is_none());
+        }
+        run.observe_foreground(false);
+        assert_eq!(run.state, RunState::Unknown);
+        assert!(run.integration_notice(sent_at).is_none());
     }
 
     #[test]
@@ -610,6 +656,7 @@ mod tests {
             command: "true".into(),
             cwd: None,
             state: RunState::Sent,
+            sent_at: Instant::now(),
         };
         run.finished(1);
         assert_eq!(
