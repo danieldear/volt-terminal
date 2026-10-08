@@ -10,6 +10,11 @@ on:
         description: 'Existing v* tag to build and publish, for example v0.1.0'
         required: true
         type: string
+      draft:
+        description: 'Keep the release as a draft for testing (does not update Latest)'
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -74,7 +79,7 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo test --locked --workspace
-          python3 -m unittest discover -s scripts/validation -p 'test_notary_auth.py'
+          python3 -m unittest discover -s scripts/validation -p 'test_*.py'
 
       - name: Build Linux binary
         if: matrix.package == 'linux'
@@ -159,6 +164,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          DRAFT_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.draft }}
         run: |
           set -euo pipefail
           case "$(cat dist/macos-signing-status.txt)" in
@@ -177,10 +183,16 @@ jobs:
           ${signing_note}
           EOF
 
+          # An existing draft must stay a draft on tag-triggered builds.
+          # No implicit --draft=false or publication of testing releases.
+          release_args=(--title "Volt ${RELEASE_TAG}" --notes-file release-notes.md)
+          if [[ "$DRAFT_RELEASE" == true ]]; then
+            release_args+=(--draft)
+          fi
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release edit "${RELEASE_TAG}" --title "Volt ${RELEASE_TAG}" --notes-file release-notes.md
+            gh release edit "${RELEASE_TAG}" "${release_args[@]}"
           else
-            gh release create "${RELEASE_TAG}" --title "Volt ${RELEASE_TAG}" --notes-file release-notes.md
+            gh release create "${RELEASE_TAG}" "${release_args[@]}"
           fi
 
           gh release upload "${RELEASE_TAG}" dist/* --clobber

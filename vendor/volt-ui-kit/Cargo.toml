@@ -1,0 +1,12 @@
+[package]
+name = "volt-ui-kit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+description = "Renderer-independent desktop UI components extracted from Volt"
+readme = "README.md"
+include = ["src/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "LICENSE", "CHANGELOG.md", "ROADMAP.md"]
+
+[dependencies]
+unicode-width = "0.2"

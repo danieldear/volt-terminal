@@ -1,6 +1,6 @@
 # Volt roadmap
 
-Volt is an early public preview (source version: **0.1.11**). This page lists
+Volt is an early public preview (source version: **0.1.12**). This page lists
 what works today and what comes next. Status reconciled on **2026-10-07** against
 the current source, release metadata and hosted signing validation. Order within a stage is a rough priority,
 not a promise or a date. Settings and shortcuts may change before 1.0.

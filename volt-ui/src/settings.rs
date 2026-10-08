@@ -998,6 +998,7 @@ fn shortcut_rows(c: &Config) -> Vec<Row> {
             .find(|b| b.action == *a)
             .map(|b| String::from(b.key.clone()))
             .unwrap_or_else(|| default.to_string());
+        let value = shortcut_label(&value, cfg!(target_os = "macos"));
         row(
             "shortcut",
             label,
@@ -1007,6 +1008,54 @@ fn shortcut_rows(c: &Config) -> Vec<Row> {
         )
     })
     .collect()
+}
+
+/// Presentation only: configuration and keyboard dispatch keep canonical chords.
+fn shortcut_label(raw: &str, macos: bool) -> String {
+    let Ok(chord) = volt_config::keybindings::Chord::try_from(raw.to_string()) else {
+        return raw.to_string();
+    };
+    let mut parts = Vec::new();
+    for (bit, label) in [
+        (1, "Ctrl"),
+        (2, if macos { "Option" } else { "Alt" }),
+        (4, "Shift"),
+        (8, if macos { "Cmd" } else { "Super" }),
+    ] {
+        if chord.modifiers & bit != 0 {
+            parts.push(label.to_string());
+        }
+    }
+    let key = match chord.key.as_str() {
+        "enter" if macos => "Return",
+        "enter" => "Enter",
+        "escape" => "Esc",
+        "backspace" if macos => "Delete",
+        "backspace" => "Backspace",
+        "delete" if macos => "Forward Delete",
+        "delete" => "Delete",
+        "pageup" => "Page Up",
+        "pagedown" => "Page Down",
+        "equal" => "=",
+        "minus" => "-",
+        "comma" => ",",
+        "period" => ".",
+        "slash" => "/",
+        "semicolon" => ";",
+        "quote" => "'",
+        "backquote" => "`",
+        "bracketleft" => "[",
+        "bracketright" => "]",
+        "backslash" => "\\",
+        other => {
+            let mut chars = other.chars();
+            let first = chars.next().unwrap_or_default().to_ascii_uppercase();
+            parts.push(format!("{first}{}", chars.as_str()));
+            return parts.join("+");
+        }
+    };
+    parts.push(key.into());
+    parts.join("+")
 }
 #[cfg(test)]
 mod tests {
@@ -1105,7 +1154,77 @@ mod tests {
         s.activate();
         assert_eq!(s.shortcut("ctrl+alt+left".into()), Outcome::Preview);
         assert_eq!(s.draft.keybindings.len(), 1);
+        assert_eq!(
+            s.rows()[0].value,
+            shortcut_label("ctrl+alt+left", cfg!(target_os = "macos"))
+        );
+        assert_eq!(
+            String::from(s.draft.keybindings[0].key.clone()),
+            "ctrl+alt+left"
+        );
         s.erase(true);
         assert!(s.draft.keybindings.is_empty());
+        assert_eq!(
+            s.rows()[0].value,
+            shortcut_label("super+t", cfg!(target_os = "macos"))
+        );
+    }
+    #[test]
+    fn shortcut_labels_are_platform_specific_without_changing_serialization() {
+        for (raw, mac, other) in [
+            ("super+t", "Cmd+T", "Super+T"),
+            ("super+comma", "Cmd+,", "Super+,"),
+            ("ctrl+shift+tab", "Ctrl+Shift+Tab", "Ctrl+Shift+Tab"),
+            (
+                "command+option+shift+left",
+                "Option+Shift+Cmd+Left",
+                "Alt+Shift+Super+Left",
+            ),
+            ("cmd+f12", "Cmd+F12", "Super+F12"),
+            ("backspace", "Delete", "Backspace"),
+            ("delete", "Forward Delete", "Delete"),
+            ("enter", "Return", "Enter"),
+            ("Unassigned", "Unassigned", "Unassigned"),
+        ] {
+            assert_eq!(shortcut_label(raw, true), mac);
+            assert_eq!(shortcut_label(raw, false), other);
+        }
+        let chord = volt_config::keybindings::Chord::try_from("Cmd+Shift+F".to_string()).unwrap();
+        assert_eq!(String::from(chord), "shift+super+f");
+        for key in [
+            "equal",
+            "minus",
+            "period",
+            "slash",
+            "semicolon",
+            "quote",
+            "backquote",
+            "bracketleft",
+            "bracketright",
+            "backslash",
+            "pageup",
+            "pagedown",
+            "escape",
+            "space",
+            "up",
+            "home",
+            "end",
+        ] {
+            let label = shortcut_label(&format!("super+{key}"), true);
+            assert!(label.starts_with("Cmd+"));
+            assert!(!label.contains("super"));
+        }
+    }
+    #[test]
+    fn all_default_shortcuts_use_native_names() {
+        let rows = shortcut_rows(&Config::default());
+        assert_eq!(rows.len(), 30);
+        if cfg!(target_os = "macos") {
+            assert!(rows
+                .iter()
+                .all(|r| !r.value.contains("super") && !r.value.contains("alt+")));
+            assert_eq!(rows[0].value, "Cmd+T");
+            assert_eq!(rows[6].value, "Cmd+,");
+        }
     }
 }

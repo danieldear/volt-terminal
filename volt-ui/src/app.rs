@@ -809,6 +809,7 @@ impl MainState {
                         cwd: task.cwd,
                         root: tasks.root,
                         state: crate::tasks::RunState::Sent,
+                        sent_at: Instant::now(),
                     }));
             }
             Err(message) => self.set_task_message(message),
@@ -1047,15 +1048,8 @@ impl MainState {
                 .collect(),
             more: tasks.tasks.len() > MAX_BUTTONS,
             message: self.task_note().or_else(|| {
-                run.filter(|r| {
-                    matches!(
-                        r.state,
-                        crate::tasks::RunState::Sent
-                            | crate::tasks::RunState::Unknown
-                            | crate::tasks::RunState::Finished(-1)
-                    )
-                })
-                .map(|_| "Exit status unavailable. View → Enable Shell Integration.".into())
+                run.and_then(|r| r.integration_notice(Instant::now()))
+                    .map(str::to_string)
             }),
         })
     }
@@ -1083,6 +1077,52 @@ impl MainState {
             .as_ref()
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(6))
             .map(|(m, _)| m.clone())
+    }
+
+    /// One-shot expiry, not a repeating render timer. Also invalidate the
+    /// cached strip when a shell report ends the integration hint early.
+    fn tick_task_notices(&mut self) -> Option<Instant> {
+        let now = Instant::now();
+        let mut deadline = None;
+        if let Some((_, at)) = &self.task_message {
+            let expires = *at + Duration::from_secs(6);
+            if now >= expires {
+                self.task_message = None;
+                self.sync_workspace_card();
+                self.begin_redraw();
+            } else {
+                deadline = Some(expires);
+            }
+        }
+        if self
+            .renderer
+            .task_strip
+            .as_ref()
+            .is_some_and(|s| s.message.is_some())
+        {
+            let run = self
+                .active_tab()
+                .active_pane()
+                .task_run
+                .as_deref()
+                .filter(|r| self.tasks.tasks.as_ref().is_some_and(|t| t.root == r.root));
+            let notice = run.and_then(|r| r.integration_notice(now));
+            if notice.is_some() {
+                let expires = run.unwrap().notice_deadline();
+                deadline = Some(deadline.map_or(expires, |d| d.min(expires)));
+            }
+            let message = self.task_note().or_else(|| notice.map(str::to_string));
+            if self
+                .renderer
+                .task_strip
+                .as_ref()
+                .and_then(|s| s.message.as_ref())
+                != message.as_ref()
+            {
+                self.begin_redraw();
+            }
+        }
+        deadline
     }
 
     /// Open the workspace card with Tasks expanded (e.g. to review a file).
@@ -5879,6 +5919,10 @@ impl ApplicationHandler<VoltEvent> for App {
         let mut windows_to_close = Vec::new();
 
         for (window_id, state) in self.windows.iter_mut() {
+            if let Some(deadline) = state.tick_task_notices() {
+                next_blink_deadline =
+                    Some(next_blink_deadline.map_or(deadline, |d| d.min(deadline)));
+            }
             // Once per 250 ms, not per output chunk/frame. This also works for
             // shells without OSC 7 and inactive tabs, without reading their files.
             if Instant::now() >= state.next_context_poll {

@@ -19,3 +19,7 @@ pub mod task_strip;
 mod prompt_viewport;
 
 pub mod settings;
+
+pub mod tab_layout {
+    pub use volt_ui_kit::tab_layout::*;
+}

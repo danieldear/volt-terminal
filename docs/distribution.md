@@ -123,3 +123,9 @@ an install/launch test before that release is advertised as fully validated.
 References:
 - [Apple notarization documentation](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
 - Local `xcrun notarytool --help`, `codesign`, `stapler` and `spctl` validation.
+
+## Draft testing releases
+
+Draft releases are visible only to repository users with the required access; they do not change the public Latest release. The Release workflow's manual dispatch has a `draft` input that defaults to true. For a tag-triggered draft build, create and verify the draft against the merged commit **before** pushing its version tag. The workflow preserves existing draft status while uploading signed packages and checksums. Do not publish the draft until cross-system testing is accepted.
+
+The v0.1.12 testing build includes platform-readable shortcut labels, transient task-integration notices, and the pinned shared UI snapshot required by Volt's renderer. The standalone toolkit remains independently maintained. The public release remains v0.1.11 until a later explicit publication.
