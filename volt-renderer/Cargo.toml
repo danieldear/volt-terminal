@@ -12,7 +12,7 @@ winit = "0.30"
 cosmic-text = "0.11"
 unicode-width = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
-pollster = "0.3"
+pollster = "1.0"
 tokio = { workspace = true, features = ["rt", "sync"] }
 volt-core = { path = "../volt-core" }
 volt-config = { path = "../volt-config" }

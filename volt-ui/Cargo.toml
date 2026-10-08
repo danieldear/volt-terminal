@@ -14,7 +14,7 @@ ignore = "0.4"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 winit = "0.30"
-pollster = "0.3"
+pollster = "1.0"
 tokio = { workspace = true, features = ["rt", "sync"] }
 volt-core = { path = "../volt-core" }
 volt-renderer = { path = "../volt-renderer" }
