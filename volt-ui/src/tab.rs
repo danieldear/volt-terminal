@@ -239,9 +239,24 @@ impl Selection {
             if matches!(sel.mode, SelectionMode::Block) {
                 out.push_str(&line);
             } else {
-                out.push_str(line.trim_end_matches(' '));
+                let soft_wrapped = if row < history {
+                    grid.scrollback_row_soft_wrapped(row)
+                } else {
+                    grid.row_soft_wrapped(row - history)
+                };
+                // Spaces at a soft-wrap boundary are text, not padding.
+                if soft_wrapped && row != end {
+                    out.push_str(&line);
+                } else {
+                    out.push_str(line.trim_end_matches(' '));
+                }
             }
-            if row != end {
+            let soft_wrapped = if row < history {
+                grid.scrollback_row_soft_wrapped(row)
+            } else {
+                grid.row_soft_wrapped(row - history)
+            };
+            if row != end && (matches!(sel.mode, SelectionMode::Block) || !soft_wrapped) {
                 out.push('\n');
             }
         }

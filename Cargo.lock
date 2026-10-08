@@ -2500,6 +2500,7 @@ dependencies = [
  "objc",
  "pollster",
  "raw-window-handle",
+ "serde",
  "serde_json",
  "tokio",
  "toml",

@@ -451,5 +451,16 @@ Source the bundled Zsh/Bash integration to record shell prompts. Fish 4.9.3
 emits compatible OSC 133 markers by itself; do not source a Fish hook.
 `Cmd+Shift+Up` / `Cmd+Shift+Down` navigate prompt history without sending input
 to the shell. Custom actions: `previous_prompt` and `next_prompt`.
-Anchors are bounded and discarded on resize; command-output selection is not
-yet implemented. See [setup, compatibility and validation](docs/shell-integration.md).
+In the unreleased compatibility branch, anchors survive resize/reflow and
+`Cmd+Shift+O` selects the last completed command's output (`select_command_output`
+for custom bindings). Use `Cmd+C` to copy it. Shell completion markers are required;
+Volt does not guess command boundaries from terminal text. This is not yet part
+of the v0.1.12 draft. See [current implementation and testing](docs/terminal-compatibility.md).
+
+### Unreleased terminal compatibility work
+
+DEC 2026 synchronized output, negotiated extended keyboard input, command-output
+selection and opt-in workspace layout restoration are implemented on the
+compatibility branch. They are not in the existing v0.1.12 draft. See
+[behavior, boundaries and validation](docs/terminal-compatibility.md). Linux
+clipboard/desktop work is deferred pending a test system.

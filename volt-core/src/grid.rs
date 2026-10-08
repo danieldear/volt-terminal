@@ -65,6 +65,7 @@ struct ReflowSource<'a> {
     soft_wrapped: &'a [bool],
     cols: usize,
     rows: usize,
+    anchors: &'a [(usize, usize)],
 }
 
 struct ReflowResult {
@@ -75,6 +76,7 @@ struct ReflowResult {
     pending_wrap: bool,
     history: Vec<Cell>,
     history_wrapped: Vec<bool>,
+    anchors: Vec<Option<(usize, usize)>>,
 }
 
 struct ReflowTarget {
@@ -89,6 +91,20 @@ struct CursorSnapshot {
 }
 
 impl Grid {
+    /// A synchronized frame needs only visible cells, never a second copy of
+    /// configured scrollback. Extended text/link IDs are remapped by the
+    /// existing bounded blitter. This path runs only on explicit DECSET 2026.
+    pub(crate) fn presentation_snapshot(&self) -> Self {
+        let mut out = Self::new_alt(self.cols, self.rows);
+        for row in 0..self.rows {
+            out.copy_text_from_grid(row, 0, self, self.row_cells(row));
+            out.set_row_soft_wrapped(row, self.row_soft_wrapped(row));
+        }
+        out.cursor_col = self.cursor_col;
+        out.cursor_row = self.cursor_row;
+        out
+    }
+
     pub fn new(cols: usize, rows: usize) -> Self {
         let cols = cols.max(1);
         let rows = rows.max(1);
@@ -533,6 +549,7 @@ impl Grid {
                 pending_wrap: false,
                 history: Vec::new(),
                 history_wrapped: Vec::new(),
+                anchors: vec![None; source.anchors.len()],
             };
         }
 
@@ -558,6 +575,16 @@ impl Grid {
             visual_wraps.push(source.soft_wrapped[physical]);
         }
 
+        let mut sorted_anchors: Vec<_> = source
+            .anchors
+            .iter()
+            .enumerate()
+            .map(|(id, &(r, c))| (r, c, id))
+            .collect();
+        sorted_anchors.sort_unstable();
+        let mut next_anchor = 0;
+        let mut anchor_logical = vec![None; source.anchors.len()];
+        let mut anchor_virtual = vec![None; source.anchors.len()];
         let mut logical_lines: Vec<Vec<Cell>> = Vec::new();
         let mut current: Vec<Cell> = Vec::new();
         let mut line_idx = 0usize;
@@ -566,6 +593,23 @@ impl Grid {
         for (row, (row_cells, &row_wraps)) in
             visual_rows.iter().zip(visual_wraps.iter()).enumerate()
         {
+            while let Some(&(r, c, id)) = sorted_anchors.get(next_anchor) {
+                if r != row {
+                    break;
+                }
+                next_anchor += 1;
+                {
+                    let physical = source.row_map[row];
+                    let prefix = &source.cells
+                        [physical * source.cols..physical * source.cols + c.min(source.cols)];
+                    let offset: usize = prefix
+                        .iter()
+                        .filter(|cell| !cell.is_wrap_spacer())
+                        .map(|cell| if cell.is_clipped_wide() { 2 } else { 1 })
+                        .sum();
+                    anchor_logical[id] = Some((line_idx, current.len() + offset));
+                }
+            }
             if row == cursor.row {
                 cursor_line_idx = line_idx;
                 cursor_offset = current.len()
@@ -610,6 +654,13 @@ impl Grid {
         let mut cursor_virtual_col = 0usize;
         let mut cursor_pending_wrap = false;
 
+        let mut sorted_logical: Vec<_> = anchor_logical
+            .iter()
+            .enumerate()
+            .filter_map(|(id, p)| p.map(|(line, offset)| (line, offset, id)))
+            .collect();
+        sorted_logical.sort_unstable();
+        let mut next_logical = 0;
         for (idx, line) in logical_lines.iter().enumerate() {
             let line_start = virtual_rows.len();
             let mut line_len = Grid::trim_trailing_spaces_len(line);
@@ -658,6 +709,14 @@ impl Grid {
                 }
             }
 
+            while let Some(&(line, offset, id)) = sorted_logical.get(next_logical) {
+                if line != idx {
+                    break;
+                }
+                next_logical += 1;
+                let (r, c) = positions[offset.min(line_len)];
+                anchor_virtual[id] = Some((line_start + r, c));
+            }
             if idx != cursor_line_idx {
                 continue;
             }
@@ -680,6 +739,13 @@ impl Grid {
         if virtual_rows.is_empty() {
             virtual_rows.push(vec![Cell::default(); target.cols]);
             virtual_wraps.push(false);
+        }
+        // A completed output can end exclusively after the final source row.
+        // It has no source cell, but must survive a second consecutive reflow.
+        for &(row, col, id) in &sorted_anchors[next_anchor..] {
+            if row == source.rows && col == 0 {
+                anchor_virtual[id] = Some((virtual_rows.len(), 0));
+            }
         }
         if cursor_virtual_row >= virtual_rows.len() {
             cursor_virtual_row = virtual_rows.len() - 1;
@@ -727,6 +793,7 @@ impl Grid {
                 .copied()
                 .collect(),
             history_wrapped: virtual_wraps[..window_start].to_vec(),
+            anchors: anchor_virtual,
         }
     }
 
@@ -737,10 +804,12 @@ impl Grid {
         if cols == self.cols && rows == self.rows {
             return;
         }
-        // Reflow changes visual row coordinates. Drop anchors rather than
-        // navigating to unrelated text until anchor remapping is implemented.
-        self.prompt_marks = None;
+        let anchors = self
+            .prompt_marks
+            .as_ref()
+            .map_or_else(Vec::new, |m| m.anchors());
         if !self.history_enabled {
+            self.prompt_marks = None;
             // Alternate-screen TUIs own their layout and redraw on SIGWINCH.
             // Resize their rectangle, never reflow it into shell history.
             let mut cells = vec![Cell::default(); cols * rows];
@@ -775,6 +844,7 @@ impl Grid {
                     soft_wrapped: &wrapped,
                     cols: self.cols,
                     rows: count,
+                    anchors: &anchors,
                 },
                 ReflowTarget { cols, rows },
                 CursorSnapshot {
@@ -791,6 +861,9 @@ impl Grid {
             self.scrollback_start = 0;
             // Reflow changes row identities; callers must discard selections.
             self.scrollback_origin = 0;
+            if let Some(marks) = &mut self.prompt_marks {
+                marks.remap(&result.anchors, skip, history_count - skip + rows);
+            }
             self.cells = result.cells;
             self.soft_wrapped = result.wrapped;
             self.cursor_col = result.cursor_col;
@@ -1070,6 +1143,29 @@ impl Grid {
                 .get_or_insert_with(Default::default)
                 .add(self.scrollback_count + self.cursor_row);
         }
+    }
+
+    pub(crate) fn mark_output_start(&mut self) {
+        if self.history_enabled {
+            self.prompt_marks
+                .get_or_insert_with(Default::default)
+                .start_output(
+                    self.scrollback_count + self.cursor_row,
+                    self.cursor_col + usize::from(self.pending_wrap),
+                );
+        }
+    }
+    pub(crate) fn mark_output_end(&mut self) {
+        if let Some(marks) = &mut self.prompt_marks {
+            marks.end_output(
+                self.scrollback_count + self.cursor_row,
+                self.cursor_col + usize::from(self.pending_wrap),
+            );
+        }
+    }
+    /// End is exclusive; coordinates refer to retained history + live rows.
+    pub fn latest_command_output(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.prompt_marks.as_ref()?.latest_output()
     }
 
     fn invalidate_live_prompts(&mut self) {

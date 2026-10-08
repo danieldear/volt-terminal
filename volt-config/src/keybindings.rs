@@ -17,6 +17,7 @@ pub enum Action {
     PreviousTab,
     MoveTabLeft,
     MoveTabRight,
+    SelectCommandOutput,
     PreviousPrompt,
     NextPrompt,
     SplitRight,

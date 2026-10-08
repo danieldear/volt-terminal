@@ -127,7 +127,9 @@ This batch does **not** complete the entire feature roadmap.
   Raw measurements and rejected experiments are recorded in `docs/osc8-links.md`.
 
 Next implementation batch is shell integration and command/prompt navigation.
-The protocol/restoration/ligature/graphics phases are still not delivered.
+That was the status at batch 2. For current protocol/restoration source work,
+see [the unreleased compatibility batch](terminal-compatibility.md). Ligature,
+image, clipboard protocol and general accessibility delivery remain separate.
 
 ### Batch 3: prompt navigation and opt-in shell hooks
 

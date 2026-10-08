@@ -56,6 +56,73 @@ impl PaneTree {
         }
     }
 
+    pub(crate) fn saved_layout(&self) -> crate::session::Node {
+        fn node(n: &PaneNode) -> crate::session::Node {
+            match n {
+                PaneNode::Leaf { pane, .. } => crate::session::Node::Pane {
+                    cwd: pane.local_cwd(),
+                },
+                PaneNode::Split {
+                    direction,
+                    ratio,
+                    children,
+                    ..
+                } => crate::session::Node::Split {
+                    vertical: matches!(direction, PaneSplitDirection::Vertical),
+                    ratio: ratio.clamp(0.1, 0.9),
+                    children: Box::new([node(&children[0]), node(&children[1])]),
+                },
+            }
+        }
+        node(self.root.as_ref().expect("pane tree root"))
+    }
+
+    pub(crate) fn restore_layout(
+        layout: &crate::session::Node,
+        spawn: &mut impl FnMut(Option<&std::path::Path>) -> anyhow::Result<TerminalPane>,
+    ) -> anyhow::Result<Self> {
+        fn restore(
+            n: &crate::session::Node,
+            id: &mut usize,
+            spawn: &mut impl FnMut(Option<&std::path::Path>) -> anyhow::Result<TerminalPane>,
+        ) -> anyhow::Result<PaneNode> {
+            let current = *id;
+            *id += 1;
+            Ok(match n {
+                crate::session::Node::Pane { cwd } => PaneNode::Leaf {
+                    id: current,
+                    pane: spawn(cwd.as_deref().filter(|p| p.is_dir()))?,
+                },
+                crate::session::Node::Split {
+                    vertical,
+                    ratio,
+                    children,
+                } => PaneNode::Split {
+                    direction: if *vertical {
+                        PaneSplitDirection::Vertical
+                    } else {
+                        PaneSplitDirection::Horizontal
+                    },
+                    ratio: *ratio,
+                    divider_id: current,
+                    children: Box::new([
+                        restore(&children[0], id, spawn)?,
+                        restore(&children[1], id, spawn)?,
+                    ]),
+                },
+            })
+        }
+        let mut next_id = 0;
+        let root = restore(layout, &mut next_id, spawn)?;
+        let mut leaves = Vec::new();
+        collect_leaf_ids(&root, &mut leaves);
+        Ok(Self {
+            root: Some(root),
+            active_id: leaves[0],
+            next_id,
+        })
+    }
+
     pub fn split(
         &mut self,
         target_id: usize,

@@ -1,7 +1,7 @@
 # Volt roadmap
 
 Volt is an early public preview (source version: **0.1.12**). This page lists
-what works today and what comes next. Status reconciled on **2026-10-07** against
+what works today and what comes next. Status reconciled on **2026-10-08** against
 the current source, release metadata and hosted signing validation. Order within a stage is a rough priority,
 not a promise or a date. Settings and shortcuts may change before 1.0.
 
@@ -31,8 +31,8 @@ publicly released are separate milestones; a pending check is not missing code.
 
 | Area | Completed evidence | What remains |
 | --- | --- | --- |
-| macOS signing and notarization | Developer ID signing, hardened runtime, timestamp, Apple acceptance, stapling and extracted-ZIP verification passed locally and in [hosted validation](https://github.com/danieldear/volt-terminal/actions/runs/37572203978). Repository mode is `notarized` for future releases. | Publish a new reviewed version and test its downloaded public ZIP. Existing [v0.1.10](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.10) is still ad-hoc signed; it was not replaced or relabeled. **Do not redo credential setup.** |
-| Rendering optimizations | Local ASCII/extended shape caches and task-strip geometry reuse passed targeted CPU/GPU checks. | Review/merge the local changes; perform matched visible-window benchmarks before claiming a whole-app speedup. See [measurement evidence](performance-intelligent-rendering.md). |
+| macOS signing and notarization | Developer ID signing, hardened runtime, timestamp, Apple acceptance, stapling and extracted-ZIP verification passed locally and in [hosted validation](https://github.com/danieldear/volt-terminal/actions/runs/37572203978). Repository mode is `notarized` for future releases. | Public v0.1.11 is notarized. v0.1.12 is a notarized draft with signature/staple/Gatekeeper verification; the user reports cross-system testing passed. Draft publication remains explicit. Older v0.1.10 stays ad-hoc; **do not redo credential setup.** |
+| Rendering optimizations | Merged ASCII/extended shape caches and task-strip geometry reuse passed targeted CPU/GPU checks. | Caches are merged. Perform matched visible-window benchmarks before claiming a whole-app speedup. See [measurement evidence](performance-intelligent-rendering.md). |
 | Project tasks and tab status | Current-pane execution, task import/form, trust review and shell completion handling exist. | Verify directory changes, status transitions and all card/strip routes across supported shells; fix demonstrated regressions rather than rebuild the feature. |
 
 See [distribution evidence](distribution.md) for the distinction between a
@@ -56,30 +56,36 @@ validated signing pipeline and a downloadable notarized public release.
   infer "fastest" from unmatched fonts, grids or parser-only results.
 - **Notarized public release**: release and download/launch verification of the
   already validated pipeline; no new signing implementation is required.
-- **Synchronized output and extended keyboard**: prioritize these modern TUI
-  capabilities after the baseline regression/performance gates are established.
+- **Synchronized output and extended keyboard**: implemented in the unreleased
+  compatibility branch. Native editor/TUI acceptance remains; see the batch report.
 - **Linux usability**: clipboard integration and platform-appropriate desktop
   behavior. Do not promise macOS Secure Event Input parity on Linux; its threat
   model and compositor support require a separate design.
-- **Select command output**: select a whole command's output in one action,
-  using shell-integration marks. Prompt marks should also survive reflow.
+- **Select command output**: implemented in the unreleased compatibility branch,
+  with prompt/output anchors surviving reflow. Native shell acceptance remains.
 - **Key sequences and key tables**: multi-key bindings on top of today's
   single-chord shortcuts.
 - **Link hover**: highlight a whole link on hover before ⌘-click.
 
-## Planned
+## Implemented for the next preview — not yet released
 
 - **Synchronized output** (DEC mode 2026): full-screen programs redraw in a
   single frame. A timeout release and resize recovery prevent a stuck screen.
 - **Extended keyboard protocol**: precise key, modifier, repeat and release
   reporting for editors and TUIs that request it. Legacy input is unchanged
   when it is off.
-- **Clipboard for programs** (OSC 52): copy requests with deny, ask or allow
-  policies per pane. Clipboard reads are denied by default, and payloads are
-  bounded.
 - **Layout restoration** (opt-in): reopen windows, tabs, splits, split sizes
   and local folders. Commands, terminal output, passwords and running
   processes are never restored.
+
+The source-level implementation and pending native acceptance are documented
+in [terminal-compatibility.md](terminal-compatibility.md). IME support has been
+improved; the full VoiceOver semantic bridge is still open.
+
+## Planned
+
+- **Clipboard for programs** (OSC 52): copy requests with deny, ask or allow
+  policies per pane. Clipboard reads must be denied by default and payloads bounded.
 
 ## Later
 
@@ -109,16 +115,16 @@ not instructions to reimplement them.
 | P0 | Terminal compatibility | Correct cursor, colors, modes, scrolling and application control sequences. | Common behavior is essential; every extension is not. | Common ANSI/xterm subset implemented. Extend regression coverage and fix confirmed defects; do not claim full conformance. |
 | P0 | Performance | Output throughput, responsive typing, consistent redraws and low idle resource use. | Essential without removing features or safety checks. | Local cache improvements tested; matched visible-window verification pending. |
 | P0 | Project task and tab reliability | Run commands in the selected pane and show accurate directory, busy, success and failure state. | Essential to existing workflows. | Implemented. Validate all card/strip routes and supported shells; without completion hooks show unknown/sent, never invented success. |
-| P0 | Notarized public distribution | Trusted macOS installation and accurately labeled downloads. | Essential for public adoption. | Pipeline implemented and validated. Publish/test a new public release; do not repeat credential setup. |
+| P0 | Notarized public distribution | Trusted macOS installation and accurately labeled downloads. | Essential for public adoption. | Public v0.1.11 is notarized; tested v0.1.12 remains draft. Do not repeat credential setup. |
 | P0 audit; P1 fixes | Accessibility / IME | Screen-reader navigation and correct multilingual input composition. | Essential usability work. | Audit native behavior and fix demonstrated blockers. Emoji insertion does not establish full IME support. |
 | P0 maintain | Graphical Settings and skippable first-run setup | Configure appearance, shell/prompt, terminal behavior and shortcuts without editing TOML; learn tasks and navigation. | Faster, safer setup for new users while keeping manual configuration. | Implemented in source; native/GPU/config/shell checks documented in [Settings](settings.md). Included starting with v0.1.11; not in older v0.1.10 archives. |
 | P0 maintain | Tabs, splits and search | Organize shells/editors and find project files or retained terminal output. | Already part of the product. | Implemented. Preserve selection, focus, modal routing and cache invalidation through changes. |
 | P1 | Synchronized output (DEC 2026) | Present a bracketed TUI screen update together instead of exposing partial redraws. | Important for modern TUIs. | Not implemented. Add bounded timeout and resize/close recovery. |
 | P1 | Extended keyboard reporting | Unambiguous modifiers and negotiated press/repeat/release events. | Important for modern editors/TUIs. | Not implemented. Preserve legacy defaults, IME and application shortcuts. |
-| P1 | Prompt/output navigation | Select a command's output and retain prompt anchors after reflow. | Useful shell-integration completion. | Prompt navigation exists; command-output selection and anchor-preserving reflow remain. |
-| P2 | Session/layout restoration | Reopen windows, pane arrangement and local directories, not processes. | Useful everyday convenience. | Not implemented. Opt-in, atomic/versioned state with bounded validation. |
+| P1 | Prompt/output navigation | Select a command's output and retain prompt anchors after reflow. | Useful shell-integration completion. | Unreleased branch: command-output selection and sparse anchor reflow implemented; shell markers required. Native selection acceptance pending. |
+| P2 | Session/layout restoration | Reopen windows, pane arrangement and local directories, not processes. | Useful everyday convenience. | Unreleased branch: opt-in private atomic/versioned state, windows/tabs/splits/ratios/active pane/colors/local CWD only. Native custom-tab lifecycle acceptance pending. |
 | P2 | Key sequences and key tables | Context-specific and multi-key shortcuts beyond a single chord. | Useful for configurable workflows. | Single-chord overrides exist; sequences/tables remain. |
-| P2 | Linux usability | Clipboard integration and appropriate desktop behavior. | Needed before claiming platform parity. | Release archives exist; clipboard/desktop acceptance remains. macOS Secure Event Input is not a portable Linux guarantee. |
+| P2 | Linux usability | Clipboard integration and appropriate desktop behavior. | Needed before claiming platform parity. | Deferred by user until a Linux test system is available; do not claim clipboard/desktop parity. |
 | P2 | Link hover | Make the target and full clickable span clear before opening a URL. | Useful interaction polish. | Safe click handling exists; whole-link hover grouping remains. |
 | P2, security-gated | OSC 52 clipboard | Allow terminal applications to request clipboard operations. | Optional and sensitive. | Not implemented. Future policy must bound requests, attribute panes and deny reads by default. |
 | P3 | Programming ligatures | Combined programming-font shapes without changing underlying text. | Optional polish. | Shaped-run support missing; keep cell/cursor/selection alignment and disableable behavior. |
@@ -172,3 +178,5 @@ Potential ideas do not delay terminal correctness or the validated release path.
 
 Missing something, or want a feature moved up?
 [Open an issue on GitHub](https://github.com/danieldear/volt-terminal/issues).
+
+Current unreleased evidence and remaining native acceptance: [terminal compatibility](terminal-compatibility.md).

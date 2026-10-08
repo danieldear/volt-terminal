@@ -218,6 +218,8 @@ fn default_workspace_enabled() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
+    pub session: SessionConfig,
+    #[serde(default)]
     pub setup: SetupConfig,
     #[serde(default, deserialize_with = "crate::keybindings::deserialize_bindings")]
     pub keybindings: Vec<crate::keybindings::KeyBinding>,
@@ -237,6 +239,12 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     #[serde(default)]
     pub editor: EditorConfig,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionConfig {
+    /// Save layout only, never output or commands. Opt-in and off by default.
+    #[serde(default)]
+    pub restore: bool,
 }
 fn default_theme() -> String {
     "catppuccin".to_string()
@@ -539,6 +547,12 @@ layout = "docked"
 # Increase this for high-output commands such as `adb logcat`.
 # Memory usage is roughly: scrollback_lines × terminal_cols × 24 bytes.
 scrollback_lines = 10000
+
+# ── Session layout (opt-in) ────────────────────────────────────────────────────
+# [session]
+# restore = false
+# Reopen custom tabs, splits, colors and local folders as fresh shells.
+# Never restores running processes, commands, terminal output or passwords.
 "#,
         shell = shell
     )

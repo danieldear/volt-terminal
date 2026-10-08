@@ -366,6 +366,8 @@ impl Settings {
                 ),
             ],
             7 => vec![
+                toggle("restore", "Restore workspace layout", c.session.restore,
+                    "Next launch: tabs, splits and local folders only; no commands or output. Custom tabs only"),
                 row(
                     "editor",
                     "Default file editor",
@@ -879,6 +881,7 @@ impl Settings {
                         PromptMode::Existing
                     }
                 }
+                "restore" => c.session.restore = v == "On",
                 "integration" => c.shell.integration = v == "On",
                 "workspace_enabled" => c.workspace.enabled = v == "On",
                 "layout" => {
@@ -929,7 +932,10 @@ impl Settings {
             }
             3 => self.draft.workspace = defaults.workspace,
             5 => self.draft.keybindings.clear(),
-            7 => self.draft.editor = defaults.editor,
+            7 => {
+                self.draft.editor = defaults.editor;
+                self.draft.session = defaults.session;
+            }
             _ => {}
         }
         self.edit = None;
@@ -976,6 +982,11 @@ fn shortcut_rows(c: &Config) -> Vec<Row> {
         (A::FocusRight, "Focus right", "super+alt+right"),
         (A::FocusUp, "Focus up", "super+alt+up"),
         (A::FocusDown, "Focus down", "super+alt+down"),
+        (
+            A::SelectCommandOutput,
+            "Select last command output",
+            "super+shift+o",
+        ),
         (A::PreviousPrompt, "Previous prompt", "super+shift+up"),
         (A::NextPrompt, "Next prompt", "super+shift+down"),
         (A::IncreaseFontSize, "Increase font size", "super+equal"),
@@ -1218,7 +1229,7 @@ mod tests {
     #[test]
     fn all_default_shortcuts_use_native_names() {
         let rows = shortcut_rows(&Config::default());
-        assert_eq!(rows.len(), 30);
+        assert_eq!(rows.len(), 31);
         if cfg!(target_os = "macos") {
             assert!(rows
                 .iter()
