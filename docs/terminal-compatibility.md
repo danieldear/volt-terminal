@@ -1,4 +1,4 @@
-# Terminal compatibility batch — v0.1.13 source
+# Terminal compatibility batch — v0.1.14 source
 
 This work originated on `feature/terminal-compatibility`, based on reviewed main
 `e088e4e` (v0.1.12). **The existing v0.1.12 release does not contain these changes.**

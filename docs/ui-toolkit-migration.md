@@ -194,3 +194,11 @@ unmaintained-package warnings). Secret scanning found two false positives in
 verified inventory checksums; the detector retains default rules and exempts
 only those exact lines in that exact manifest. Independent inventory tests
 verify the hashes, and synthetic API keys in/outside the manifest are rejected.
+
+## v0.1.14 release decision
+
+The follow-up Unicode buffer-reuse fix and its tests are included in v0.1.14.
+The maintainer reports real-app performance near 23 seconds and has accepted
+the build for release. This does not turn the historical failed offscreen
+batches into passes or establish a universal throughput claim. See the
+[fix, repeated measurements and acceptance boundaries](unicode-rendering-performance.md).

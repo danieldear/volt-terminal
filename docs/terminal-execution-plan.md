@@ -18,7 +18,9 @@ for source/tests, GPU fixtures, native UI, benchmarks and public artifacts.
   Local and hosted Apple acceptance, stapling and extracted-ZIP checks passed.
   Future release mode is `notarized`; see [distribution.md](distribution.md).
 - Public v0.1.12 is notarized; the user reports testing passed. v0.1.13
-  is being prepared, with UI Kit 0.4.0 performance acceptance still open. Older v0.1.10 stays ad-hoc. Do not redo signing setup.
+  remains a testing draft. v0.1.14 includes Unicode buffer reuse; user-reported
+  real-app results near 23 seconds are accepted for release. Offscreen evidence
+  remains inconclusive, not an automated no-regression pass. Older v0.1.10 stays ad-hoc. Do not redo signing setup.
 - Recent rendering/parser optimizations are merged changes with targeted evidence.
   Visible-window end-to-end acceptance is pending; do not market microbenchmark
   gains as a terminal throughput or display-latency improvement.
