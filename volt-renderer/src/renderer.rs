@@ -378,6 +378,31 @@ struct CachedRow {
     glyphs: Vec<GlyphVertex>,
 }
 impl CachedRow {
+    fn capture_source(&mut self, grid: &Grid, row: usize, key: RowKey) {
+        self.cells.clear();
+        self.cells.extend_from_slice(grid.row_cells(row));
+        // Full-row churn often changes only a counter/prefix. Keep owned
+        // grapheme buffers instead of freeing and allocating them every frame.
+        // IDs are grid-local: always capture/compare text, never trust IDs alone.
+        let mut count = 0;
+        if grid.has_extended_text() {
+            for (col, cell) in grid.row_cells(row).iter().enumerate() {
+                if let Some(text) = grid.extended_text(cell) {
+                    if let Some((old_col, old_text)) = self.extended.get_mut(count) {
+                        *old_col = col;
+                        if old_text != text {
+                            text.clone_into(old_text);
+                        }
+                    } else {
+                        self.extended.push((col, text.to_string()));
+                    }
+                    count += 1;
+                }
+            }
+        }
+        self.extended.truncate(count);
+        self.key = key;
+    }
     fn matches(&self, grid: &Grid, row: usize, key: RowKey) -> bool {
         self.key == key
             && self.cells == grid.row_cells(row)
@@ -2102,17 +2127,7 @@ impl Renderer {
                     .extend_from_slice(&glyph_verts[first_vertex..]);
             }
             cached.valid = cache_geometry;
-            cached.cells.clear();
-            cached.cells.extend_from_slice(grid.row_cells(row));
-            cached.extended.clear();
-            if grid.has_extended_text() {
-                for (col, cell) in grid.row_cells(row).iter().enumerate() {
-                    if let Some(text) = grid.extended_text(cell) {
-                        cached.extended.push((col, text.to_string()));
-                    }
-                }
-            }
-            cached.key = row_keys[row];
+            cached.capture_source(grid, row, row_keys[row]);
         }
 
         // ── tab bar ──────────────────────────────────────────────────────────
@@ -2762,6 +2777,136 @@ mod workspace_card_draw;
 
 #[cfg(test)]
 mod placement_tests {
+    #[test]
+    fn row_source_reuses_unchanged_grapheme_buffers_during_ascii_churn() {
+        let mut p = volt_core::performer::Performer::new(32, 2);
+        let mut parser = vte::Parser::new();
+        parser.advance(&mut p, "000000 é ẍ 👩‍💻 👍🏽".as_bytes());
+        let mut cached = super::CachedRow::default();
+        let key = super::RowKey::default();
+        cached.capture_source(&p.grid, 0, key);
+        // Reserve a larger retained string so freeing/recreating it cannot
+        // accidentally pass because malloc reused the same small address.
+        for (_, text) in &mut cached.extended {
+            text.reserve(256);
+        }
+        let allocations: Vec<_> = cached
+            .extended
+            .iter()
+            .map(|(col, text)| (*col, text.as_ptr(), text.capacity()))
+            .collect();
+        for i in 1..20 {
+            parser.advance(&mut p, format!("\x1b[1;1H{i:06}").as_bytes());
+            cached.capture_source(&p.grid, 0, key);
+            assert!(cached.matches(&p.grid, 0, key));
+            for ((col, text), (old_col, ptr, capacity)) in cached.extended.iter().zip(&allocations)
+            {
+                assert_eq!(col, old_col);
+                assert_eq!(text.as_ptr(), *ptr);
+                assert_eq!(text.capacity(), *capacity);
+            }
+        }
+        assert!(!allocations.is_empty());
+    }
+
+    #[test]
+    fn row_source_updates_moved_and_changed_clusters_without_stale_entries() {
+        let mut p = volt_core::performer::Performer::new(32, 2);
+        let mut parser = vte::Parser::new();
+        let key = super::RowKey::default();
+        let mut cached = super::CachedRow::default();
+        for text in ["👩‍💻 👍🏽", "---👨‍💻", "👩🏽‍💻 x", "plain", "👍🏽 👩‍💻"]
+        {
+            parser.advance(&mut p, format!("\x1b[1;1H\x1b[2K{text}").as_bytes());
+            cached.capture_source(&p.grid, 0, key);
+            let expected: Vec<_> = p
+                .grid
+                .row_cells(0)
+                .iter()
+                .enumerate()
+                .filter_map(|(col, cell)| p.grid.extended_text(cell).map(|s| (col, s.to_string())))
+                .collect();
+            assert_eq!(cached.extended, expected);
+            assert!(cached.matches(&p.grid, 0, key));
+        }
+    }
+
+    /// CPU-only cache-source bookkeeping, not GPU or whole-terminal speed.
+    #[test]
+    #[ignore]
+    fn benchmark_row_source_capture() {
+        use std::{hint::black_box, time::Instant};
+        let mut p = volt_core::performer::Performer::new(200, 2);
+        vte::Parser::new().advance(
+            &mut p,
+            format!("000000 {}", "👩‍💻 👍🏽 é ẍ 日本 ".repeat(12)).as_bytes(),
+        );
+        let key = super::RowKey::default();
+        let mut old = super::CachedRow::default();
+        let mut new = super::CachedRow::default();
+        let legacy = |c: &mut super::CachedRow| {
+            c.cells.clear();
+            c.cells.extend_from_slice(p.grid.row_cells(0));
+            c.extended.clear();
+            for (col, cell) in p.grid.row_cells(0).iter().enumerate() {
+                if let Some(text) = p.grid.extended_text(cell) {
+                    c.extended.push((col, text.to_string()));
+                }
+            }
+            c.key = key;
+        };
+        legacy(&mut old);
+        new.capture_source(&p.grid, 0, key);
+        assert_eq!(old.extended, new.extended);
+        let mut samples = [vec![], vec![]];
+        for repeat in 0..9 {
+            for path in if repeat % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let start = Instant::now();
+                for _ in 0..10_000 {
+                    if path == 0 {
+                        legacy(&mut old);
+                        black_box(&old);
+                    } else {
+                        new.capture_source(&p.grid, 0, key);
+                        black_box(&new);
+                    }
+                }
+                samples[path].push(start.elapsed().as_nanos() as f64 / 10_000.);
+            }
+        }
+        for times in &mut samples {
+            times.sort_by(f64::total_cmp);
+        }
+        println!(
+            "row source capture ns/row: legacy={:.1} retained={:.1} change={:.1}%",
+            samples[0][4],
+            samples[1][4],
+            100. * (samples[1][4] / samples[0][4] - 1.)
+        );
+        assert_eq!(old.cells, new.cells);
+        assert_eq!(old.extended, new.extended);
+    }
+
+    #[test]
+    fn row_source_compares_grid_local_ids_by_text_and_prunes_removed_clusters() {
+        let mut a = volt_core::performer::Performer::new(16, 2);
+        let mut b = volt_core::performer::Performer::new(16, 2);
+        vte::Parser::new().advance(&mut a, "👩‍💻".as_bytes());
+        vte::Parser::new().advance(&mut b, "👨‍💻".as_bytes());
+        // Both grids assign their first cluster the same local ID.
+        assert_eq!(a.grid.row_cells(0), b.grid.row_cells(0));
+        let key = super::RowKey::default();
+        let mut cached = super::CachedRow::default();
+        cached.capture_source(&a.grid, 0, key);
+        assert!(!cached.matches(&b.grid, 0, key));
+        cached.capture_source(&b.grid, 0, key);
+        assert!(cached.matches(&b.grid, 0, key));
+        assert!(!cached.matches(&a.grid, 0, key));
+        vte::Parser::new().advance(&mut b, b"\x1b[1;1H\x1b[2Kplain");
+        cached.capture_source(&b.grid, 0, key);
+        assert!(cached.extended.is_empty());
+        assert!(cached.matches(&b.grid, 0, key));
+    }
     #[test]
     fn ascii_style_slots_are_bounded_and_unique() {
         let mut seen = [false; 128 * 4];
