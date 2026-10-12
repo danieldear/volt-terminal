@@ -56,7 +56,7 @@ identical. It shows that this measurement setup has substantial system/per-proce
 variation even without a code change. It does not identify the cause of that
 variation, prove every earlier failure was noise, or justify waiving the gate.
 The four fix comparisons consistently improve Unicode full redraw, but static,
-ASCII and task results are inconsistent. Overall performance acceptance remains
+ASCII and task results are inconsistent. Offscreen performance acceptance remains
 inconclusive; do not call this a blanket no-regression pass.
 
 ## Functional acceptance
@@ -81,3 +81,13 @@ Repeat the offscreen comparison with an identical-binary control in stable
 conditions. A failed control makes code-level attribution inconclusive; it does
 not turn a failed release gate into a pass. No full-app performance result is
 claimed by this change.
+
+## Maintainer release acceptance — 2026-10-12
+
+After testing the buffer-reuse build in the real app, the maintainer reported
+performance near **23 seconds**, judged it good and explicitly requested release.
+That is user-reported runtime acceptance for v0.1.14, not an independently
+collected matched before/after trial set. The offscreen measurements above remain
+inconclusive and their failures are not removed or relabeled as passes. No
+benchmark threshold is changed and no universal throughput improvement is claimed.
+Release CI, security checks and notarized artifact validation remain required.

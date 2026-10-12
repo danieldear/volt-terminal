@@ -3664,7 +3664,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "volt"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "libc",
@@ -3675,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "volt-config"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "dirs 5.0.1",
  "libc",
@@ -3686,7 +3686,7 @@ dependencies = [
 
 [[package]]
 name = "volt-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "libc",
@@ -3701,7 +3701,7 @@ dependencies = [
 
 [[package]]
 name = "volt-renderer"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -3720,7 +3720,7 @@ dependencies = [
 
 [[package]]
 name = "volt-ui"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",

@@ -14,7 +14,7 @@ in Rust, for macOS and Linux.
 
 > ⚠️ **Early development.** Volt is functional on macOS, but it has not been validated as a daily driver; APIs and config formats may change before v1.0.
 
-**Public preview (October 2026):** [Volt v0.1.12](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.12)
+**Public preview (October 2026):** [Download the latest release](https://github.com/danieldear/volt-terminal/releases/latest)
 includes macOS and Linux archives with SHA-256 checksums. The macOS release
 workflow requires **Developer ID signing, Apple notarization and a stapled
 ticket** before publication. Check the release's `macos-signing-status.txt`
@@ -51,8 +51,11 @@ including the dynamic Services submenu, is genuine.
 
 ## Shared UI toolkit
 
-The v0.1.13 source includes the UI update and terminal compatibility batch.
-Performance acceptance is still open; see the [recorded toolkit measurements](docs/ui-toolkit-migration.md#rendering-comparison-acceptance-not-passed).
+The v0.1.14 source includes the UI update, terminal compatibility batch and
+Unicode row-cache buffer reuse. The maintainer reports real-app results near
+23 seconds and has accepted this build for release; this is not an independent
+matched benchmark or a claim of universal speedup. See the
+[performance investigation](docs/unicode-rendering-performance.md).
 
 
 Volt uses a pinned [Volt UI Kit snapshot](docs/ui-toolkit-migration.md) for its
@@ -332,7 +335,7 @@ commands, but not every shortcut or its key-equivalent hint.
 | `Enter` / `Shift+Enter` (Find open) | Next / previous terminal match |
 | `Ctrl+Cmd+F` | Toggle full screen |
 | `Cmd+K` | Clear screen and scrollback |
-| `Cmd+,` | Open config in editor |
+| `Cmd+,` | Open Settings |
 | `Cmd+Shift+R` | Reload config |
 | `Cmd+Q` | Quit |
 
@@ -462,16 +465,15 @@ Source the bundled Zsh/Bash integration to record shell prompts. Fish 4.9.3
 emits compatible OSC 133 markers by itself; do not source a Fish hook.
 `Cmd+Shift+Up` / `Cmd+Shift+Down` navigate prompt history without sending input
 to the shell. Custom actions: `previous_prompt` and `next_prompt`.
-In the unreleased compatibility branch, anchors survive resize/reflow and
+In v0.1.14, anchors survive resize/reflow and
 `Cmd+Shift+O` selects the last completed command's output (`select_command_output`
 for custom bindings). Use `Cmd+C` to copy it. Shell completion markers are required;
-Volt does not guess command boundaries from terminal text. This is not yet part
-of the v0.1.12 release. See [current implementation and testing](docs/terminal-compatibility.md).
+Volt does not guess command boundaries from terminal text. Older v0.1.12
+archives do not include these additions. See [current implementation and testing](docs/terminal-compatibility.md).
 
-### Unreleased terminal compatibility work
+### Terminal compatibility
 
 DEC 2026 synchronized output, negotiated extended keyboard input, command-output
-selection and opt-in workspace layout restoration are implemented on the
-compatibility branch. They are not in the existing v0.1.12 release. See
+selection and opt-in workspace layout restoration are included in v0.1.14. See
 [behavior, boundaries and validation](docs/terminal-compatibility.md). Linux
 clipboard/desktop work is deferred pending a test system.
