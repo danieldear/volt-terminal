@@ -7,3 +7,5 @@ pub mod performer;
 pub mod pty;
 
 mod shell;
+
+pub mod keyboard;

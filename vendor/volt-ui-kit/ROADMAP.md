@@ -1,40 +1,64 @@
 # Roadmap
 
-## Delivered: toolkit extraction
+Volt UI Kit is a Rust-first, renderer-independent toolkit with an optional native
+host. It is not yet a production-certified cross-platform application framework.
+Catalog is the current component acceptance app; older examples are regression
+fixtures. See [developer documentation](docs/README.md).
 
-- Terminal-independent presentation/layout models and vector paint recipes.
-- Generic button shared with Volt; application-specific widget compatibility.
-- Existing-host renderer adapter and static SVG backend.
-- Component gallery, unit tests and reproducible vendoring.
-- No additional GPU device, event loop or periodic redraw timer in Volt.
-- Glass-inspired generic Panel, smoked/frosted tokens, host-fed tint hysteresis.
-- Rounded/clipped topmost hit map with explicit background blockers.
+## Delivered foundation
 
-## Next: polish and generalization (high priority)
+- Extracted Volt presentation/layout/paint APIs, static-dispatch `Painter`, SVG
+  gallery and reproducible vendoring. Default dependency: `unicode-width` only.
+- Rust declarations, typed callbacks, stable keys and validated whole-view
+  recomposition; optional schema-1 JSON frontend with explicit reload.
+- Stacks/layers, responsive rules, grids/wrapping/constraints, semantic themes,
+  selective corners/spacing/borders, images, vector paths/icons and clipping.
+- Editable fields, IME/clipboard/undo foundation, selection/value/date/form
+  controls, bars/tabs/navigation, dialogs/disclosure/overlays and display/chart APIs.
+- Keyed nested scrolling, focus reveal, fixed-row virtualization, tables, trees
+  and pixel/ratio split panes; bounded worker messages and coalesced wakeups.
+- Optional Vello/wgpu GPU drawing, vector text, resident images, conservative
+  admission with GPU strips and software fallback; incremental software damage.
+- Bounded appearance/slide/ambient animations, reduced motion and display pacing.
+- Native accessibility tree/actions, macOS unified chrome, public Material and
+  explicit experimental private compositor blur.
+- Application scaffolding/dev runner, state-aware commands/close veto, native
+  macOS menus/tray, file panels, bounded local notifications and local `.app` bundles.
 
-- Replace compatibility-specific labels/action IDs with application-supplied metadata.
-- General-purpose Input, Checkbox, Tabs and selectable List APIs (Panel delivered).
-- Measured typography, clipping, long text, narrow-window and DPI improvements.
-- Shared keyboard focus model, pointer capture and predictable disabled/hover states.
-- Validate each change in the gallery and Volt; retain screenshot and performance gates.
+## Next: application and interaction maturity
 
-## Before calling this a complete framework (required)
+- Independent keyboard/screen-reader range-slider thumbs; dedicated result
+  navigation for comboboxes/command palettes; deeper composite semantics.
+- Human VoiceOver/Narrator/Orca, real IME/bidi, trackpad, resize/DPI and other-OS
+  native runtime acceptance. Headless checks do not close these gates.
+- Resolve and desktop-validate Material -> Compositor square external corners.
+  Public Material remains the default; private compositor blur is opt-in.
+- Profile native idle/scroll/animation/image churn, total memory/energy and device
+  loss. Bound caches and intermediate targets without stale frames or broken clips.
+- Fine-grained reconciliation/signals and cached/damaged GPU scenes; current
+  callbacks rebuild the whole view and admitted Vello scenes normally redraw fully.
+- Multi-window/state restoration/full OS termination, deeper navigation and
+  richer notification settings/actions/foreground lifecycle.
+- Dependency-stack maintenance without silently raising Rust 1.87, changing
+  renderer contracts or altering the embedded/Volt dependency footprint.
 
-- Native standalone winit/wgpu host with text shaping, IME, clipboard and undo/redo.
-- Accessibility semantic tree, actions and platform adapters.
-- Nested layout, constraints, scroll containers and virtualization.
-- Rich Unicode/multiline text editing and input method composition.
-- Platform-specific menus/dialogs/window lifecycle and multi-window validation.
-- Stable API, documentation, packaging, published crate and compatibility policy.
-- macOS/Linux/Windows runtime and assistive-technology validation.
+## Later, explicitly deferred
 
-## Later possibilities
+- Generic in-app GPU backdrop blur with explicit sources, bounded cached targets,
+  saturation/tint/opacity and alpha-correct clipping; native window blur is separate.
+- Springs/keyframes/layout animation, touch/gesture scrolling, variable-height
+  virtualization, toast timers, cascading submenus and interactive chart axes/tooltips.
+- Theme-editor tooling; debugging/inspection and richer reload tooling.
+- WebKit/maps/on-device AI/App Intents adapters after desktop-service acceptance.
+- Mobile hosts: touch, lifecycle, IME, accessibility and packaging require dedicated
+  platform work; portable declarations alone do not provide mobile support.
+- A desktop-style panel/dock/launcher demo inside a normal app window. A real
+  Wayland compositor/window manager is a separate project, not a demo setting.
 
-- Animation with reduced-motion support and explicit scheduling.
-- Optional GPU glass compositor: cached downsampled/separable blur, host-supplied backdrop, consistent color space, reduced-transparency fallback; no blur work for opaque widgets.
-- Additional renderer backends without changing widget APIs.
-- Rich tables, tree views and inspector-oriented controls.
-- Theme editor as a generic color/palette component.
+## Shipping gates
 
-No claim of automatic accessibility, full cross-platform framework readiness,
-or terminal benchmark parity is made by the initial extraction.
+Keep the [validation](docs/VALIDATION.md) and
+[security/performance](docs/SECURITY_AND_PERFORMANCE.md) boundaries explicit.
+Publishing/version policy, Developer ID/notarization/installers and other-platform
+packaging remain release work. Volt is a separately vendored consumer: canonical
+source changes do not imply a vendor sync, terminal performance or visual acceptance.

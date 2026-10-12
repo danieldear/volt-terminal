@@ -3,7 +3,7 @@ use anyhow::Result;
 use volt_config::Theme;
 use volt_core::grid::Grid;
 use volt_renderer::{
-    settings::{SettingsRow, SettingsView},
+    settings::{SettingsControl, SettingsDropdown, SettingsRow, SettingsView},
     Renderer,
 };
 fn draw(r: &mut Renderer, g: &Grid, t: &Theme) {
@@ -124,8 +124,54 @@ fn main() -> Result<()> {
                 r.settings = Some(view(onboarding, 1));
                 let l = r.settings_layout().expect("fits");
                 r.settings.as_mut().unwrap().rows.truncate(l.rows);
+                r.settings_toggles = r
+                    .settings
+                    .as_ref()
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| if i == 3 { Some(false) } else { None })
+                    .collect();
+                r.settings_controls = vec![
+                    SettingsControl::Choice,
+                    SettingsControl::Choice,
+                    SettingsControl::Number,
+                    SettingsControl::Switch(false),
+                ];
+                r.settings_controls
+                    .truncate(r.settings.as_ref().unwrap().rows.len());
+                r.settings_dropdown = None;
                 draw(&mut r, &g, &t);
                 let first = r.read_offscreen_rgba()?;
+                let field = volt_renderer::settings::control_rect(&l, 0);
+                let sample = |x: u32, y: u32| {
+                    &first[((y * w + x) * 4) as usize..((y * w + x) * 4 + 3) as usize]
+                };
+                let base = sample(
+                    (field[0] + 4. * scale) as u32,
+                    (field[1] + field[3] * 0.5) as u32,
+                );
+                let mut ink = 0;
+                for y in (field[1] + 6. * scale).ceil() as u32
+                    ..(field[1] + field[3] - 6. * scale).floor() as u32
+                {
+                    for x in (field[0] + field[2] - 32. * scale).ceil() as u32
+                        ..(field[0] + field[2] - 9. * scale).floor() as u32
+                    {
+                        if sample(x, y)
+                            .iter()
+                            .zip(base)
+                            .any(|(a, b)| a.abs_diff(*b) > 30)
+                        {
+                            ink += 1;
+                        }
+                    }
+                }
+                anyhow::ensure!(
+                    ink > 3,
+                    "missing toolkit select chevron, {name}, DPI {scale}"
+                );
                 for (i, label) in [
                     (0, if onboarding { "Next" } else { "Apply" }),
                     (1, if onboarding { "Skip" } else { "Cancel" }),
@@ -170,6 +216,79 @@ fn main() -> Result<()> {
                     "fresh settings pixels differ"
                 );
                 anyhow::ensure!(first != baseline, "Settings missing");
+                if r.settings_toggles.len() > 3 {
+                    // Same view: typed switch state must be part of cache identity.
+                    r.settings_toggles[3] = Some(true);
+                    r.settings_controls[3] = SettingsControl::Switch(true);
+                    draw(&mut r, &g, &t);
+                    let enabled = r.read_offscreen_rgba()?;
+                    anyhow::ensure!(enabled != first, "toggle state did not repaint");
+                    let row = l.row(3);
+                    for (pixel, (off, on)) in first
+                        .chunks_exact(4)
+                        .zip(enabled.chunks_exact(4))
+                        .enumerate()
+                    {
+                        if off != on {
+                            let x = (pixel as u32 % w) as f32;
+                            let y = (pixel as u32 / w) as f32;
+                            anyhow::ensure!(
+                                x >= row[0] + row[2] - 110. * scale
+                                    && x < row[0] + row[2]
+                                    && y >= row[1]
+                                    && y < row[1] + row[3],
+                                "toggle state change escaped right-hand row control"
+                            );
+                        }
+                    }
+                    draw(&mut r, &g, &t);
+                    anyhow::ensure!(enabled == r.read_offscreen_rgba()?, "toggle cache differs");
+                    if name == "gruvbox" && scale == 1. && !onboarding {
+                        png(
+                            "target/settingscheck/settings-toggle-on.png",
+                            w,
+                            h,
+                            &enabled,
+                        )?;
+                    }
+                    r.settings_toggles[3] = Some(false);
+                    r.settings_controls[3] = SettingsControl::Switch(false);
+                    draw(&mut r, &g, &t);
+                    anyhow::ensure!(first == r.read_offscreen_rgba()?, "toggle leaves ghosts");
+                }
+                r.settings_dropdown = Some(SettingsDropdown {
+                    row: 0,
+                    items: vec![
+                        "Gruvbox".into(),
+                        "Catppuccin".into(),
+                        "Nord".into(),
+                        "Tokyo Night".into(),
+                        "Dracula".into(),
+                    ],
+                    selected: 1,
+                    current: 0,
+                    offset: 0,
+                });
+                draw(&mut r, &g, &t);
+                let menu = r.read_offscreen_rgba()?;
+                anyhow::ensure!(menu != first, "dropdown missing");
+                draw(&mut r, &g, &t);
+                anyhow::ensure!(menu == r.read_offscreen_rgba()?, "dropdown cache changed");
+                r.update_scale(scale, 14.);
+                draw(&mut r, &g, &t);
+                anyhow::ensure!(
+                    menu == r.read_offscreen_rgba()?,
+                    "dropdown fresh/cache mismatch"
+                );
+                if name == "gruvbox" && scale == 1. && !onboarding {
+                    png("target/settingscheck/dropdown.png", w, h, &menu)?;
+                }
+                r.settings_dropdown = None;
+                draw(&mut r, &g, &t);
+                anyhow::ensure!(
+                    first == r.read_offscreen_rgba()?,
+                    "dropdown left stale glyphs"
+                );
                 if name == "gruvbox" && scale == 1. {
                     png(
                         &format!(
@@ -190,6 +309,79 @@ fn main() -> Result<()> {
                 cases += 1;
             }
         }
+    }
+    // Complete component mix at all supported backing scales.
+    for scale in [1., 1.5, 2.] {
+        let (w, h) = ((1000. * scale) as u32, (740. * scale) as u32);
+        let mut r = pollster::block_on(Renderer::new_offscreen(w, h, 14., scale, "SF Mono", 1.2))?;
+        let (cols, rows) = r.grid_size();
+        let g = Grid::new(cols, rows);
+        let t = Theme::by_name("gruvbox");
+        let mut v = view(false, 0);
+        let template = v.rows[0].clone();
+        v.rows = [
+            ("Theme", "gruvbox"),
+            ("Font family", "SF Mono"),
+            ("Font size", "14"),
+            ("Line height", "1.2"),
+            ("Padding", "12"),
+            ("Opacity", "0.85"),
+            ("Background blur", "On"),
+        ]
+        .into_iter()
+        .map(|(label, value)| SettingsRow {
+            label: label.into(),
+            value: value.into(),
+            adjustable: false,
+            editing: false,
+            caret: None,
+            selected: false,
+            ..template.clone()
+        })
+        .collect();
+        r.settings = Some(v);
+        r.settings_controls = vec![
+            SettingsControl::Choice,
+            SettingsControl::Choice,
+            SettingsControl::Number,
+            SettingsControl::Number,
+            SettingsControl::Number,
+            SettingsControl::Slider {
+                value: 0.85,
+                min: 0.1,
+                max: 1.,
+            },
+            SettingsControl::Switch(true),
+        ];
+        draw(&mut r, &g, &t);
+        let first = r.read_offscreen_rgba()?;
+        draw(&mut r, &g, &t);
+        anyhow::ensure!(first == r.read_offscreen_rgba()?, "component cache changed");
+        if scale == 1. {
+            png("target/settingscheck/appearance-controls.png", w, h, &first)?;
+        }
+        let v = r.settings.as_mut().unwrap();
+        v.rows[0].label = "Shell arguments".into();
+        v.rows[0].value = "[\"-l\"]".into();
+        v.rows[1].label = "New tab".into();
+        v.rows[1].value = "Cmd+T".into();
+        v.rows[2].label = "Edit theme colors".into();
+        v.rows[2].value = "Customize".into();
+        r.settings_controls[0] = SettingsControl::Text;
+        r.settings_controls[1] = SettingsControl::Shortcut;
+        r.settings_controls[2] = SettingsControl::Action("Customize…".into());
+        draw(&mut r, &g, &t);
+        let mixed = r.read_offscreen_rgba()?;
+        anyhow::ensure!(mixed != first, "component types did not invalidate cache");
+        draw(&mut r, &g, &t);
+        anyhow::ensure!(
+            mixed == r.read_offscreen_rgba()?,
+            "mixed components cache changed"
+        );
+        if scale == 1. {
+            png("target/settingscheck/mixed-controls.png", w, h, &mixed)?;
+        }
+        cases += 1;
     }
     println!("{cases} settings GPU cache/hide/theme/DPI cases passed");
     Ok(())

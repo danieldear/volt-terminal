@@ -72,6 +72,14 @@ pub struct Performer {
     bracketed_paste: bool,
     active_link: Option<Arc<Hyperlink>>,
     command_started: Option<std::time::Instant>,
+    synchronized: Option<Box<SynchronizedFrame>>,
+    keyboard: [crate::keyboard::KeyboardModes; 2],
+}
+
+struct SynchronizedFrame {
+    grid: Grid,
+    cursor_visible: bool,
+    deadline: std::time::Instant,
 }
 
 impl Performer {
@@ -82,6 +90,7 @@ impl Performer {
         if params.len() >= 2 && params[0] == b"133" && !self.use_alt_screen {
             match params[1] {
                 b"A" => {
+                    self.grid.mark_output_end();
                     self.grid.mark_prompt();
                     // A prompt also terminates stale busy state if a shell did
                     // not send D (e.g. interrupted input or prompt-only hooks).
@@ -94,6 +103,7 @@ impl Performer {
                 }
                 b"C" => {
                     if self.command_started.is_none() {
+                        self.grid.mark_output_start();
                         self.command_started = Some(std::time::Instant::now());
                         self.pending_events.push(CoreEvent::CommandStarted);
                     }
@@ -111,6 +121,7 @@ impl Performer {
                             None => return,
                         },
                     };
+                    self.grid.mark_output_end();
                     let duration_ms = self.command_started.take().map_or(0, |start| {
                         start.elapsed().as_millis().min(u64::MAX as u128) as u64
                     });
@@ -219,9 +230,33 @@ impl Performer {
         if ignore {
             return;
         }
+        if action == 'u' && matches!(intermediates, b"?" | b">" | b"<" | b"=") {
+            let flags = Self::param(params, 0);
+            let mode = Self::param(params, 1);
+            let keyboard = &mut self.keyboard[self.use_alt_screen as usize];
+            match intermediates {
+                b"?" => self
+                    .pending_writes
+                    .push(format!("\x1b[?{}u", keyboard.flags()).into_bytes()),
+                b">" => keyboard.push(flags),
+                b"<" => keyboard.pop(flags),
+                b"=" => keyboard.set(flags, mode),
+                _ => unreachable!(),
+            }
+            return;
+        }
         let private = intermediates == b"?";
         // Never execute unsupported private/intermediate sequences as their
         // ordinary CSI counterpart (e.g. DECSCA is not SGR).
+        if intermediates == b"?$" && action == 'p' {
+            if Self::param(params, 0) == 2026 {
+                self.expire_synchronized_output(std::time::Instant::now());
+                let state = if self.synchronized.is_some() { 1 } else { 2 };
+                self.pending_writes
+                    .push(format!("\x1b[?2026;{state}$y").into_bytes());
+            }
+            return;
+        }
         if !(intermediates.is_empty()
             || private && matches!(action, 'h' | 'l' | 'n')
             || intermediates == b">" && action == 'c')
@@ -521,6 +556,40 @@ impl Performer {
         }
     }
 
+    /// Only presentation is held; the PTY keeps parsing and replying normally.
+    /// No clock calls or allocations are added to print()/SGR.
+    pub fn presentation_grid(&self) -> (&Grid, bool) {
+        self.synchronized
+            .as_ref()
+            .map_or((&self.grid, self.cursor_visible), |frame| {
+                (&frame.grid, frame.cursor_visible)
+            })
+    }
+
+    pub fn synchronized_deadline(&self) -> Option<std::time::Instant> {
+        self.synchronized.as_ref().map(|frame| frame.deadline)
+    }
+
+    pub fn expire_synchronized_output(&mut self, now: std::time::Instant) -> bool {
+        if self
+            .synchronized_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.end_synchronized_output();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn end_synchronized_output(&mut self) {
+        if self.synchronized.take().is_some() {
+            self.pending_events
+                .push(CoreEvent::SynchronizedOutput { deadline: None });
+            self.mark_dirty_all();
+        }
+    }
+
     pub fn alternate_screen_active(&self) -> bool {
         self.use_alt_screen
     }
@@ -551,11 +620,15 @@ impl Performer {
             bracketed_paste: false,
             active_link: None,
             command_started: None,
+            synchronized: None,
+            keyboard: Default::default(),
         }
     }
 
     /// Resize both the main and alt screen grids.
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        // A resized surface cannot present an old-sized transaction.
+        self.end_synchronized_output();
         self.grid.resize(cols, rows);
         self.alt_grid.resize(cols, rows);
         if self.use_alt_screen {
@@ -571,6 +644,10 @@ impl Performer {
         // Configured limits are at least one; resize populated rings safely.
         self.grid.set_scrollback_limit(limit);
         self.alt_grid.set_scrollback_limit(limit);
+    }
+
+    pub fn keyboard_flags(&self) -> u16 {
+        self.keyboard[self.use_alt_screen as usize].flags()
     }
 
     pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
@@ -768,6 +845,8 @@ impl Performer {
     /// cursor keys). `scrollback_limit` is a config value, not terminal
     /// state, so it's preserved across the reset.
     pub fn reset(&mut self) {
+        self.end_synchronized_output();
+        self.keyboard = Default::default();
         self.use_alt_screen = false;
         let cols = self.grid.cols;
         let rows = self.grid.rows;
@@ -869,6 +948,26 @@ impl Performer {
             }
             1006 => self.mouse_sgr = enabled,
             2004 => self.bracketed_paste = enabled,
+            2026 => {
+                if enabled {
+                    // Repeated starts are idempotent, not an unbounded nesting
+                    // counter or a way to extend a stuck frame indefinitely.
+                    if self.synchronized.is_none() {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(1);
+                        self.pending_events.push(CoreEvent::SynchronizedOutput {
+                            deadline: Some(deadline),
+                        });
+                        self.synchronized = Some(Box::new(SynchronizedFrame {
+                            grid: self.grid.presentation_snapshot(),
+                            cursor_visible: self.cursor_visible,
+                            deadline,
+                        }));
+                    }
+                } else {
+                    self.end_synchronized_output();
+                }
+            }
             _ => {}
         }
     }
@@ -2041,5 +2140,100 @@ mod tests {
         p.reset();
         assert_eq!(p.grid.scrollback_limit, 500);
         assert_eq!(p.alt_grid.scrollback_limit, 500);
+    }
+}
+
+#[cfg(test)]
+mod synchronized_tests {
+    use super::*;
+    fn feed(p: &mut Performer, bytes: &[u8]) {
+        let mut parser = vte::Parser::new();
+        parser.advance(p, bytes);
+    }
+    #[test]
+    fn transaction_keeps_parsing_and_replies_but_holds_grid_and_cursor() {
+        let mut p = Performer::new(20, 3);
+        feed(&mut p, b"before\x1b[?2026hAFTER\x1b[?25l\x1b[6n");
+        assert_eq!(p.presentation_grid().0.cursor_col, 6);
+        assert_eq!(p.grid.cursor_col, 11);
+        assert!(p.presentation_grid().1);
+        assert!(!p.pending_writes.is_empty());
+        feed(&mut p, b"\x1b[?2026h");
+        assert_eq!(p.presentation_grid().0.cursor_col, 6);
+        feed(&mut p, b"\x1b[?2026$p\x1b[?2026l\x1b[?2026$p");
+        assert!(p.pending_writes.contains(&b"\x1b[?2026;1$y".to_vec()));
+        assert!(p.pending_writes.contains(&b"\x1b[?2026;2$y".to_vec()));
+        assert_eq!(p.presentation_grid().0.cursor_col, 11);
+        assert!(!p.presentation_grid().1);
+    }
+    #[test]
+    fn timeout_resize_and_reset_recover() {
+        let mut p = Performer::new(20, 3);
+        feed(&mut p, b"\x1b[?2026h");
+        let deadline = p.synchronized_deadline().unwrap();
+        feed(&mut p, b"\x1b[?2026h");
+        assert_eq!(p.synchronized_deadline(), Some(deadline));
+        assert!(p.expire_synchronized_output(deadline));
+        assert!(p.display_dirty);
+        feed(&mut p, b"\x1b[?2026h");
+        p.resize(30, 3);
+        assert_eq!(p.synchronized_deadline(), None);
+        feed(&mut p, b"\x1b[?2026h\x1bc");
+        assert_eq!(p.synchronized_deadline(), None);
+    }
+    #[test]
+    fn chunked_parser_and_alt_screen_are_atomic() {
+        let mut p = Performer::new(20, 3);
+        feed(&mut p, b"main");
+        let mut parser = vte::Parser::new();
+        for &byte in b"\x1b[?2026h\x1b[?1049hALT\x1b[?1049lEND" {
+            parser.advance(&mut p, &[byte]);
+        }
+        assert_eq!(p.presentation_grid().0.cursor_col, 4);
+        parser.advance(&mut p, b"\x1b[?2026l");
+        assert_eq!(p.presentation_grid().0.cursor_col, 7);
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::*;
+    #[test]
+    fn negotiated_modes_are_separate_from_ansi_cursor_and_screens() {
+        let mut p = Performer::new(20, 3);
+        let mut parser = vte::Parser::new();
+        parser.advance(&mut p, b"\x1b[>3u\x1b[?u");
+        assert_eq!(p.keyboard_flags(), 3);
+        assert_eq!(p.pending_writes.pop(), Some(b"\x1b[?3u".to_vec()));
+        parser.advance(&mut p, b"\x1b[?1049h\x1b[>8u");
+        assert_eq!(p.keyboard_flags(), 8);
+        parser.advance(&mut p, b"\x1b[?1049l");
+        assert_eq!(p.keyboard_flags(), 3);
+        parser.advance(&mut p, b"\x1b[<u");
+        assert_eq!(p.keyboard_flags(), 0);
+        parser.advance(&mut p, b"abc\x1b[s\x1b[H\x1b[u");
+        assert_eq!(p.grid.cursor_col, 3);
+        parser.advance(&mut p, b"\x1b[=31u\x1bc");
+        assert_eq!(p.keyboard_flags(), 0);
+    }
+}
+
+#[cfg(test)]
+mod synchronized_memory_tests {
+    use super::*;
+    #[test]
+    fn frozen_frame_does_not_duplicate_history_and_preserves_visible_unicode() {
+        let mut p = Performer::new(20, 3);
+        let mut parser = vte::Parser::new();
+        for _ in 0..200 {
+            parser.advance(&mut p, b"history\r\n");
+        }
+        parser.advance(&mut p, "👩‍💻é".as_bytes());
+        let before = p.grid.row_text(p.grid.row_cells(p.grid.cursor_row));
+        parser.advance(&mut p, b"\x1b[?2026hchanged");
+        let (shown, _) = p.presentation_grid();
+        assert_eq!(shown.scrollback_len(), 0);
+        assert!(p.grid.scrollback_len() > 100);
+        assert_eq!(shown.row_text(shown.row_cells(shown.cursor_row)), before);
     }
 }

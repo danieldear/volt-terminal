@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "root": {
+    "type": "column",
+    "id": "root",
+    "children": [
+      {
+        "type": "text",
+        "id": "eyebrow",
+        "text": "VOLT UI KIT  /  NATIVE EXAMPLES",
+        "font_size": 11,
+        "tone": "accent"
+      },
+      {
+        "type": "text",
+        "id": "title",
+        "text": "A small stack. A real window.",
+        "font_size": 30,
+        "tone": "body"
+      },
+      {
+        "type": "text",
+        "id": "intro",
+        "text": "Solid surfaces, measured text and Rust behavior. Resize the window to see the layout adapt.",
+        "font_size": 15,
+        "tone": "muted"
+      },
+      {
+        "type": "row",
+        "id": "columns",
+        "children": [
+          {
+            "type": "panel",
+            "id": "left",
+            "children": [
+              {
+                "type": "text",
+                "id": "left_title",
+                "text": "Nested panels",
+                "font_size": 21,
+                "tone": "body"
+              },
+              {
+                "type": "text",
+                "id": "left_body",
+                "text": "Rows and columns share one layout tree. Padding, gaps and flex sizing are declared in the document.",
+                "font_size": 14,
+                "tone": "muted"
+              },
+              {
+                "type": "panel",
+                "id": "inner",
+                "children": [
+                  {
+                    "type": "text",
+                    "id": "inner_text",
+                    "text": "A panel inside a panel",
+                    "font_size": 13,
+                    "tone": "accent"
+                  }
+                ],
+                "padding": 16
+              }
+            ],
+            "padding": 24,
+            "flex": 1,
+            "gap": 20
+          },
+          {
+            "type": "panel",
+            "id": "right",
+            "children": [
+              {
+                "type": "text",
+                "id": "right_title",
+                "text": "Responsive geometry",
+                "font_size": 21,
+                "tone": "body"
+              },
+              {
+                "type": "text",
+                "id": "right_body",
+                "text": "Text wraps using shaped font metrics. Physical-pixel drawing and hit testing use the same scale.",
+                "font_size": 14,
+                "tone": "muted"
+              },
+              {
+                "type": "button",
+                "id": "ping",
+                "label": "Try a Rust callback",
+                "on_activate": "increment",
+                "primary": true
+              }
+            ],
+            "padding": 24,
+            "flex": 1,
+            "gap": 20
+          }
+        ],
+        "gap": 18,
+        "flex": 1,
+        "align": "stretch"
+      },
+      {
+        "type": "text",
+        "id": "footer",
+        "text": "Tab moves focus  \u00b7  Enter / Space activates  \u00b7  F5 reloads the document",
+        "font_size": 12,
+        "tone": "muted"
+      }
+    ],
+    "padding": 28,
+    "gap": 16
+  }
+}

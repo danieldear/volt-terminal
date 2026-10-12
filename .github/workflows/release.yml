@@ -78,7 +78,8 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace
+          # Larger stack for UI Kit's deep-tree tests; not a runtime setting.
+          RUST_MIN_STACK=33554432 cargo test --locked --workspace
           python3 -m unittest discover -s scripts/validation -p 'test_*.py'
 
       - name: Build Linux binary

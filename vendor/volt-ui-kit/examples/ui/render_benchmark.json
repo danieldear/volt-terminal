@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "root": {
+    "type": "column",
+    "id": "root",
+    "children": [
+      {
+        "type": "text",
+        "id": "eyebrow",
+        "text": "VOLT UI KIT  /  NATIVE EXAMPLES",
+        "font_size": 11,
+        "tone": "accent"
+      },
+      {
+        "type": "text",
+        "id": "title",
+        "text": "A small stack. A real window.",
+        "font_size": 30,
+        "tone": "body"
+      },
+      {
+        "type": "text",
+        "id": "intro",
+        "text": "Solid surfaces, measured text and Rust behavior. Resize the window to see the layout adapt.",
+        "font_size": 15,
+        "tone": "muted"
+      },
+      {
+        "type": "row",
+        "id": "workspace",
+        "children": [
+          {
+            "type": "panel",
+            "id": "sidebar",
+            "children": [
+              {
+                "type": "text",
+                "id": "side_heading",
+                "text": "One shared toolkit",
+                "font_size": 20,
+                "tone": "body"
+              },
+              {
+                "type": "text",
+                "id": "side_body",
+                "text": "No terminal dependency. No embedded scripts. A document describes the UI; Rust owns what happens.",
+                "font_size": 14,
+                "tone": "muted"
+              },
+              {
+                "type": "button",
+                "id": "side_action",
+                "label": "Add a milestone",
+                "on_activate": "increment",
+                "primary": true
+              },
+              {
+                "type": "text",
+                "id": "side_note",
+                "text": "F5 validates and reloads this file. Invalid edits keep the last working UI.",
+                "font_size": 13,
+                "tone": "muted"
+              }
+            ],
+            "width": 210,
+            "padding": 20,
+            "gap": 22
+          },
+          {
+            "type": "panel",
+            "id": "main_panel",
+            "children": [
+              {
+                "type": "text",
+                "id": "main_heading",
+                "text": "Project workspace",
+                "font_size": 22,
+                "tone": "body"
+              },
+              {
+                "type": "text",
+                "id": "status",
+                "bind_text": "status",
+                "font_size": 27,
+                "tone": "accent"
+              },
+              {
+                "type": "text",
+                "id": "main_body",
+                "text": "This is the first complete vertical slice: native windowing, document validation, nested layout, measured typography, input routing and typed Rust callbacks.",
+                "font_size": 15,
+                "tone": "muted"
+              },
+              {
+                "type": "row",
+                "id": "actions",
+                "children": [
+                  {
+                    "type": "button",
+                    "id": "save",
+                    "label": "Add milestone",
+                    "on_activate": "increment",
+                    "primary": true
+                  },
+                  {
+                    "type": "button",
+                    "id": "reset",
+                    "label": "Reset progress",
+                    "on_activate": "reset",
+                    "bind_enabled": "can_reset"
+                  }
+                ],
+                "gap": 12
+              },
+              {
+                "type": "panel",
+                "id": "details",
+                "children": [
+                  {
+                    "type": "text",
+                    "id": "details_heading",
+                    "text": "The legacy path stays intact",
+                    "font_size": 15,
+                    "tone": "body"
+                  },
+                  {
+                    "type": "text",
+                    "id": "details_body",
+                    "text": "Existing Painter and widget APIs remain unchanged. The native host and document dependencies are opt-in.",
+                    "font_size": 13,
+                    "tone": "muted"
+                  }
+                ],
+                "padding": 18,
+                "gap": 10
+              },
+              {
+                "type": "button",
+                "id": "not_yet",
+                "label": "GPU Glass \u2014 later milestone",
+                "on_activate": "increment",
+                "enabled": false
+              }
+            ],
+            "padding": 24,
+            "gap": 20,
+            "flex": 1
+          }
+        ],
+        "gap": 18,
+        "flex": 1,
+        "align": "stretch"
+      },
+      {
+        "type": "text",
+        "id": "footer",
+        "text": "TAB / SHIFT+TAB  Navigate     ENTER / SPACE  Activate     F5  Reload",
+        "font_size": 11,
+        "tone": "muted"
+      }
+    ],
+    "padding": 28,
+    "gap": 16
+  }
+}

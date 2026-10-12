@@ -196,6 +196,8 @@ struct MainState {
     _native_text: crate::native_text::NativeTextInput,
     renderer: Renderer,
     render_snapshot: Option<Grid>,
+    synchronized_deadlines: HashMap<usize, Instant>,
+    reported_keys: HashMap<PhysicalKey, (usize, bool, crate::keyboard_protocol::ProtocolKey)>,
     tabs: Vec<TerminalTab>,
     active_tab: usize,
     theme: Theme,
@@ -322,11 +324,19 @@ impl MainState {
             if let Some(s) = self.settings.as_mut() {
                 s.set_capacity(layout.rows);
                 self.renderer.settings = Some(s.view());
+                self.renderer.settings_toggles = s.toggle_rows();
+                self.renderer.settings_controls = s.control_rows();
+                self.renderer.settings_dropdown = s.dropdown_view();
             }
         } else if self.settings.is_some() {
             self.cancel_settings();
             self.renderer
                 .set_top_alert(Some("Make the window larger to open Settings".into()));
+        }
+        if self.settings.is_none() {
+            self.renderer.settings_toggles.clear();
+            self.renderer.settings_controls.clear();
+            self.renderer.settings_dropdown = None;
         }
         self.begin_redraw();
     }
@@ -336,6 +346,9 @@ impl MainState {
             self.apply_config(&s.initial);
         }
         self.renderer.settings = None;
+        self.renderer.settings_toggles.clear();
+        self.renderer.settings_controls.clear();
+        self.renderer.settings_dropdown = None;
         self.begin_redraw();
     }
     fn settings_outcome(&mut self, outcome: crate::settings::Outcome) {
@@ -426,6 +439,23 @@ impl MainState {
             PhysicalKey::Code(c) => c,
             _ => return,
         };
+        if s.dropdown_open() {
+            let o = if code == KeyCode::Tab {
+                s.dropdown_key("Escape", "");
+                s.move_focus(if shift { -1 } else { 1 })
+            } else {
+                s.dropdown_key(
+                    &format!("{code:?}"),
+                    if super_key || ctrl || alt {
+                        ""
+                    } else {
+                        text.unwrap_or("")
+                    },
+                )
+            };
+            self.settings_outcome(o);
+            return;
+        }
         if s.recording_shortcut()
             && !matches!(
                 code,
@@ -516,6 +546,7 @@ impl MainState {
                     s.activate()
                 }
             }
+            KeyCode::Space if !s.is_editing() => s.activate(),
             KeyCode::Backspace => s.erase(false),
             KeyCode::Delete => s.erase(true),
             _ => {
@@ -1687,6 +1718,35 @@ impl MainState {
         to.is_some_and(|to| self.reorder_tab(from, to))
     }
 
+    fn select_command_output(&mut self) {
+        let pane = self.active_tab().active_pane();
+        let selection = pane.performer.lock().ok().and_then(|p| {
+            if p.alternate_screen_active() {
+                return None;
+            }
+            let (start, mut end) = p.grid.latest_command_output()?;
+            if end.1 == 0 {
+                end = (end.0.checked_sub(1)?, p.grid.cols - 1);
+            } else {
+                end.1 -= 1;
+            }
+            let origin = p.grid.scrollback_origin();
+            Some(Selection {
+                pane_id: self.active_tab().tree.active_id,
+                alternate_screen: false,
+                mode: SelectionMode::Linear,
+                start_row: origin + start.0,
+                start_col: start.1,
+                end_row: origin + end.0,
+                end_col: end.1,
+            })
+        });
+        if let Some(selection) = selection {
+            self.selection = Some(selection);
+            self.begin_redraw();
+        }
+    }
+
     fn run_keybinding(&mut self, action: volt_config::keybindings::Action) {
         use volt_config::keybindings::Action as A;
         match action {
@@ -1714,6 +1774,7 @@ impl MainState {
             A::MoveTabRight => {
                 self.move_active_tab(1);
             }
+            A::SelectCommandOutput => self.select_command_output(),
             A::PreviousPrompt => self.jump_prompt(true),
             A::NextPrompt => self.jump_prompt(false),
             A::SplitRight | A::SplitLeft => {
@@ -2002,7 +2063,11 @@ impl MainState {
             // Blit directly while holding the lock — avoids cloning the grid
             // (and its scrollback buffer), which is expensive under heavy output.
             let performer = pane.performer.lock().ok()?;
-            let grid = &performer.grid;
+            let (grid, presented_cursor_visible) = if pane.scroll_view_offset == 0 {
+                performer.presentation_grid()
+            } else {
+                (&performer.grid, performer.cursor_visible)
+            };
             let offset = pane.scroll_view_offset.min(grid.scrollback_len());
             if offset == 0 {
                 Self::blit_grid(&mut out, grid, rect.col, rect.row);
@@ -2014,7 +2079,7 @@ impl MainState {
             // Only show the active cursor in the live view; when scrolled back,
             // hide it because the user is viewing history.
             if rect.id == active_id && offset == 0 {
-                active_cursor_visible = performer.cursor_visible;
+                active_cursor_visible = presented_cursor_visible;
                 out.cursor_col =
                     (rect.col + grid.cursor_col).min(rect.col + rect.cols.saturating_sub(1));
                 out.cursor_row =
@@ -2490,7 +2555,21 @@ impl MainState {
                 }
                 self.on_prompt_text_changed();
             }
-            CommittedTextTarget::Terminal => self.send_pty_input(text.as_bytes()),
+            CommittedTextTarget::Terminal => {
+                let flags = self
+                    .active_tab()
+                    .active_pane()
+                    .performer
+                    .lock()
+                    .map_or(0, |p| p.keyboard_flags());
+                if let Some(bytes) =
+                    crate::keyboard_protocol::ProtocolKey::committed_text(flags, text)
+                {
+                    self.send_pty_input(&bytes);
+                } else {
+                    self.send_pty_input(text.as_bytes());
+                }
+            }
             CommittedTextTarget::Ignore => {}
         }
     }
@@ -3087,6 +3166,126 @@ impl App {
         })
     }
 
+    fn save_layout(&self) {
+        if !self.config.session.restore
+            || self.config.appearance.native_tabs
+            || self.windows.is_empty()
+        {
+            return;
+        }
+        let windows = self
+            .windows
+            .values()
+            .take(8)
+            .map(|state| {
+                let size = state
+                    .window
+                    .inner_size()
+                    .to_logical::<u32>(state.window.scale_factor());
+                crate::session::WindowLayout {
+                    width: size.width.clamp(320, 7680),
+                    height: size.height.clamp(200, 4320),
+                    active: state.active_tab.min(15),
+                    tabs: state
+                        .tabs
+                        .iter()
+                        .take(16)
+                        .map(|tab| crate::session::TabLayout {
+                            active_pane: tab
+                                .tree
+                                .leaf_ids()
+                                .iter()
+                                .position(|&id| id == tab.tree.active_id)
+                                .unwrap_or(0),
+                            color: tab.color.map(|c| c.id().to_string()),
+                            root: tab.tree.saved_layout(),
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        if let Some(path) = crate::session::path() {
+            if let Err(e) = crate::session::save(
+                &path,
+                &crate::session::Layout {
+                    version: 1,
+                    windows,
+                },
+            ) {
+                eprintln!("volt-ui: layout was not saved: {e}");
+            }
+        }
+    }
+
+    fn restore_layout(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        if !self.config.session.restore || self.config.appearance.native_tabs {
+            return false;
+        }
+        let Some(path) = crate::session::path() else {
+            return false;
+        };
+        let layout = match crate::session::load(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("volt-ui: ignoring invalid layout: {e}");
+                }
+                return false;
+            }
+        };
+        for window in layout.windows {
+            let id = match self.create_main_window(event_loop, None) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("volt-ui: restore window: {e}");
+                    break;
+                }
+            };
+            let state = self.windows.get_mut(&id).expect("created window");
+            let _ = state
+                .window
+                .request_inner_size(winit::dpi::LogicalSize::new(window.width, window.height));
+            let (cols, rows) = state.current_grid_size();
+            let mut tabs = Vec::new();
+            for tab in window.tabs {
+                let tree = crate::pane_tree::PaneTree::restore_layout(&tab.root, &mut |cwd| {
+                    TerminalPane::spawn_in(
+                        &state.config,
+                        cols as u16,
+                        rows as u16,
+                        state.proxy.clone(),
+                        Arc::clone(&state.pty_wake_pending),
+                        cwd,
+                    )
+                });
+                match tree {
+                    Ok(mut tree) => {
+                        tree.active_id = tree.leaf_ids()[tab.active_pane];
+                        tabs.push(TerminalTab {
+                            tree,
+                            color: tab
+                                .color
+                                .as_deref()
+                                .and_then(volt_renderer::tab_color::TabColor::from_id),
+                            custom_title: None,
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("volt-ui: restoring tab failed: {e}");
+                        break;
+                    }
+                }
+            }
+            if !tabs.is_empty() {
+                state.tabs = tabs;
+                state.active_tab = window.active.min(state.tabs.len() - 1);
+            }
+            state.resize_all_tabs_to_current_grid();
+            state.begin_redraw();
+        }
+        !self.windows.is_empty()
+    }
+
     pub fn run(mut self) -> anyhow::Result<()> {
         let event_loop = EventLoop::<VoltEvent>::with_user_event().build()?;
         self.proxy = Some(event_loop.create_proxy());
@@ -3131,6 +3330,7 @@ impl App {
             .with_blur(self.config.appearance.blur_enabled());
 
         let window = Arc::new(event_loop.create_window(window_attrs)?);
+        window.set_ime_allowed(true);
         // Capture native picker text without changing normal keyboard/IME handling.
         #[cfg(target_os = "macos")]
         let native_text = crate::native_text::NativeTextInput::install(
@@ -3192,6 +3392,8 @@ impl App {
             _native_text: native_text,
             renderer,
             render_snapshot: None,
+            synchronized_deadlines: HashMap::new(),
+            reported_keys: HashMap::new(),
             tabs: vec![first_tab],
             active_tab: 0,
             theme,
@@ -3593,6 +3795,7 @@ impl App {
                 return;
             }
             A::CloseWindow => {
+                self.save_layout();
                 self.windows.remove(&window_id);
                 if self.windows.is_empty() {
                     event_loop.exit();
@@ -3620,6 +3823,7 @@ impl App {
             A::CloseTab => {
                 if state.close_active_pane_or_tab() {
                     let _ = state;
+                    self.save_layout();
                     self.windows.remove(&window_id);
                     if self.windows.is_empty() {
                         event_loop.exit();
@@ -3895,6 +4099,10 @@ fn committed_text_target(
 // ── ApplicationHandler ────────────────────────────────────────────────────────
 
 impl ApplicationHandler<VoltEvent> for App {
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.save_layout();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if !self.windows.is_empty() {
             return;
@@ -3926,6 +4134,9 @@ impl ApplicationHandler<VoltEvent> for App {
             }
         }
 
+        if self.restore_layout(event_loop) {
+            return;
+        }
         if let Err(err) = self.create_main_window(event_loop, Some("volt".to_string())) {
             eprintln!("volt-ui: failed to create initial window: {err}");
             event_loop.exit();
@@ -4003,6 +4214,7 @@ impl ApplicationHandler<VoltEvent> for App {
         event: WindowEvent,
     ) {
         if matches!(event, WindowEvent::CloseRequested) {
+            self.save_layout();
             self.windows.remove(&window_id);
             if self.windows.is_empty() {
                 event_loop.exit();
@@ -4015,6 +4227,36 @@ impl ApplicationHandler<VoltEvent> for App {
         let mut close_window_after_event = false;
 
         match event {
+            WindowEvent::Ime(Ime::Preedit(_, _)) => {
+                let pane = state.active_tab().active_pane();
+                if let Ok(performer) = pane.performer.lock() {
+                    let id = state.active_tab().tree.active_id;
+                    let (cols, rows) = state.current_grid_size();
+                    if let Some(rect) = state
+                        .active_tab()
+                        .tree
+                        .layout(cols, rows)
+                        .iter()
+                        .find(|r| r.id == id)
+                    {
+                        let pad = state.renderer.padding * state.renderer.scale_factor;
+                        let x = pad
+                            + (rect.col + performer.grid.cursor_col) as f32
+                                * state.renderer.cell_width;
+                        let y = pad
+                            + state.current_content_top_offset()
+                            + (rect.row + performer.grid.cursor_row) as f32
+                                * state.renderer.cell_height;
+                        state.window.set_ime_cursor_area(
+                            winit::dpi::PhysicalPosition::new(x as f64, y as f64),
+                            winit::dpi::PhysicalSize::new(
+                                state.renderer.cell_width as f64,
+                                state.renderer.cell_height as f64,
+                            ),
+                        );
+                    }
+                }
+            }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 // Commit is final UTF-8 input, not paste or a command key.
                 // Winit suppresses the composing key event to avoid duplicates.
@@ -4074,6 +4316,10 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::Focused(false) => {
+                state.reported_keys.clear();
+                if let Some(settings) = state.settings.as_mut() {
+                    settings.pointer_release();
+                }
                 #[cfg(target_os = "macos")]
                 {
                     if self.focused_window == Some(window_id) {
@@ -4114,12 +4360,23 @@ impl ApplicationHandler<VoltEvent> for App {
                 // A release outside our window may never arrive. Don't let a
                 // later click inherit an old tab drag candidate.
                 state.tab_drag = None;
+                if let Some(settings) = state.settings.as_mut() {
+                    settings.pointer_release();
+                }
                 state.window.set_cursor(winit::window::CursorIcon::Default);
             }
 
             WindowEvent::CursorMoved { position, .. } => {
                 if state.settings.is_some() {
                     state.mouse_pos = (position.x as f32, position.y as f32);
+                    if let Some(layout) = state.renderer.settings_layout() {
+                        let outcome = state.settings.as_mut().and_then(|s| {
+                            s.pointer_move(&layout, position.x as f32, position.y as f32)
+                        });
+                        if let Some(o) = outcome {
+                            state.settings_outcome(o);
+                        }
+                    }
                     return;
                 }
                 let pointer_moved = state.mouse_pos != (position.x as f32, position.y as f32);
@@ -4310,16 +4567,17 @@ impl ApplicationHandler<VoltEvent> for App {
                 if state.settings.is_some() {
                     if btn_state == ElementState::Pressed && button == MouseButton::Left {
                         if let Some(layout) = state.renderer.settings_layout() {
-                            let sections = state
-                                .settings
-                                .as_ref()
-                                .map(|s| s.sections().len())
-                                .unwrap_or(0);
-                            let hit = layout.hit(state.mouse_pos.0, state.mouse_pos.1, sections);
-                            let outcome = state.settings.as_mut().map(|s| s.hit(hit));
+                            let outcome = state.settings.as_mut().map(|s| {
+                                s.pointer_click(&layout, state.mouse_pos.0, state.mouse_pos.1)
+                            });
                             if let Some(o) = outcome {
                                 state.settings_outcome(o);
                             }
+                        }
+                    }
+                    if btn_state == ElementState::Released && button == MouseButton::Left {
+                        if let Some(s) = state.settings.as_mut() {
+                            s.pointer_release();
                         }
                     }
                     return;
@@ -4774,10 +5032,13 @@ impl ApplicationHandler<VoltEvent> for App {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(p) => p.y as f32,
                     };
-                    if let Some(settings) = state.settings.as_mut() {
-                        settings.move_focus(if amount < 0. { 1 } else { -1 });
+                    let outcome = state
+                        .settings
+                        .as_mut()
+                        .map(|settings| settings.wheel(if amount < 0. { 1 } else { -1 }));
+                    if let Some(o) = outcome {
+                        state.settings_outcome(o);
                     }
-                    state.sync_settings();
                     return;
                 }
                 if state
@@ -4901,17 +5162,17 @@ impl ApplicationHandler<VoltEvent> for App {
                 }
             }
 
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key,
-                        logical_key,
-                        state: key_state,
-                        text,
-                        ..
-                    },
-                ..
-            } => {
+            WindowEvent::KeyboardInput { event, .. } => {
+                use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+                let base_key = event.key_without_modifiers();
+                let KeyEvent {
+                    physical_key,
+                    ref logical_key,
+                    state: key_state,
+                    ref text,
+                    repeat,
+                    ..
+                } = event;
                 match physical_key {
                     PhysicalKey::Code(KeyCode::ShiftLeft) => {
                         state.left_shift_down = key_state == ElementState::Pressed;
@@ -4935,6 +5196,33 @@ impl ApplicationHandler<VoltEvent> for App {
                 }
 
                 if key_state != ElementState::Pressed {
+                    if let Some((owner, screen, key)) = state.reported_keys.remove(&physical_key) {
+                        if state.settings.is_none()
+                            && state.theme_editor.is_none()
+                            && state.task_form.is_none()
+                            && state.active_prompt.is_none()
+                            && !state.workspace_search.visible
+                            && !(state.workspace_panel.visible && state.workspace_panel.focused)
+                        {
+                            let pane = state.active_tab().active_pane();
+                            if owner == Arc::as_ptr(&pane.performer) as usize {
+                                let flags = pane.performer.lock().map_or(0, |p| {
+                                    if p.alternate_screen_active() == screen {
+                                        p.keyboard_flags()
+                                    } else {
+                                        0
+                                    }
+                                });
+                                let modifiers = u8::from(state.shift_down())
+                                    | (u8::from(state.modifiers.alt_key()) << 1)
+                                    | (u8::from(state.ctrl_down()) << 2)
+                                    | (u8::from(state.super_down()) << 3);
+                                if let Some(bytes) = key.encode(flags, modifiers, 3, None) {
+                                    state.send_pty_input(&bytes);
+                                }
+                            }
+                        }
+                    }
                     return;
                 }
 
@@ -5053,6 +5341,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         A::ClosePane => {
                             if state.close_active_pane_or_tab() {
                                 let _ = state;
+                                self.save_layout();
                                 self.windows.remove(&window_id);
                                 if self.windows.is_empty() {
                                     event_loop.exit();
@@ -5398,6 +5687,10 @@ impl ApplicationHandler<VoltEvent> for App {
                         return;
                     }
                     match physical_key {
+                        PhysicalKey::Code(KeyCode::KeyO) if shift && !ctrl && !alt => {
+                            state.select_command_output();
+                            return;
+                        }
                         PhysicalKey::Code(KeyCode::Tab) => {
                             if shift {
                                 state.cycle_tab_prev();
@@ -5491,6 +5784,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         PhysicalKey::Code(KeyCode::KeyW) => {
                             if state.close_active_pane_or_tab() {
                                 let _ = state;
+                                self.save_layout();
                                 self.windows.remove(&window_id);
                                 if self.windows.is_empty() {
                                     event_loop.exit();
@@ -5647,6 +5941,37 @@ impl ApplicationHandler<VoltEvent> for App {
                     return;
                 }
 
+                // Application shortcuts/modal handlers above own their keypress
+                // and do not create a release event in the terminal protocol.
+                let pane = state.active_tab().active_pane();
+                let owner = Arc::as_ptr(&pane.performer) as usize;
+                let (flags, screen) = pane.performer.lock().map_or((0, false), |p| {
+                    (p.keyboard_flags(), p.alternate_screen_active())
+                });
+                if let Some(key) = crate::keyboard_protocol::ProtocolKey::from_event(
+                    &base_key,
+                    logical_key,
+                    physical_key,
+                ) {
+                    let modifiers = u8::from(shift)
+                        | (u8::from(alt) << 1)
+                        | (u8::from(ctrl) << 2)
+                        | (u8::from(super_key) << 3);
+                    if let Some(bytes) = key.encode(
+                        flags,
+                        modifiers,
+                        if repeat { 2 } else { 1 },
+                        text.as_deref(),
+                    ) {
+                        if !pane.read_only {
+                            state
+                                .reported_keys
+                                .insert(physical_key, (owner, screen, key));
+                            state.send_pty_input(&bytes);
+                        }
+                        return;
+                    }
+                }
                 // ── terminal input ────────────────────────────────────────────
                 let special = match physical_key {
                     PhysicalKey::Code(code) => terminal_special_sequence(
@@ -5704,6 +6029,14 @@ impl ApplicationHandler<VoltEvent> for App {
                     tab.tree.for_each_leaf_mut(&mut |pane_id, pane| {
                         while let Ok(ev) = pane.event_rx.try_recv() {
                             match ev {
+                                CoreEvent::SynchronizedOutput { deadline } => {
+                                    let owner = Arc::as_ptr(&pane.performer) as usize;
+                                    if let Some(deadline) = deadline {
+                                        state.synchronized_deadlines.insert(owner, deadline);
+                                    } else {
+                                        state.synchronized_deadlines.remove(&owner);
+                                    }
+                                }
                                 CoreEvent::GridUpdated { damaged_rows } => {
                                     if i == active {
                                         active_grid_changed = true;
@@ -5894,6 +6227,7 @@ impl ApplicationHandler<VoltEvent> for App {
         }
 
         if close_window_after_event {
+            self.save_layout();
             self.windows.remove(&window_id);
             if self.windows.is_empty() {
                 event_loop.exit();
@@ -6042,6 +6376,14 @@ impl ApplicationHandler<VoltEvent> for App {
                     tab.tree.for_each_leaf_mut(&mut |pane_id, pane| {
                         while let Ok(ev) = pane.event_rx.try_recv() {
                             match ev {
+                                CoreEvent::SynchronizedOutput { deadline } => {
+                                    let owner = Arc::as_ptr(&pane.performer) as usize;
+                                    if let Some(deadline) = deadline {
+                                        state.synchronized_deadlines.insert(owner, deadline);
+                                    } else {
+                                        state.synchronized_deadlines.remove(&owner);
+                                    }
+                                }
                                 CoreEvent::GridUpdated { damaged_rows } => {
                                     if i == active {
                                         active_grid_changed = true;
@@ -6162,6 +6504,35 @@ impl ApplicationHandler<VoltEvent> for App {
                 state.next_cursor_blink = Instant::now() + CURSOR_BLINK_INTERVAL;
             }
 
+            // No new lock, allocation or pane traversal in ordinary output.
+            // The sparse deadline map exists only while a child requests a batch.
+            if !state.synchronized_deadlines.is_empty() {
+                let now = Instant::now();
+                for tab in &mut state.tabs {
+                    tab.tree.for_each_leaf_mut(&mut |_, pane| {
+                        let owner = Arc::as_ptr(&pane.performer) as usize;
+                        if state
+                            .synchronized_deadlines
+                            .get(&owner)
+                            .is_some_and(|&d| now >= d)
+                        {
+                            if let Ok(mut performer) = pane.performer.lock() {
+                                if performer.expire_synchronized_output(now) {
+                                    needs_redraw = true;
+                                    needs_full_redraw = true;
+                                }
+                            }
+                        }
+                    });
+                }
+                // Also drop deadlines belonging to already closed panes.
+                state.synchronized_deadlines.retain(|_, d| *d > now);
+                if let Some(&deadline) = state.synchronized_deadlines.values().min() {
+                    next_blink_deadline =
+                        Some(next_blink_deadline.map_or(deadline, |d| d.min(deadline)));
+                }
+            }
+
             if let Some(deadline) = state.tick_selection_auto_scroll() {
                 next_blink_deadline =
                     Some(next_blink_deadline.map_or(deadline, |d| d.min(deadline)));
@@ -6181,6 +6552,7 @@ impl ApplicationHandler<VoltEvent> for App {
             windows_to_close.sort_unstable();
             windows_to_close.dedup();
             for window_id in windows_to_close {
+                self.save_layout();
                 self.windows.remove(&window_id);
             }
             if self.windows.is_empty() {

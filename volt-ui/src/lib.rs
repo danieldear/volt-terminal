@@ -33,3 +33,7 @@ mod shell_integration;
 
 pub mod settings;
 mod shell_startup;
+
+mod keyboard_protocol;
+
+mod session;

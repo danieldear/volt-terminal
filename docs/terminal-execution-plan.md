@@ -1,6 +1,6 @@
 # Volt terminal execution plan
 
-Updated **2026-10-07**. This is a plan, not a claim that pending work has been
+Updated **2026-10-12**. This is a plan, not a claim that pending work has been
 executed. Feature scope and usefulness live in [ROADMAP.md](ROADMAP.md).
 Changes should land as small reviewable units, with evidence recorded separately
 for source/tests, GPU fixtures, native UI, benchmarks and public artifacts.
@@ -17,11 +17,21 @@ for source/tests, GPU fixtures, native UI, benchmarks and public artifacts.
 - Signing/notarization implementation and credential configuration are complete.
   Local and hosted Apple acceptance, stapling and extracted-ZIP checks passed.
   Future release mode is `notarized`; see [distribution.md](distribution.md).
-- Existing public v0.1.10 is still ad-hoc signed. Publication and installation
-  acceptance of a new notarized version remain separate release work.
-- Recent rendering/parser optimizations are local changes with targeted evidence.
+- Public v0.1.12 is notarized; the user reports testing passed. v0.1.13
+  is being prepared, with UI Kit 0.4.0 performance acceptance still open. Older v0.1.10 stays ad-hoc. Do not redo signing setup.
+- Recent rendering/parser optimizations are merged changes with targeted evidence.
   Visible-window end-to-end acceptance is pending; do not market microbenchmark
   gains as a terminal throughput or display-latency improvement.
+
+## Current compatibility batch
+
+Synchronized output, negotiated keyboard input, command-output/reflow anchors,
+opt-in layout restoration and IME fixes are implemented on the unreleased
+`feature/terminal-compatibility` branch. The full accessibility bridge remains
+open; evidence and acceptance boundaries are in
+[terminal-compatibility.md](terminal-compatibility.md).
+Linux platform work is deferred at the user's request. No new public release or
+publication of the tested draft is implied by this implementation.
 
 ## P0 — Establish release gates and validate existing behavior
 
@@ -32,8 +42,9 @@ for source/tests, GPU fixtures, native UI, benchmarks and public artifacts.
   each new change; do not discard another contributor's work.
 - [ ] Record display/backing scale, window/grid size, font, size, line height,
   scrollback, shell hooks and workspace state for each comparison.
-- [ ] Run alternating baseline/new parser and offscreen-render repeats using
+- [x] Run alternating baseline/new parser and offscreen-render repeats using
   `scripts/validation/compare_throughput.py` and `compare_rendering.py`.
+  Exact-main median gates passed; tail variability remains documented, not ignored.
 - [ ] Run at least three visible-window termbench trials per build, preferably
   five or more, with profiling disabled and no overlapping builds/tests.
   Include closed, floating and docked workspace states.

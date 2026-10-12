@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub enum CoreEvent {
+    SynchronizedOutput {
+        deadline: Option<std::time::Instant>,
+    },
     GridUpdated {
         damaged_rows: Option<(usize, usize)>,
     },

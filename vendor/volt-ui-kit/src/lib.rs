@@ -28,8 +28,23 @@ pub mod button;
 pub use button::{Button, ButtonColors};
 
 pub mod geometry;
+pub mod graphics;
+pub mod theme;
+pub use theme::{ColorToken, Palette, ThemeMode, UiTheme};
 pub mod panel;
 pub mod surface;
 pub use geometry::{HitMap, HitTarget, Rect};
 pub use panel::{BackdropRequest, Panel};
 pub use surface::{SurfaceStyle, Tint, TintPicker};
+
+/// Opt-in validated document tree, bindings and interaction runtime; no event loop.
+#[cfg(feature = "declarative")]
+pub mod declarative;
+
+/// Primary Rust-first declarative composition API; opt-in and host-independent.
+#[cfg(feature = "rust-ui")]
+pub mod ui;
+
+/// Optional standalone software-rendered desktop host. Never used by legacy consumers.
+#[cfg(feature = "native")]
+pub mod native;
