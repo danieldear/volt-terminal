@@ -82,7 +82,8 @@ jobs:
             libxinerama-dev \
             fonts-dejavu-core \
             mesa-vulkan-drivers
-      - run: cargo test --locked --workspace
+      # UI Kit 0.4's deep-tree rejection fixture needs larger test stacks only.
+      - run: RUST_MIN_STACK=33554432 cargo test --locked --workspace
       - name: Validation script unit tests
         run: python3 -m unittest discover -s scripts/validation -p 'test_*.py'
       - name: Offscreen GPU renderer regressions (Mesa software Vulkan)

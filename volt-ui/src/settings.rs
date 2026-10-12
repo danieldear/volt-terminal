@@ -5,13 +5,16 @@ use volt_config::{
     preferences::Preferences,
     Config, ThemeRegistry,
 };
-use volt_renderer::settings::{SettingsHit, SettingsRow, SettingsView};
+use volt_renderer::settings::{
+    dropdown_rect, inside, slider_track, SettingsControl, SettingsDropdown, SettingsHit,
+    SettingsLayout, SettingsRow, SettingsView, DROPDOWN_ROWS,
+};
 #[derive(Clone)]
 enum Control {
     Text,
     Number(f32),
     Choice(Vec<String>),
-    Toggle,
+    Toggle(bool),
     Action(Outcome),
     Shortcut(volt_config::keybindings::Action),
 }
@@ -37,6 +40,15 @@ pub enum Outcome {
     Secure,
     GettingStarted,
 }
+struct Dropdown {
+    values: Vec<String>,
+    labels: Vec<String>,
+    selected: usize,
+    current: usize,
+    offset: usize,
+    custom: bool,
+    prefix: String,
+}
 pub struct Settings {
     pub draft: Config,
     pub initial: Config,
@@ -48,6 +60,8 @@ pub struct Settings {
     capacity: usize,
     edit: Option<(Vec<char>, usize)>,
     select_all: bool,
+    dropdown: Option<Dropdown>,
+    slider_drag: Option<usize>,
     pub status: String,
     themes: Vec<(String, String)>,
     fonts: Vec<String>,
@@ -117,6 +131,8 @@ impl Settings {
             capacity: 3,
             edit: None,
             select_all: false,
+            dropdown: None,
+            slider_drag: None,
             status: String::new(),
             themes: themes
                 .entries()
@@ -163,22 +179,23 @@ impl Settings {
     fn rows(&self) -> Vec<Row> {
         use Control::*;
         let c = &self.draft;
-        let toggle =
-            |id, label, v: bool, hint| row(id, label, if v { "On" } else { "Off" }, hint, Toggle);
+        let toggle = |id, label, v: bool, hint| {
+            row(id, label, if v { "On" } else { "Off" }, hint, Toggle(v))
+        };
         match self.page() {
             0 => vec![
                 row(
                     "theme",
                     "Theme",
                     &c.theme,
-                    "Use − / + or arrows to select a theme",
+                    "Open the list; ↑↓ chooses, Enter previews, Esc dismisses",
                     Choice(self.themes.iter().map(|e| e.0.clone()).collect()),
                 ),
                 row(
                     "font",
                     "Font family",
                     &c.font.family,
-                    "Installed fonts; Enter to type a family name",
+                    "Choose an installed font or Custom… to type a family name",
                     Choice(self.fonts.clone()),
                 ),
                 row(
@@ -494,7 +511,7 @@ impl Settings {
                 .take(self.capacity)
                 .enumerate()
                 .map(|(i, r)| SettingsRow {
-                    adjustable: matches!(r.control, Control::Number(_) | Control::Choice(_)),
+                    adjustable: false,
                     caret: self
                         .edit
                         .as_ref()
@@ -521,12 +538,275 @@ impl Settings {
             preview: page == 0,
         }
     }
+    /// Visible control metadata, independent of translated labels or values.
+    pub fn toggle_rows(&self) -> Vec<Option<bool>> {
+        self.rows()
+            .into_iter()
+            .skip(self.offset)
+            .take(self.capacity)
+            .map(|r| match r.control {
+                Control::Toggle(checked) => Some(checked),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Semantic component types, never guessed from presentation strings.
+    pub fn control_rows(&self) -> Vec<SettingsControl> {
+        self.rows()
+            .into_iter()
+            .skip(self.offset)
+            .take(self.capacity)
+            .map(|r| match r.control {
+                Control::Toggle(v) => SettingsControl::Switch(v),
+                Control::Choice(_) => SettingsControl::Choice,
+                Control::Number(_) if r.id == "opacity" || r.id == "divider" => {
+                    SettingsControl::Slider {
+                        value: r.value.parse().unwrap_or(1.),
+                        min: if r.id == "opacity" { 0.1 } else { 0. },
+                        max: 1.,
+                    }
+                }
+                Control::Number(_) => SettingsControl::Number,
+                Control::Text => SettingsControl::Text,
+                Control::Shortcut(_) => SettingsControl::Shortcut,
+                Control::Action(Outcome::Redraw) => SettingsControl::Info,
+                Control::Action(o) => SettingsControl::Action(
+                    match o {
+                        Outcome::Themes => "Customize…",
+                        Outcome::Tasks if r.id == "card" => "Open card",
+                        Outcome::Tasks => "Open tasks",
+                        Outcome::AddTask => "Add task…",
+                        Outcome::Config => "Open config",
+                        Outcome::Secure => "Toggle secure entry",
+                        Outcome::GettingStarted => "Show introduction",
+                        _ => "Open",
+                    }
+                    .into(),
+                ),
+            })
+            .collect()
+    }
+    pub fn dropdown_view(&self) -> Option<SettingsDropdown> {
+        self.dropdown.as_ref().map(|d| SettingsDropdown {
+            row: self.focus.saturating_sub(self.offset),
+            items: d.labels.clone(),
+            selected: d.selected,
+            current: d.current,
+            offset: d.offset,
+        })
+    }
+    pub fn dropdown_open(&self) -> bool {
+        self.dropdown.is_some()
+    }
+    fn open_dropdown(&mut self, values: Vec<String>, row: &Row) -> Outcome {
+        let custom = matches!(row.id.as_str(), "font" | "shell");
+        let mut labels: Vec<String> = values
+            .iter()
+            .map(|v| {
+                if row.id == "theme" {
+                    self.themes
+                        .iter()
+                        .find(|e| e.0 == *v)
+                        .map(|e| e.1.clone())
+                        .unwrap_or(v.clone())
+                } else {
+                    v.clone()
+                }
+            })
+            .collect();
+        let mut values = values;
+        if custom {
+            values.insert(0, String::new());
+            labels.insert(0, "Custom…".into());
+        }
+        if values.is_empty() {
+            self.status = "No choices available".into();
+            return Outcome::Redraw;
+        }
+        let selected = values.iter().position(|v| *v == row.value).unwrap_or(0);
+        self.dropdown = Some(Dropdown {
+            values,
+            labels,
+            selected,
+            current: selected,
+            offset: selected.saturating_sub(DROPDOWN_ROWS - 1),
+            custom,
+            prefix: String::new(),
+        });
+        self.status = "↑↓ chooses • Enter selects • type to jump • Esc dismisses".into();
+        Outcome::Redraw
+    }
+    fn choose_dropdown(&mut self) -> Outcome {
+        let Some(d) = self.dropdown.take() else {
+            return Outcome::Redraw;
+        };
+        if d.custom && d.selected == 0 {
+            return self.begin_edit();
+        }
+        let Some(row) = self.rows().get(self.focus).cloned() else {
+            return Outcome::Redraw;
+        };
+        self.assign(&row.id, &d.values[d.selected])
+    }
+    fn dropdown_move(&mut self, delta: isize) -> Outcome {
+        if let Some(d) = &mut self.dropdown {
+            d.selected = d
+                .selected
+                .saturating_add_signed(delta)
+                .min(d.values.len() - 1);
+            if d.selected < d.offset {
+                d.offset = d.selected;
+            }
+            if d.selected >= d.offset + DROPDOWN_ROWS {
+                d.offset = d.selected + 1 - DROPDOWN_ROWS;
+            }
+        }
+        Outcome::Redraw
+    }
+    pub fn dropdown_key(&mut self, key: &str, text: &str) -> Outcome {
+        match key {
+            "Escape" => {
+                self.dropdown = None;
+                self.status.clear();
+                Outcome::Redraw
+            }
+            "Enter" | "NumpadEnter" => self.choose_dropdown(),
+            "ArrowDown" => self.dropdown_move(1),
+            "ArrowUp" => self.dropdown_move(-1),
+            "PageDown" => self.dropdown_move(DROPDOWN_ROWS as isize),
+            "PageUp" => self.dropdown_move(-(DROPDOWN_ROWS as isize)),
+            "Home" => self.dropdown_move(-isize::MAX),
+            "End" => self.dropdown_move(isize::MAX),
+            "Tab" => {
+                self.dropdown = None;
+                self.move_focus(1)
+            }
+            _ => {
+                if !text.is_empty() && !text.chars().any(char::is_control) {
+                    if let Some(d) = &mut self.dropdown {
+                        if d.prefix.len() + text.len() <= 256 {
+                            d.prefix.push_str(&text.to_lowercase());
+                        }
+                        let find = |prefix: &str| {
+                            d.labels
+                                .iter()
+                                .position(|v| v.to_lowercase().starts_with(prefix))
+                        };
+                        if let Some(i) = find(&d.prefix).or_else(|| find(&text.to_lowercase())) {
+                            d.selected = i;
+                            d.offset = i.saturating_sub(DROPDOWN_ROWS - 1);
+                        }
+                    }
+                }
+                Outcome::Redraw
+            }
+        }
+    }
+    pub fn wheel(&mut self, delta: isize) -> Outcome {
+        if self.dropdown.is_some() {
+            self.dropdown_move(delta)
+        } else {
+            self.move_focus(delta)
+        }
+    }
+    pub fn pointer_click(&mut self, l: &SettingsLayout, x: f32, y: f32) -> Outcome {
+        if let Some(view) = self.dropdown_view() {
+            let r = dropdown_rect(l, &view);
+            if inside(r, x, y) {
+                let slot = ((y - r[1] - 4. * l.scale) / (28. * l.scale)).floor();
+                if slot >= 0. && slot < DROPDOWN_ROWS as f32 {
+                    let index = view.offset + slot as usize;
+                    if index < view.items.len() {
+                        self.dropdown.as_mut().unwrap().selected = index;
+                        return self.choose_dropdown();
+                    }
+                }
+                return Outcome::Redraw;
+            }
+            // Dismiss without activating a control obscured by the menu.
+            self.dropdown = None;
+            self.status.clear();
+            return Outcome::Redraw;
+        }
+        let hit = l.hit(x, y, self.sections().len());
+        if let SettingsHit::Row(i) | SettingsHit::Plus(i) | SettingsHit::Minus(i) = hit {
+            let absolute = self.offset + i;
+            let Some(row) = self.rows().get(absolute).cloned() else {
+                return Outcome::Redraw;
+            };
+            if matches!(row.id.as_str(), "opacity" | "divider") {
+                let t = slider_track(l, i);
+                if inside(
+                    [
+                        t[0] - 8. * l.scale,
+                        t[1] - 8. * l.scale,
+                        t[2] + 16. * l.scale,
+                        20. * l.scale,
+                    ],
+                    x,
+                    y,
+                ) {
+                    if self.edit.is_some() && self.commit() == Outcome::Redraw {
+                        return Outcome::Redraw;
+                    }
+                    self.focus = absolute;
+                    self.slider_drag = Some(absolute);
+                    return self.set_slider(l, x);
+                }
+            }
+            return self.hit(SettingsHit::Row(i));
+        }
+        self.hit(hit)
+    }
+    fn set_slider(&mut self, l: &SettingsLayout, x: f32) -> Outcome {
+        let Some(index) = self.slider_drag else {
+            return Outcome::Redraw;
+        };
+        let Some(row) = self.rows().get(index).cloned() else {
+            return Outcome::Redraw;
+        };
+        if !x.is_finite() {
+            return Outcome::Redraw;
+        }
+        let t = slider_track(l, index.saturating_sub(self.offset));
+        let min = if row.id == "opacity" { 0.1 } else { 0. };
+        let value = min + ((x - t[0]) / t[2]).clamp(0., 1.) * (1. - min);
+        self.assign(&row.id, &format!("{:.2}", value))
+    }
+    pub fn pointer_drag(&mut self, l: &SettingsLayout, x: f32) -> Option<Outcome> {
+        self.slider_drag.map(|_| self.set_slider(l, x))
+    }
+    pub fn pointer_move(&mut self, l: &SettingsLayout, x: f32, y: f32) -> Option<Outcome> {
+        if self.slider_drag.is_some() {
+            return self.pointer_drag(l, x);
+        }
+        let view = self.dropdown_view()?;
+        let r = dropdown_rect(l, &view);
+        if inside(r, x, y) {
+            let slot = ((y - r[1] - 4. * l.scale) / (28. * l.scale)).floor();
+            if slot >= 0. && slot < DROPDOWN_ROWS as f32 {
+                let index = view.offset + slot as usize;
+                if index < view.items.len() && index != view.selected {
+                    self.dropdown.as_mut()?.selected = index;
+                    return Some(Outcome::Redraw);
+                }
+            }
+        }
+        None
+    }
+    pub fn pointer_release(&mut self) {
+        self.slider_drag = None;
+    }
+
     pub fn section(&mut self, n: usize) -> Outcome {
         let edited = self.edit.is_some();
         if edited && self.commit() == Outcome::Redraw {
             return Outcome::Redraw;
         }
         self.edit = None;
+        self.dropdown = None;
+        self.slider_drag = None;
         self.section = n.min(self.sections().len() - 1);
         self.focus = 0;
         self.offset = 0;
@@ -543,6 +823,8 @@ impl Settings {
             return Outcome::Redraw;
         }
         self.edit = None;
+        self.dropdown = None;
+        self.slider_drag = None;
         self.focus = self
             .focus
             .saturating_add_signed(delta)
@@ -622,16 +904,22 @@ impl Settings {
         };
         match r.control {
             Control::Action(o) => o,
-            Control::Toggle => self.adjust(1),
-            _ => {
-                let chars: Vec<char> = r.value.chars().collect();
-                let n = chars.len();
-                self.edit = Some((chars, n));
-                self.select_all = true;
-                self.status =
-                    "Type a value; Enter confirms. Shortcuts: press the new chord.".into();
-                Outcome::Redraw
-            }
+            Control::Toggle(_) => self.adjust(1),
+            Control::Choice(ref values) => self.open_dropdown(values.clone(), &r),
+            _ => self.begin_edit(),
+        }
+    }
+    fn begin_edit(&mut self) -> Outcome {
+        let Some(r) = self.rows().get(self.focus).cloned() else {
+            return Outcome::Redraw;
+        };
+        {
+            let chars: Vec<char> = r.value.chars().collect();
+            let n = chars.len();
+            self.edit = Some((chars, n));
+            self.select_all = true;
+            self.status = "Type a value; Enter confirms. Shortcuts: press the new chord.".into();
+            Outcome::Redraw
         }
     }
     pub fn selected_text(&self) -> Option<String> {
@@ -650,6 +938,11 @@ impl Settings {
         self.edit.is_some()
     }
     pub fn escape(&mut self) -> Outcome {
+        if self.dropdown.take().is_some() {
+            self.status.clear();
+            return Outcome::Redraw;
+        }
+        self.slider_drag = None;
         if self.edit.take().is_some() {
             self.status.clear();
             Outcome::Redraw
@@ -660,6 +953,9 @@ impl Settings {
         }
     }
     pub fn text(&mut self, s: &str) -> Outcome {
+        if self.dropdown.is_some() {
+            return self.dropdown_key("Text", s);
+        }
         if let Some((chars, cursor)) = &mut self.edit {
             if self.select_all {
                 chars.clear();
@@ -783,7 +1079,7 @@ impl Settings {
                 let value = r.value.parse::<f32>().unwrap_or(0.) + step * delta as f32;
                 self.assign(&r.id, &format!("{:.3}", value))
             }
-            Control::Toggle => self.assign(&r.id, if r.value == "On" { "Off" } else { "On" }),
+            Control::Toggle(checked) => self.assign(&r.id, if checked { "Off" } else { "On" }),
             Control::Choice(values) => {
                 if values.is_empty() {
                     return Outcome::Redraw;
@@ -939,6 +1235,8 @@ impl Settings {
             _ => {}
         }
         self.edit = None;
+        self.dropdown = None;
+        self.slider_drag = None;
         self.status = "Page reset in draft; Apply to save".into();
         Outcome::Preview
     }
@@ -1090,6 +1388,34 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn toolkit_toggles_follow_visible_rows_and_draft_changes() {
+        let mut s = settings();
+        s.section(3); // Workspace: toggle, placement choice, action.
+        s.set_capacity(3);
+        assert_eq!(
+            s.toggle_rows(),
+            vec![Some(s.draft.workspace.enabled), None, None]
+        );
+        let original = s.initial.workspace.enabled;
+        s.focus = 0;
+        s.hit(SettingsHit::Row(0));
+        assert_eq!(s.toggle_rows()[0], Some(!original));
+        assert_eq!(s.initial.workspace.enabled, original);
+        assert!(s.transaction.is_new()); // No Apply/save happened.
+                                         // The rightmost switch area shares the existing +/- hit zones.
+        s.hit(SettingsHit::Plus(0));
+        assert_eq!(s.toggle_rows()[0], Some(original));
+        s.hit(SettingsHit::Minus(0));
+        assert_eq!(s.toggle_rows()[0], Some(!original));
+        s.set_capacity(1);
+        s.move_focus(1);
+        assert_eq!(s.toggle_rows(), vec![None]);
+        s.move_focus(-1);
+        assert_eq!(s.toggle_rows(), vec![Some(!original)]);
+        s.section(5); // Shortcuts must not be mistaken for switches.
+        assert!(s.toggle_rows().iter().all(Option::is_none));
+    }
+    #[test]
     fn invalid_preview_keeps_previous_value() {
         let mut s = settings();
         s.focus = 2;
@@ -1148,6 +1474,8 @@ mod tests {
         let mut s = settings();
         s.focus = 1;
         s.activate();
+        s.dropdown_key("Home", "");
+        s.dropdown_key("Enter", ""); // Custom font opens the editable field.
         assert_eq!(s.selected_text().as_deref(), Some("monospace"));
         s.text("日本");
         s.cursor_edge(false);
@@ -1156,6 +1484,91 @@ mod tests {
         assert_eq!(s.selected_text().as_deref(), Some("a日本"));
         s.erase(false);
         assert_eq!(s.selected_text(), None);
+    }
+    #[test]
+    fn every_page_exposes_typed_components_not_generic_steppers() {
+        let mut s = settings();
+        s.set_capacity(7);
+        for section in 0..8 {
+            s.section(section);
+            assert_eq!(s.control_rows().len(), s.view().rows.len());
+            assert!(s.view().rows.iter().all(|r| !r.adjustable));
+        }
+        s.section(0);
+        let c = s.control_rows();
+        assert!(matches!(c[0], SettingsControl::Choice));
+        assert!(matches!(c[2], SettingsControl::Number));
+        assert!(matches!(c[5], SettingsControl::Slider { .. }));
+        assert!(matches!(c[6], SettingsControl::Switch(_)));
+        s.section(4);
+        assert!(matches!(s.control_rows()[0], SettingsControl::Action(_)));
+        assert!(matches!(s.control_rows()[2], SettingsControl::Info));
+        s.section(5);
+        assert!(matches!(s.control_rows()[0], SettingsControl::Shortcut));
+        s.onboarding = true;
+        for section in 0..4 {
+            s.section(section);
+            assert_eq!(s.control_rows().len(), s.view().rows.len());
+            assert!(s.view().rows.iter().all(|r| !r.adjustable));
+        }
+    }
+    #[test]
+    fn dropdown_keyboard_preview_escape_and_custom_font_are_transactional() {
+        let mut s = settings();
+        s.activate();
+        let original = s.draft.theme.clone();
+        assert!(s.dropdown_open());
+        let current = s.dropdown_view().unwrap().current;
+        s.dropdown_key("End", "");
+        assert_eq!(s.dropdown_view().unwrap().current, current);
+        assert_eq!(s.draft.theme, original);
+        let selected =
+            s.dropdown.as_ref().unwrap().values[s.dropdown.as_ref().unwrap().selected].clone();
+        assert_eq!(s.dropdown_key("Enter", ""), Outcome::Preview);
+        assert_eq!(s.draft.theme, selected);
+        assert!(s.transaction.is_new());
+        s.activate();
+        s.dropdown_key("Home", "");
+        assert_eq!(s.escape(), Outcome::Redraw);
+        assert!(!s.dropdown_open());
+        assert_eq!(s.draft.theme, selected);
+        s.focus = 1;
+        s.activate();
+        s.dropdown_key("Home", "");
+        s.dropdown_key("Enter", "");
+        assert!(s.is_editing());
+        s.text("Custom Mono");
+        assert_eq!(s.commit(), Outcome::Preview);
+        assert_eq!(s.draft.font.family, "Custom Mono");
+    }
+    #[test]
+    fn dropdown_pointer_and_slider_drag_share_scaled_paint_geometry() {
+        for scale in [1., 1.5, 2.] {
+            let mut s = settings();
+            let l = SettingsLayout::new(850. * scale, 680. * scale, 0., scale).unwrap();
+            s.set_capacity(l.rows);
+            let field = volt_renderer::settings::control_rect(&l, 0);
+            s.pointer_click(&l, field[0] + field[2] - 4. * scale, field[1] + 10. * scale);
+            assert!(s.dropdown_open()); // Right edge opens list, never cycles.
+            let view = s.dropdown_view().unwrap();
+            let r = dropdown_rect(&l, &view);
+            assert_eq!(
+                s.pointer_click(&l, r[0] + 30. * scale, r[1] + 17. * scale),
+                Outcome::Preview
+            );
+            assert!(!s.dropdown_open());
+            let t = slider_track(&l, 5);
+            assert_eq!(s.pointer_click(&l, t[0], t[1]), Outcome::Preview);
+            assert_eq!(s.draft.appearance.opacity, 0.1);
+            s.pointer_drag(&l, t[0] + t[2] * 2.);
+            assert_eq!(s.draft.appearance.opacity, 1.);
+            s.pointer_release();
+            assert!(s.pointer_drag(&l, t[0]).is_none());
+            assert_eq!(
+                s.initial.appearance.opacity,
+                Config::default().appearance.opacity
+            );
+        }
     }
     #[test]
     fn shortcut_arrow_chord_validates_and_delete_restores() {

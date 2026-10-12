@@ -324,11 +324,19 @@ impl MainState {
             if let Some(s) = self.settings.as_mut() {
                 s.set_capacity(layout.rows);
                 self.renderer.settings = Some(s.view());
+                self.renderer.settings_toggles = s.toggle_rows();
+                self.renderer.settings_controls = s.control_rows();
+                self.renderer.settings_dropdown = s.dropdown_view();
             }
         } else if self.settings.is_some() {
             self.cancel_settings();
             self.renderer
                 .set_top_alert(Some("Make the window larger to open Settings".into()));
+        }
+        if self.settings.is_none() {
+            self.renderer.settings_toggles.clear();
+            self.renderer.settings_controls.clear();
+            self.renderer.settings_dropdown = None;
         }
         self.begin_redraw();
     }
@@ -338,6 +346,9 @@ impl MainState {
             self.apply_config(&s.initial);
         }
         self.renderer.settings = None;
+        self.renderer.settings_toggles.clear();
+        self.renderer.settings_controls.clear();
+        self.renderer.settings_dropdown = None;
         self.begin_redraw();
     }
     fn settings_outcome(&mut self, outcome: crate::settings::Outcome) {
@@ -428,6 +439,23 @@ impl MainState {
             PhysicalKey::Code(c) => c,
             _ => return,
         };
+        if s.dropdown_open() {
+            let o = if code == KeyCode::Tab {
+                s.dropdown_key("Escape", "");
+                s.move_focus(if shift { -1 } else { 1 })
+            } else {
+                s.dropdown_key(
+                    &format!("{code:?}"),
+                    if super_key || ctrl || alt {
+                        ""
+                    } else {
+                        text.unwrap_or("")
+                    },
+                )
+            };
+            self.settings_outcome(o);
+            return;
+        }
         if s.recording_shortcut()
             && !matches!(
                 code,
@@ -518,6 +546,7 @@ impl MainState {
                     s.activate()
                 }
             }
+            KeyCode::Space if !s.is_editing() => s.activate(),
             KeyCode::Backspace => s.erase(false),
             KeyCode::Delete => s.erase(true),
             _ => {
@@ -4288,6 +4317,9 @@ impl ApplicationHandler<VoltEvent> for App {
 
             WindowEvent::Focused(false) => {
                 state.reported_keys.clear();
+                if let Some(settings) = state.settings.as_mut() {
+                    settings.pointer_release();
+                }
                 #[cfg(target_os = "macos")]
                 {
                     if self.focused_window == Some(window_id) {
@@ -4328,12 +4360,23 @@ impl ApplicationHandler<VoltEvent> for App {
                 // A release outside our window may never arrive. Don't let a
                 // later click inherit an old tab drag candidate.
                 state.tab_drag = None;
+                if let Some(settings) = state.settings.as_mut() {
+                    settings.pointer_release();
+                }
                 state.window.set_cursor(winit::window::CursorIcon::Default);
             }
 
             WindowEvent::CursorMoved { position, .. } => {
                 if state.settings.is_some() {
                     state.mouse_pos = (position.x as f32, position.y as f32);
+                    if let Some(layout) = state.renderer.settings_layout() {
+                        let outcome = state.settings.as_mut().and_then(|s| {
+                            s.pointer_move(&layout, position.x as f32, position.y as f32)
+                        });
+                        if let Some(o) = outcome {
+                            state.settings_outcome(o);
+                        }
+                    }
                     return;
                 }
                 let pointer_moved = state.mouse_pos != (position.x as f32, position.y as f32);
@@ -4524,16 +4567,17 @@ impl ApplicationHandler<VoltEvent> for App {
                 if state.settings.is_some() {
                     if btn_state == ElementState::Pressed && button == MouseButton::Left {
                         if let Some(layout) = state.renderer.settings_layout() {
-                            let sections = state
-                                .settings
-                                .as_ref()
-                                .map(|s| s.sections().len())
-                                .unwrap_or(0);
-                            let hit = layout.hit(state.mouse_pos.0, state.mouse_pos.1, sections);
-                            let outcome = state.settings.as_mut().map(|s| s.hit(hit));
+                            let outcome = state.settings.as_mut().map(|s| {
+                                s.pointer_click(&layout, state.mouse_pos.0, state.mouse_pos.1)
+                            });
                             if let Some(o) = outcome {
                                 state.settings_outcome(o);
                             }
+                        }
+                    }
+                    if btn_state == ElementState::Released && button == MouseButton::Left {
+                        if let Some(s) = state.settings.as_mut() {
+                            s.pointer_release();
                         }
                     }
                     return;
@@ -4988,10 +5032,13 @@ impl ApplicationHandler<VoltEvent> for App {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(p) => p.y as f32,
                     };
-                    if let Some(settings) = state.settings.as_mut() {
-                        settings.move_focus(if amount < 0. { 1 } else { -1 });
+                    let outcome = state
+                        .settings
+                        .as_mut()
+                        .map(|settings| settings.wheel(if amount < 0. { 1 } else { -1 }));
+                    if let Some(o) = outcome {
+                        state.settings_outcome(o);
                     }
-                    state.sync_settings();
                     return;
                 }
                 if state

@@ -110,6 +110,104 @@ pub trait Painter: Sized {
         }
     }
 
+    /// Independently rounded corners, ordered top-left, top-right, bottom-right,
+    /// bottom-left. Radii are capped at half the shorter rectangle dimension.
+    /// This additive fallback triangulates a convex outline; existing adapters
+    /// need not implement a new required method.
+    fn card_corners(
+        &self,
+        out: &mut Vec<Self::Shape>,
+        rect: [f32; 4],
+        radii: [f32; 4],
+        color: [f32; 4],
+    ) {
+        let Some(points) = corner_points(rect, radii) else {
+            return;
+        };
+        let center = [rect[0] + rect[2] * 0.5, rect[1] + rect[3] * 0.5];
+        for i in 0..points.len() {
+            self.card_triangle(
+                out,
+                [center, points[i], points[(i + 1) % points.len()]],
+                color,
+            );
+        }
+    }
+
+    /// Inset border, entirely inside the outer corner silhouette. Unlike a
+    /// centered stroke this does not grow layout or pointer bounds.
+    fn card_outline(
+        &self,
+        out: &mut Vec<Self::Shape>,
+        rect: [f32; 4],
+        radii: [f32; 4],
+        width: f32,
+        color: [f32; 4],
+    ) {
+        if !width.is_finite() || width <= 0. {
+            return;
+        }
+        let Some(outer) = corner_points(rect, radii) else {
+            return;
+        };
+        if width * 2. >= rect[2].min(rect[3]) {
+            self.card_corners(out, rect, radii, color);
+            return;
+        }
+        let inner_rect = [
+            rect[0] + width,
+            rect[1] + width,
+            rect[2] - width * 2.,
+            rect[3] - width * 2.,
+        ];
+        let limit = rect[2].min(rect[3]) * 0.5;
+        let Some(inner) = corner_points(inner_rect, radii.map(|r| (r.min(limit) - width).max(0.)))
+        else {
+            return;
+        };
+        for i in 0..outer.len() {
+            let next = (i + 1) % outer.len();
+            self.card_triangle(out, [outer[i], inner[i], outer[next]], color);
+            self.card_triangle(out, [inner[i], inner[next], outer[next]], color);
+        }
+    }
+
+    /// Optional shadow adapter. The renderer-independent fallback is explicitly
+    /// an **unblurred offset/spread silhouette**; it does not pretend to provide
+    /// blur. Native adapters can override this with an alpha-mask blur.
+    fn card_shadow(
+        &self,
+        out: &mut Vec<Self::Shape>,
+        rect: [f32; 4],
+        radii: [f32; 4],
+        blur: f32,
+        spread: f32,
+        offset: [f32; 2],
+        color: [f32; 4],
+    ) {
+        if ![blur, spread, offset[0], offset[1]]
+            .into_iter()
+            .all(f32::is_finite)
+            || blur < 0.
+            || corner_points(rect, radii).is_none()
+        {
+            return;
+        }
+        let expanded = [
+            rect[0] + offset[0] - spread,
+            rect[1] + offset[1] - spread,
+            rect[2] + spread * 2.,
+            rect[3] + spread * 2.,
+        ];
+        let limit = rect[2].min(rect[3]) * 0.5;
+        self.card_corners(
+            out,
+            expanded,
+            radii.map(|r| (r.min(limit) + spread).max(0.)),
+            color,
+        );
+    }
+
     fn card_icon(
         &self,
         bg: &mut Vec<Self::Shape>,
@@ -256,4 +354,28 @@ pub trait Painter: Sized {
             }
         }
     }
+}
+
+fn corner_points([x, y, w, h]: [f32; 4], radii: [f32; 4]) -> Option<Vec<[f32; 2]>> {
+    if ![x, y, w, h, x + w, y + h].into_iter().all(f32::is_finite)
+        || w <= 0.
+        || h <= 0.
+        || radii.into_iter().any(|r| !r.is_finite() || r < 0.)
+    {
+        return None;
+    }
+    let [tl, tr, br, bl] = radii.map(|r| r.min(w.min(h) * 0.5));
+    let mut points = Vec::with_capacity(68);
+    for (cx, cy, radius, angle) in [
+        (x + tl, y + tl, tl, 180_f32),
+        (x + w - tr, y + tr, tr, 270.),
+        (x + w - br, y + h - br, br, 0.),
+        (x + bl, y + h - bl, bl, 90.),
+    ] {
+        for i in 0..=16 {
+            let a = (angle + i as f32 * 90. / 16.).to_radians();
+            points.push([cx + radius * a.cos(), cy + radius * a.sin()]);
+        }
+    }
+    Some(points)
 }

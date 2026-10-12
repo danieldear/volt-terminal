@@ -14,7 +14,7 @@ in Rust, for macOS and Linux.
 
 > ⚠️ **Early development.** Volt is functional on macOS, but it has not been validated as a daily driver; APIs and config formats may change before v1.0.
 
-**Public preview (October 2026):** [Volt v0.1.11](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.11)
+**Public preview (October 2026):** [Volt v0.1.12](https://github.com/danieldear/volt-terminal/releases/tag/v0.1.12)
 includes macOS and Linux archives with SHA-256 checksums. The macOS release
 workflow requires **Developer ID signing, Apple notarization and a stapled
 ticket** before publication. Check the release's `macos-signing-status.txt`
@@ -48,6 +48,17 @@ the OS never offers them here. Everything else in a native context menu,
 including the dynamic Services submenu, is genuine.
 
 ---
+
+## Shared UI toolkit
+
+The v0.1.13 source includes the UI update and terminal compatibility batch.
+Performance acceptance is still open; see the [recorded toolkit measurements](docs/ui-toolkit-migration.md#rendering-comparison-acceptance-not-passed).
+
+
+Volt uses a pinned [Volt UI Kit snapshot](docs/ui-toolkit-migration.md) for its
+custom GPU-rendered interface. Settings switches, select triggers and sliders use UI Kit 0.4.0 components
+without adding a second GPU renderer or windowing system. The migration is
+incremental; Volt retains ownership of terminal input and settings transactions.
 
 ## Platform support
 
@@ -455,12 +466,12 @@ In the unreleased compatibility branch, anchors survive resize/reflow and
 `Cmd+Shift+O` selects the last completed command's output (`select_command_output`
 for custom bindings). Use `Cmd+C` to copy it. Shell completion markers are required;
 Volt does not guess command boundaries from terminal text. This is not yet part
-of the v0.1.12 draft. See [current implementation and testing](docs/terminal-compatibility.md).
+of the v0.1.12 release. See [current implementation and testing](docs/terminal-compatibility.md).
 
 ### Unreleased terminal compatibility work
 
 DEC 2026 synchronized output, negotiated extended keyboard input, command-output
 selection and opt-in workspace layout restoration are implemented on the
-compatibility branch. They are not in the existing v0.1.12 draft. See
+compatibility branch. They are not in the existing v0.1.12 release. See
 [behavior, boundaries and validation](docs/terminal-compatibility.md). Linux
 clipboard/desktop work is deferred pending a test system.

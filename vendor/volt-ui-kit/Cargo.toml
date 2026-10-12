@@ -1,12 +1,154 @@
 [package]
 name = "volt-ui-kit"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.87"
 license = "MIT"
 description = "Renderer-independent desktop UI components extracted from Volt"
 readme = "README.md"
-include = ["src/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "LICENSE", "CHANGELOG.md", "ROADMAP.md"]
+include = ["docs/**", "src/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "LICENSE", "CHANGELOG.md", "ROADMAP.md"]
+
+[features]
+default = []
+declarative = ["dep:serde", "dep:serde_json"]
+rust-ui = ["declarative", "dep:unicode-segmentation"]
+native = ["rust-ui", "dep:winit", "dep:softbuffer", "dep:tiny-skia", "dep:cosmic-text", "dep:image", "dep:arboard", "dep:accesskit", "dep:accesskit_winit", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+native-desktop = ["native", "dep:muda", "dep:tray-icon", "objc2-app-kit?/NSOpenPanel", "objc2-app-kit?/NSSavePanel", "objc2-app-kit?/NSPanel", "objc2-foundation?/NSURL"]
+native-notifications = ["native", "dep:objc2-user-notifications", "dep:block2", "objc2-foundation?/NSBundle", "objc2-foundation?/NSURL"]
+dev-tools = ["dep:serde_json"]
+native-gpu = ["native", "dep:vello", "dep:wgpu", "dep:pollster", "dep:guillotiere"]
 
 [dependencies]
 unicode-width = "0.2"
+unicode-segmentation = { version = "=1.13.3", optional = true }
+arboard = { version = "=3.6.1", default-features = false, optional = true }
+
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+winit = { version = "0.30.13", optional = true }
+# Screen-reader/assistive-technology tree for native windows (macOS, Windows, Linux AT-SPI).
+accesskit = { version = "=0.25.1", optional = true }
+accesskit_winit = { version = "=0.34.1", optional = true }
+softbuffer = { version = "0.4.8", optional = true }
+tiny-skia = { version = "0.11.4", optional = true }
+image = { version = "=0.25.8", default-features = false, features = ["png", "jpeg"], optional = true }
+# Vello 0.6 / wgpu 26 retains the crate's Rust 1.87 minimum. Newer Vello
+# releases require newer Rust. This is isolated to the optional native host.
+vello = { version = "=0.6.0", optional = true, default-features = false, features = ["wgpu", "bump_estimate"] }
+pollster = { version = "0.4", optional = true }
+# Reuse Vello 0.6's already-transitive allocator for packing admission. This
+# adds no new locked packages and is absent from the default/native CPU build.
+guillotiere = { version = "=0.6.2", optional = true }
+cosmic-text = { version = "0.14.2", optional = true }
+
+# One native compute backend per platform; no unused GLES/WebGPU backend.
+[target.'cfg(target_os = "macos")'.dependencies]
+# Narrow, independent modern local-notification adapter; no delegate/actions/locations.
+objc2-user-notifications = { version = "=0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger"], optional = true }
+block2 = { version = "=0.6.2", default-features = false, features = ["std"], optional = true }
+objc2 = { version = "=0.6.5", default-features = false, features = ["std"], optional = true }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSGeometry"], optional = true }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSView", "NSResponder", "NSToolbar", "NSButton", "NSControl", "NSVisualEffectView", "NSGraphics", "NSWorkspace", "NSAccessibility"], optional = true }
+muda = { version = "=0.19.3", default-features = false, optional = true }
+tray-icon = { version = "=0.24.2", default-features = false, optional = true }
+wgpu = { version = "=26.0.1", optional = true, default-features = false, features = ["std", "wgsl", "metal"] }
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "=26.0.1", optional = true, default-features = false, features = ["std", "wgsl", "dx12"] }
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+wgpu = { version = "=26.0.1", optional = true, default-features = false, features = ["std", "wgsl", "vulkan"] }
+
+# CPU rasterization/shaping must be usable under the documented `cargo run`.
+# These profiles apply only when this repository is the workspace root; consumer
+# workspaces (including Volt) retain their own profile settings.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[[example]]
+name = "native_window"
+required-features = ["native"]
+[[example]]
+name = "panels_and_layout"
+required-features = ["native"]
+[[example]]
+name = "buttons_and_events"
+required-features = ["native"]
+[[example]]
+name = "declarative_ui"
+required-features = ["native"]
+[[example]]
+name = "complete_app"
+required-features = ["native"]
+[[example]]
+name = "components"
+required-features = ["native"]
+
+[[example]]
+name = "render_benchmark"
+required-features = ["native"]
+
+[[example]]
+name = "rust_counter"
+required-features = ["native"]
+[[example]]
+name = "rust_settings"
+required-features = ["native"]
+[[example]]
+name = "rust_keyed_list"
+required-features = ["native"]
+[[example]]
+name = "rust_layout"
+required-features = ["native"]
+
+[[example]]
+name = "rust_responsive"
+required-features = ["native"]
+
+[[example]]
+name = "rust_effects"
+required-features = ["native"]
+
+[[example]]
+name = "rust_surfaces"
+required-features = ["native"]
+[[example]]
+name = "rust_scroll"
+required-features = ["native"]
+[[example]]
+name = "rust_transparent"
+required-features = ["native-gpu"]
+
+[[example]]
+name = "ui_lab"
+required-features = ["native"]
+
+[[example]]
+name = "showcase"
+required-features = ["native"]
+
+[[example]]
+name = "desk"
+required-features = ["native"]
+
+[[example]]
+name = "northbound"
+required-features = ["native"]
+
+[[example]]
+name = "specimen"
+required-features = ["native"]
+
+[[example]]
+name = "catalog"
+required-features = ["native"]
+
+[[example]]
+name = "relay"
+required-features = ["native"]
+
+[[bin]]
+name = "cargo-volt"
+path = "src/bin/cargo-volt.rs"
+required-features = ["dev-tools"]

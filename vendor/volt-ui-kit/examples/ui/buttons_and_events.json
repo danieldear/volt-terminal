@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "root": {
+    "type": "column",
+    "id": "root",
+    "children": [
+      {
+        "type": "text",
+        "id": "eyebrow",
+        "text": "INPUT + RUST EVENTS",
+        "font_size": 11,
+        "tone": "accent"
+      },
+      {
+        "type": "text",
+        "id": "title",
+        "text": "Every state has a purpose.",
+        "font_size": 30,
+        "tone": "body"
+      },
+      {
+        "type": "text",
+        "id": "subtitle",
+        "text": "Hover, press, cancel by dragging away, or use keyboard focus.",
+        "font_size": 15,
+        "tone": "muted"
+      },
+      {
+        "type": "panel",
+        "id": "controls",
+        "children": [
+          {
+            "type": "text",
+            "id": "counter",
+            "bind_text": "status",
+            "font_size": 24
+          },
+          {
+            "type": "row",
+            "id": "actions",
+            "children": [
+              {
+                "type": "button",
+                "id": "increment",
+                "label": "Increment",
+                "on_activate": "increment",
+                "primary": true
+              },
+              {
+                "type": "button",
+                "id": "reset",
+                "label": "Reset",
+                "on_activate": "reset",
+                "bind_enabled": "can_reset"
+              },
+              {
+                "type": "button",
+                "id": "disabled",
+                "label": "Disabled",
+                "on_activate": "increment",
+                "enabled": false
+              }
+            ],
+            "gap": 12
+          },
+          {
+            "type": "text",
+            "id": "help",
+            "text": "Reset becomes enabled after the first activation. Disabled controls are skipped during keyboard traversal.",
+            "font_size": 14,
+            "tone": "muted"
+          }
+        ],
+        "padding": 24,
+        "gap": 22
+      },
+      {
+        "type": "text",
+        "id": "footer",
+        "text": "State lives in Rust. The document only connects names.",
+        "font_size": 12,
+        "tone": "accent"
+      }
+    ],
+    "padding": 28,
+    "gap": 22
+  }
+}

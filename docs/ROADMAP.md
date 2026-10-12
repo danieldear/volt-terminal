@@ -1,7 +1,7 @@
 # Volt roadmap
 
-Volt is an early public preview (source version: **0.1.12**). This page lists
-what works today and what comes next. Status reconciled on **2026-10-08** against
+Volt is an early public preview (source version: **0.1.13**). This page lists
+what works today and what comes next. Status reconciled on **2026-10-12** against
 the current source, release metadata and hosted signing validation. Order within a stage is a rough priority,
 not a promise or a date. Settings and shortcuts may change before 1.0.
 
@@ -31,7 +31,7 @@ publicly released are separate milestones; a pending check is not missing code.
 
 | Area | Completed evidence | What remains |
 | --- | --- | --- |
-| macOS signing and notarization | Developer ID signing, hardened runtime, timestamp, Apple acceptance, stapling and extracted-ZIP verification passed locally and in [hosted validation](https://github.com/danieldear/volt-terminal/actions/runs/37572203978). Repository mode is `notarized` for future releases. | Public v0.1.11 is notarized. v0.1.12 is a notarized draft with signature/staple/Gatekeeper verification; the user reports cross-system testing passed. Draft publication remains explicit. Older v0.1.10 stays ad-hoc; **do not redo credential setup.** |
+| macOS signing and notarization | Developer ID signing, hardened runtime, timestamp, Apple acceptance, stapling and extracted-ZIP verification passed locally and in [hosted validation](https://github.com/danieldear/volt-terminal/actions/runs/37572203978). Repository mode is `notarized` for future releases. | Public v0.1.12 is notarized and the user reports cross-system testing passed. v0.1.13 source adds terminal compatibility and UI Kit 0.4.0; its rendering-performance acceptance remains open. Older v0.1.10 stays ad-hoc; **do not redo credential setup.** |
 | Rendering optimizations | Merged ASCII/extended shape caches and task-strip geometry reuse passed targeted CPU/GPU checks. | Caches are merged. Perform matched visible-window benchmarks before claiming a whole-app speedup. See [measurement evidence](performance-intelligent-rendering.md). |
 | Project tasks and tab status | Current-pane execution, task import/form, trust review and shell completion handling exist. | Verify directory changes, status transitions and all card/strip routes across supported shells; fix demonstrated regressions rather than rebuild the feature. |
 
@@ -115,7 +115,7 @@ not instructions to reimplement them.
 | P0 | Terminal compatibility | Correct cursor, colors, modes, scrolling and application control sequences. | Common behavior is essential; every extension is not. | Common ANSI/xterm subset implemented. Extend regression coverage and fix confirmed defects; do not claim full conformance. |
 | P0 | Performance | Output throughput, responsive typing, consistent redraws and low idle resource use. | Essential without removing features or safety checks. | Local cache improvements tested; matched visible-window verification pending. |
 | P0 | Project task and tab reliability | Run commands in the selected pane and show accurate directory, busy, success and failure state. | Essential to existing workflows. | Implemented. Validate all card/strip routes and supported shells; without completion hooks show unknown/sent, never invented success. |
-| P0 | Notarized public distribution | Trusted macOS installation and accurately labeled downloads. | Essential for public adoption. | Public v0.1.11 is notarized; tested v0.1.12 remains draft. Do not repeat credential setup. |
+| P0 | Notarized public distribution | Trusted macOS installation and accurately labeled downloads. | Essential for public adoption. | Public v0.1.12 is notarized. v0.1.13 performance acceptance remains open. Do not repeat credential setup. |
 | P0 audit; P1 fixes | Accessibility / IME | Screen-reader navigation and correct multilingual input composition. | Essential usability work. | Audit native behavior and fix demonstrated blockers. Emoji insertion does not establish full IME support. |
 | P0 maintain | Graphical Settings and skippable first-run setup | Configure appearance, shell/prompt, terminal behavior and shortcuts without editing TOML; learn tasks and navigation. | Faster, safer setup for new users while keeping manual configuration. | Implemented in source; native/GPU/config/shell checks documented in [Settings](settings.md). Included starting with v0.1.11; not in older v0.1.10 archives. |
 | P0 maintain | Tabs, splits and search | Organize shells/editors and find project files or retained terminal output. | Already part of the product. | Implemented. Preserve selection, focus, modal routing and cache invalidation through changes. |

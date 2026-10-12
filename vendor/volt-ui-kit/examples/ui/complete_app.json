@@ -1,0 +1,429 @@
+{
+  "schema_version": 1,
+  "root": {
+    "type": "column",
+    "id": "root",
+    "children": [
+      {
+        "type": "row",
+        "id": "header",
+        "children": [
+          {
+            "type": "column",
+            "id": "heading",
+            "children": [
+              {
+                "type": "text",
+                "id": "app_title",
+                "text": "Project workbench",
+                "style": {
+                  "font_size": 25,
+                  "font_weight": 700
+                }
+              },
+              {
+                "type": "text",
+                "id": "app_subtitle",
+                "text": "Editable UI. Native window. Application state owned by Rust.",
+                "style": {
+                  "font_size": 13,
+                  "color": "#AAB8CA"
+                }
+              }
+            ],
+            "gap": 4,
+            "flex": 1
+          },
+          {
+            "type": "badge",
+            "id": "local_badge",
+            "text": "Local prototype",
+            "style": {
+              "background": "#263249",
+              "color": "#C5D2FC",
+              "radius": 6,
+              "font_size": 12,
+              "font_weight": 600
+            }
+          }
+        ],
+        "gap": 18,
+        "align": "center",
+        "height": 56
+      },
+      {
+        "type": "separator",
+        "id": "header_rule",
+        "height": 1,
+        "style": {
+          "background": "#334154"
+        }
+      },
+      {
+        "type": "row",
+        "id": "workbench",
+        "children": [
+          {
+            "type": "panel",
+            "id": "sidebar",
+            "children": [
+              {
+                "type": "text",
+                "id": "project_heading",
+                "text": "volt-ui-kit",
+                "style": {
+                  "font_size": 18,
+                  "font_weight": 700
+                }
+              },
+              {
+                "type": "text",
+                "id": "project_detail",
+                "text": "Standalone desktop toolkit",
+                "style": {
+                  "font_size": 12,
+                  "color": "#AAB8CA"
+                }
+              },
+              {
+                "type": "separator",
+                "id": "sidebar_divider",
+                "height": 1,
+                "style": {
+                  "background": "#334154"
+                }
+              },
+              {
+                "type": "text",
+                "id": "workspace_label",
+                "text": "This workspace",
+                "style": {
+                  "font_size": 13,
+                  "font_weight": 600
+                }
+              },
+              {
+                "type": "text",
+                "id": "workspace_info",
+                "text": "A complete document-to-window example with real control events.",
+                "style": {
+                  "font_size": 13,
+                  "color": "#AAB8CA"
+                }
+              },
+              {
+                "type": "badge",
+                "id": "state_badge",
+                "bind_text": "config_state",
+                "style": {
+                  "background": "#29364A",
+                  "color": "#D5DEFD",
+                  "radius": 6,
+                  "font_size": 12,
+                  "font_weight": 500
+                }
+              },
+              {
+                "type": "separator",
+                "id": "sidebar_rule",
+                "height": 1,
+                "style": {
+                  "background": "#334154"
+                }
+              },
+              {
+                "type": "text",
+                "id": "source_label",
+                "text": "Presentation",
+                "style": {
+                  "font_size": 13,
+                  "font_weight": 600
+                }
+              },
+              {
+                "type": "text",
+                "id": "source_path",
+                "text": "examples/ui/\ncomplete_app.json",
+                "style": {
+                  "font_family": "Menlo",
+                  "font_size": 11,
+                  "color": "#BAC6DA"
+                }
+              },
+              {
+                "type": "text",
+                "id": "reload_help",
+                "text": "Edit fonts, colors or layout in the file. Press F5 to reload.",
+                "style": {
+                  "font_size": 12,
+                  "color": "#AAB8CA"
+                }
+              },
+              {
+                "type": "text",
+                "id": "rejection_help",
+                "text": "Invalid edits leave the last working UI in place.",
+                "style": {
+                  "font_size": 12,
+                  "font_style": "italic",
+                  "color": "#95A4BA"
+                }
+              },
+              {
+                "type": "text",
+                "id": "applied_count",
+                "bind_text": "applied_count",
+                "style": {
+                  "font_size": 12,
+                  "color": "#AAB8CA"
+                }
+              }
+            ],
+            "width": 224,
+            "padding": 18,
+            "gap": 15,
+            "style": {
+              "background": "#1C2533",
+              "border_color": "#334154",
+              "border_width": 1,
+              "radius": 12
+            }
+          },
+          {
+            "type": "panel",
+            "id": "configuration",
+            "children": [
+              {
+                "type": "text",
+                "id": "configuration_title",
+                "text": "Build preferences",
+                "style": {
+                  "font_size": 20,
+                  "font_weight": 600
+                }
+              },
+              {
+                "type": "text",
+                "id": "configuration_description",
+                "text": "Change a control to update Rust state. Apply keeps the configuration in memory.",
+                "style": {
+                  "font_size": 13,
+                  "color": "#AAB8CA"
+                }
+              },
+              {
+                "type": "separator",
+                "id": "main_rule",
+                "height": 1,
+                "style": {
+                  "background": "#334154"
+                }
+              },
+              {
+                "type": "text",
+                "id": "behavior_label",
+                "text": "Workspace behavior",
+                "style": {
+                  "font_size": 14,
+                  "font_weight": 600
+                }
+              },
+              {
+                "type": "toggle",
+                "id": "auto_save_control",
+                "label": "Keep edits between preview requests",
+                "bind_checked": "auto_save",
+                "on_toggle_changed": "auto_save_changed",
+                "height": 38,
+                "style": {
+                  "font_size": 13,
+                  "color": "#ECF1F8",
+                  "accent_color": "#A7B8FA",
+                  "border_color": "#52647E"
+                }
+              },
+              {
+                "type": "toggle",
+                "id": "preview_control",
+                "label": "Open preview after applying changes",
+                "bind_checked": "open_preview",
+                "on_toggle_changed": "preview_changed",
+                "height": 38,
+                "style": {
+                  "font_size": 13,
+                  "color": "#ECF1F8",
+                  "accent_color": "#A7B8FA",
+                  "border_color": "#52647E"
+                }
+              },
+              {
+                "type": "text",
+                "id": "output_label",
+                "text": "Included in this configuration",
+                "style": {
+                  "font_size": 14,
+                  "font_weight": 600
+                }
+              },
+              {
+                "type": "checkbox",
+                "id": "docs_control",
+                "label": "Include generated documentation",
+                "bind_checked": "include_docs",
+                "on_toggle_changed": "docs_changed",
+                "height": 38,
+                "style": {
+                  "font_size": 13,
+                  "color": "#ECF1F8",
+                  "accent_color": "#A7B8FA",
+                  "border_color": "#52647E"
+                }
+              },
+              {
+                "type": "checkbox",
+                "id": "checks_control",
+                "label": "Use strict validation checks",
+                "bind_checked": "strict_checks",
+                "on_toggle_changed": "checks_changed",
+                "height": 38,
+                "style": {
+                  "font_size": 13,
+                  "color": "#ECF1F8",
+                  "accent_color": "#A7B8FA",
+                  "border_color": "#52647E"
+                }
+              },
+              {
+                "type": "separator",
+                "id": "actions_rule",
+                "height": 1,
+                "style": {
+                  "background": "#334154"
+                }
+              },
+              {
+                "type": "row",
+                "id": "actions",
+                "children": [
+                  {
+                    "type": "button",
+                    "id": "apply_button",
+                    "label": "Apply changes",
+                    "on_activate": "apply",
+                    "style": {
+                      "background": "#A7B8FA",
+                      "color": "#151B25",
+                      "border_color": "#A7B8FA",
+                      "border_width": 1,
+                      "radius": 7,
+                      "font_size": 13,
+                      "font_weight": 600,
+                      "accent_color": "#A7B8FA"
+                    },
+                    "bind_enabled": "can_apply"
+                  },
+                  {
+                    "type": "button",
+                    "id": "defaults_button",
+                    "label": "Restore defaults",
+                    "on_activate": "defaults",
+                    "style": {
+                      "background": "#29364A",
+                      "color": "#ECF1F8",
+                      "border_color": "#475872",
+                      "border_width": 1,
+                      "radius": 7,
+                      "font_size": 13,
+                      "font_weight": 600,
+                      "accent_color": "#A7B8FA"
+                    }
+                  },
+                  {
+                    "type": "button",
+                    "id": "preview_button",
+                    "label": "Preview request",
+                    "on_activate": "preview",
+                    "style": {
+                      "background": "#1C2533",
+                      "color": "#C1CDED",
+                      "border_color": "#334154",
+                      "border_width": 1,
+                      "radius": 7,
+                      "font_size": 13,
+                      "font_weight": 500,
+                      "accent_color": "#A7B8FA"
+                    }
+                  }
+                ],
+                "gap": 10
+              },
+              {
+                "type": "panel",
+                "id": "feedback",
+                "children": [
+                  {
+                    "type": "text",
+                    "id": "feedback_label",
+                    "text": "Activity",
+                    "style": {
+                      "font_size": 12,
+                      "font_weight": 600,
+                      "color": "#BDCBEB"
+                    }
+                  },
+                  {
+                    "type": "text",
+                    "id": "feedback_message",
+                    "bind_text": "status",
+                    "style": {
+                      "font_size": 12,
+                      "color": "#C4D0E1"
+                    }
+                  }
+                ],
+                "padding": 14,
+                "gap": 7,
+                "style": {
+                  "background": "#19212D",
+                  "border_color": "#334154",
+                  "border_width": 1,
+                  "radius": 8
+                }
+              }
+            ],
+            "padding": 22,
+            "gap": 12,
+            "flex": 1,
+            "style": {
+              "background": "#1C2533",
+              "border_color": "#334154",
+              "border_width": 1,
+              "radius": 12
+            }
+          }
+        ],
+        "gap": 18,
+        "align": "stretch",
+        "flex": 1
+      },
+      {
+        "type": "text",
+        "id": "footer",
+        "text": "Tab / Shift+Tab to navigate   \u2022   Enter / Space to activate   \u2022   F5 to reload the document",
+        "style": {
+          "font_size": 11,
+          "color": "#97A7BE"
+        }
+      }
+    ],
+    "padding": 24,
+    "gap": 18,
+    "style": {
+      "background": "#151B25",
+      "color": "#ECF1F8",
+      "font_family": "Avenir Next",
+      "font_size": 13,
+      "font_weight": 400
+    }
+  }
+}

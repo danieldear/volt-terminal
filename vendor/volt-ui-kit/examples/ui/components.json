@@ -1,0 +1,361 @@
+{
+  "schema_version": 1,
+  "root": {
+    "type": "column",
+    "id": "root",
+    "children": [
+      {
+        "type": "row",
+        "id": "header",
+        "children": [
+          {
+            "type": "column",
+            "id": "heading",
+            "children": [
+              {
+                "type": "text",
+                "id": "title",
+                "text": "Components & styling",
+                "style": {
+                  "font_size": 25,
+                  "font_weight": 700
+                }
+              },
+              {
+                "type": "text",
+                "id": "subtitle",
+                "text": "Change the document, not the renderer.",
+                "style": {
+                  "font_size": 13,
+                  "color": "#AAB8CA"
+                }
+              }
+            ],
+            "gap": 4,
+            "flex": 1
+          },
+          {
+            "type": "badge",
+            "id": "editable_badge",
+            "text": "Editable JSON",
+            "style": {
+              "background": "#263249",
+              "color": "#C5D2FC",
+              "radius": 6,
+              "font_size": 12,
+              "font_weight": 600
+            }
+          }
+        ],
+        "height": 56,
+        "align": "center",
+        "gap": 18
+      },
+      {
+        "type": "separator",
+        "id": "header_rule",
+        "height": 1,
+        "style": {
+          "background": "#334154"
+        }
+      },
+      {
+        "type": "row",
+        "id": "specimens",
+        "children": [
+          {
+            "type": "panel",
+            "id": "type_specimen",
+            "children": [
+              {
+                "type": "text",
+                "id": "type_heading",
+                "text": "Typography",
+                "style": {
+                  "font_size": 18,
+                  "font_weight": 600
+                }
+              },
+              {
+                "type": "text",
+                "id": "display_sample",
+                "text": "Avenir Next, 24 / 700",
+                "style": {
+                  "font_size": 24,
+                  "font_weight": 700
+                }
+              },
+              {
+                "type": "text",
+                "id": "medium_sample",
+                "text": "Medium weight keeps a compact hierarchy.",
+                "style": {
+                  "font_size": 15,
+                  "font_weight": 500,
+                  "color": "#D5DEED"
+                }
+              },
+              {
+                "type": "text",
+                "id": "body_sample",
+                "text": "Regular body text is measured, wrapped and inherited from the parent.",
+                "style": {
+                  "font_size": 13,
+                  "font_weight": 400,
+                  "color": "#AAB8CA"
+                }
+              },
+              {
+                "type": "text",
+                "id": "italic_sample",
+                "text": "Georgia italic adds a contrasting serif face.",
+                "style": {
+                  "font_size": 13,
+                  "font_style": "italic",
+                  "color": "#B9C8E2",
+                  "font_family": "Georgia"
+                }
+              },
+              {
+                "type": "separator",
+                "id": "type_rule",
+                "height": 1,
+                "style": {
+                  "background": "#334154"
+                }
+              },
+              {
+                "type": "text",
+                "id": "mono_sample",
+                "text": "font_family: Menlo\nfont_weight: 400\ncolor: #A7B8FA",
+                "style": {
+                  "font_family": "Menlo",
+                  "font_size": 12,
+                  "color": "#A7B8FA"
+                }
+              }
+            ],
+            "padding": 20,
+            "gap": 15,
+            "flex": 1,
+            "style": {
+              "background": "#1C2533",
+              "border_color": "#334154",
+              "border_width": 1,
+              "radius": 12
+            }
+          },
+          {
+            "type": "panel",
+            "id": "controls",
+            "children": [
+              {
+                "type": "text",
+                "id": "control_heading",
+                "text": "Stateful controls",
+                "style": {
+                  "font_size": 18,
+                  "font_weight": 600
+                }
+              },
+              {
+                "type": "text",
+                "id": "control_intro",
+                "text": "Check a box or toggle a preference. Typed Rust handlers receive the new boolean value.",
+                "style": {
+                  "font_size": 13,
+                  "color": "#AAB8CA"
+                }
+              },
+              {
+                "type": "toggle",
+                "id": "notification_control",
+                "label": "Enable notifications",
+                "bind_checked": "notifications",
+                "on_toggle_changed": "notifications_changed",
+                "height": 38,
+                "style": {
+                  "font_size": 13,
+                  "color": "#ECF1F8",
+                  "accent_color": "#A7B8FA",
+                  "border_color": "#52647E"
+                }
+              },
+              {
+                "type": "toggle",
+                "id": "hints_control",
+                "label": "Show keyboard hints",
+                "bind_checked": "keyboard_hints",
+                "on_toggle_changed": "hints_changed",
+                "height": 38,
+                "style": {
+                  "font_size": 13,
+                  "color": "#ECF1F8",
+                  "accent_color": "#A7B8FA",
+                  "border_color": "#52647E"
+                }
+              },
+              {
+                "type": "checkbox",
+                "id": "approval_control",
+                "label": "Require approval before applying",
+                "bind_checked": "approvals",
+                "on_toggle_changed": "approval_changed",
+                "height": 38,
+                "style": {
+                  "font_size": 13,
+                  "color": "#ECF1F8",
+                  "accent_color": "#85C8B3",
+                  "border_color": "#52647E"
+                }
+              },
+              {
+                "type": "checkbox",
+                "id": "disabled_control",
+                "label": "Unavailable in this prototype",
+                "bind_checked": "approvals",
+                "on_toggle_changed": "approval_changed",
+                "height": 38,
+                "style": {
+                  "font_size": 13,
+                  "color": "#ECF1F8",
+                  "accent_color": "#A7B8FA"
+                },
+                "enabled": false
+              },
+              {
+                "type": "badge",
+                "id": "counter_badge",
+                "bind_text": "event_count",
+                "style": {
+                  "background": "#263249",
+                  "color": "#C5D2FC",
+                  "radius": 6,
+                  "font_size": 12,
+                  "font_weight": 500
+                }
+              }
+            ],
+            "padding": 20,
+            "gap": 12,
+            "flex": 1,
+            "style": {
+              "background": "#1C2533",
+              "border_color": "#334154",
+              "border_width": 1,
+              "radius": 12
+            }
+          }
+        ],
+        "gap": 18,
+        "align": "stretch",
+        "flex": 1
+      },
+      {
+        "type": "panel",
+        "id": "button_styles",
+        "children": [
+          {
+            "type": "text",
+            "id": "button_heading",
+            "text": "One behavior contract, three surface styles",
+            "style": {
+              "font_size": 16,
+              "font_weight": 600
+            }
+          },
+          {
+            "type": "row",
+            "id": "button_row",
+            "children": [
+              {
+                "type": "button",
+                "id": "primary_button",
+                "label": "Primary action",
+                "on_activate": "primary",
+                "style": {
+                  "background": "#A7B8FA",
+                  "color": "#151B25",
+                  "border_color": "#A7B8FA",
+                  "border_width": 1,
+                  "radius": 7,
+                  "font_size": 13,
+                  "font_weight": 600,
+                  "accent_color": "#A7B8FA"
+                }
+              },
+              {
+                "type": "button",
+                "id": "secondary_button",
+                "label": "Secondary action",
+                "on_activate": "secondary",
+                "style": {
+                  "background": "#29364A",
+                  "color": "#ECF1F8",
+                  "border_color": "#475872",
+                  "border_width": 1,
+                  "radius": 7,
+                  "font_size": 13,
+                  "font_weight": 600,
+                  "accent_color": "#A7B8FA"
+                }
+              },
+              {
+                "type": "button",
+                "id": "quiet_button",
+                "label": "Quiet action",
+                "on_activate": "quiet",
+                "style": {
+                  "background": "#1C2533",
+                  "color": "#C1CDED",
+                  "border_color": "#334154",
+                  "border_width": 1,
+                  "radius": 7,
+                  "font_size": 13,
+                  "font_weight": 500,
+                  "accent_color": "#A7B8FA"
+                }
+              }
+            ],
+            "gap": 12
+          },
+          {
+            "type": "text",
+            "id": "event_status",
+            "bind_text": "status",
+            "style": {
+              "font_size": 13,
+              "color": "#AAB8CA"
+            }
+          }
+        ],
+        "padding": 20,
+        "gap": 14,
+        "style": {
+          "background": "#1C2533",
+          "border_color": "#334154",
+          "border_width": 1,
+          "radius": 12
+        }
+      },
+      {
+        "type": "text",
+        "id": "footer",
+        "text": "Style inheritance covers font and text color. Surfaces remain local to each component.",
+        "style": {
+          "font_size": 11,
+          "color": "#97A7BE"
+        }
+      }
+    ],
+    "padding": 24,
+    "gap": 18,
+    "style": {
+      "background": "#151B25",
+      "color": "#ECF1F8",
+      "font_family": "Avenir Next",
+      "font_size": 13,
+      "font_weight": 400
+    }
+  }
+}

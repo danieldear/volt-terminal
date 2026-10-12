@@ -397,6 +397,10 @@ pub struct Renderer {
     pub theme_editor: Option<crate::theme_editor::ThemeEditorView>,
     theme_editor_cache: Option<theme_editor_draw::EditorGeometry>,
     pub settings: Option<crate::settings::SettingsView>,
+    /// Typed boolean-row presentation; behavior/configuration remain in Volt.
+    pub settings_toggles: Vec<Option<bool>>,
+    pub settings_controls: Vec<crate::settings::SettingsControl>,
+    pub settings_dropdown: Option<crate::settings::SettingsDropdown>,
     settings_cache: Option<settings_draw::SettingsGeometry>,
     pub task_form: Option<crate::task_form::TaskFormView>,
     /// Task buttons where the workspace card sits while it's closed.
@@ -808,6 +812,9 @@ impl Renderer {
             theme_editor_cache: None,
             settings: None,
             settings_cache: None,
+            settings_toggles: Vec::new(),
+            settings_controls: Vec::new(),
+            settings_dropdown: None,
             task_form: None,
             task_strip: None,
             task_form_cache: None,
@@ -2873,6 +2880,8 @@ mod task_form_draw;
 mod task_strip_draw;
 #[path = "theme_editor_draw.rs"]
 mod theme_editor_draw;
+#[path = "toolkit_controls.rs"]
+mod toolkit_controls;
 
 /// Map terminal theme values at the embedding boundary, not inside widgets.
 fn ui_kit_theme(theme: &Theme) -> volt_ui_kit::Theme {

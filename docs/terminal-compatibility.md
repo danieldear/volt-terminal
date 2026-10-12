@@ -1,7 +1,7 @@
-# Unreleased terminal compatibility batch
+# Terminal compatibility batch — v0.1.13 source
 
-This work is on `feature/terminal-compatibility`, based on reviewed main
-`e088e4e` (v0.1.12). **The existing v0.1.12 draft does not contain these changes.**
+This work originated on `feature/terminal-compatibility`, based on reviewed main
+`e088e4e` (v0.1.12). **The existing v0.1.12 release does not contain these changes.**
 The user reports the draft worked on another system. Nothing here publishes it,
 changes Apple secrets or modifies the standalone toolkit. Linux platform work
 is explicitly deferred until a test system is available.
@@ -71,7 +71,7 @@ full multilingual runtime acceptance.
 - GPU fixtures: **24 settings**, **2 task-strip** and **360 tab-status** cases passed.
   These are offscreen fixtures, not native window interaction or accessibility evidence.
 - The release-mode macOS bundle builds and passes strict local signature verification.
-  This **new local bundle is ad-hoc signed**, not the notarized v0.1.12 draft.
+  This **new local bundle is ad-hoc signed**, not the notarized v0.1.12 release.
   The draft and release/version metadata were not changed or published.
 - The pinned toolkit snapshot matches its own recorded file hashes and was not changed.
   It is older than the currently evolving standalone project: its canonical sync check

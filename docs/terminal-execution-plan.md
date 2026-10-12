@@ -1,6 +1,6 @@
 # Volt terminal execution plan
 
-Updated **2026-10-08**. This is a plan, not a claim that pending work has been
+Updated **2026-10-12**. This is a plan, not a claim that pending work has been
 executed. Feature scope and usefulness live in [ROADMAP.md](ROADMAP.md).
 Changes should land as small reviewable units, with evidence recorded separately
 for source/tests, GPU fixtures, native UI, benchmarks and public artifacts.
@@ -17,8 +17,8 @@ for source/tests, GPU fixtures, native UI, benchmarks and public artifacts.
 - Signing/notarization implementation and credential configuration are complete.
   Local and hosted Apple acceptance, stapling and extracted-ZIP checks passed.
   Future release mode is `notarized`; see [distribution.md](distribution.md).
-- Public v0.1.11 is notarized. v0.1.12 remains a notarized draft; the user
-  reports testing passed. Older v0.1.10 stays ad-hoc. Do not redo signing setup.
+- Public v0.1.12 is notarized; the user reports testing passed. v0.1.13
+  is being prepared, with UI Kit 0.4.0 performance acceptance still open. Older v0.1.10 stays ad-hoc. Do not redo signing setup.
 - Recent rendering/parser optimizations are merged changes with targeted evidence.
   Visible-window end-to-end acceptance is pending; do not market microbenchmark
   gains as a terminal throughput or display-latency improvement.

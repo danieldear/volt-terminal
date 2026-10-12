@@ -31,6 +31,43 @@ impl Rect {
         let cy = y.clamp(top + r, top + h - r);
         (x - cx).hypot(y - cy) <= r
     }
+    /// Hit testing for independently rounded corners in top-left, top-right,
+    /// bottom-right, bottom-left order. Each radius is capped at half the shorter
+    /// dimension, matching the optional painter corner geometry.
+    pub fn contains_corners(self, radii: [f32; 4], x: f32, y: f32) -> bool {
+        if !self.contains(x, y) || radii.into_iter().any(|r| !r.is_finite() || r < 0.) {
+            return false;
+        }
+        let [left, top, w, h] = self.0;
+        let limit = w.min(h) * 0.5;
+        let [tl, tr, br, bl] = radii.map(|r| r.min(limit));
+        for (radius, cx, cy, in_corner) in [
+            (tl, left + tl, top + tl, x < left + tl && y < top + tl),
+            (
+                tr,
+                left + w - tr,
+                top + tr,
+                x > left + w - tr && y < top + tr,
+            ),
+            (
+                br,
+                left + w - br,
+                top + h - br,
+                x > left + w - br && y > top + h - br,
+            ),
+            (
+                bl,
+                left + bl,
+                top + h - bl,
+                x < left + bl && y > top + h - bl,
+            ),
+        ] {
+            if in_corner && (x - cx).hypot(y - cy) > radius {
+                return false;
+            }
+        }
+        true
+    }
 }
 /// A background can consume clicks without pretending to be an action.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +146,22 @@ mod tests {
         assert!(!r.contains_rounded(14., 10., 20.));
         assert!(r.contains_rounded(14., 60., 20.));
         assert!(!r.contains_rounded(f32::NAN, 60., 40.));
+    }
+    #[test]
+    fn independent_corners_preserve_square_edges_and_clamp() {
+        let r = Rect::new(10., 20., 100., 80.).unwrap();
+        assert!(!r.contains_corners([20., 0., 0., 0.], 10., 20.));
+        assert!(r.contains_corners([20., 0., 0., 0.], 109., 20.));
+        assert!(r.contains_corners([20., 0., 0., 0.], 10., 99.));
+        assert!(!r.contains_corners([0., 0., 20., 0.], 109., 99.));
+        assert!(!r.contains_corners([0., 20., 0., 0.], 109., 20.));
+        assert!(!r.contains_corners([0., 0., 0., 20.], 10., 99.));
+        assert_eq!(
+            r.contains_corners([500.; 4], 50., 20.),
+            r.contains_rounded(40., 50., 20.)
+        );
+        assert!(!r.contains_corners([f32::NAN, 0., 0., 0.], 50., 50.));
+        assert!(!r.contains_corners([0., -1., 0., 0.], 50., 50.));
     }
     #[test]
     fn topmost_blocker_clip_and_clear() {

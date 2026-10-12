@@ -1,6 +1,7 @@
 """Check the vendored toolkit snapshot; a fresh checkout needs no sibling repo."""
 import hashlib
 import json
+import tomllib
 from pathlib import Path
 import unittest
 
@@ -9,6 +10,12 @@ class UiKitSnapshot(unittest.TestCase):
         root = Path(__file__).resolve().parents[2] / "vendor/volt-ui-kit"
         manifest = json.loads((root / "SOURCE.json").read_text())
         self.assertEqual(manifest["project"], "volt-ui-kit")
+        package = tomllib.loads((root / "Cargo.toml").read_text())["package"]
+        consumer = tomllib.loads((root.parents[1] / "volt-renderer/Cargo.toml").read_text())["dependencies"]["volt-ui-kit"]
+        self.assertEqual(manifest["version"], package["version"])
+        self.assertEqual(manifest["version"], consumer["version"])
+        self.assertFalse(consumer["default-features"])
+        self.assertFalse(any(f.startswith("native") for f in consumer["features"]))
         files = {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()}
         self.assertEqual(files, set(manifest["files"]) | {"SOURCE.json"})
         for name, checksum in manifest["files"].items():

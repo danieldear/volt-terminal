@@ -1,0 +1,16 @@
+[extend]
+useDefault = true
+
+# Verified file SHA-256 checksums, not credentials. Keep the canonical snapshot
+# unchanged; inventory tests independently check both hashes against source.
+# Do not allowlist the directory, manifest, or generic API-key rule wholesale.
+[[allowlists]]
+description = "Two UI Kit inventory hashes trigger generic-api-key on filenames"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)vendor/volt-ui-kit/SOURCE\.json$''']
+regexTarget = "line"
+regexes = [
+  '''^\s*"examples/rust_keyed_list\.rs": "024a59c84898ec38096bf75eec96b35cea3f48b67c828363728ab80c6643b7cc",?\s*$''',
+  '''^\s*"src/ui/tokens\.rs": "9be2dc4405da1f182dde4bfa9b63591cb8e4fb00057f5fa89093b33b0a41a2cd",?\s*$''',
+]
