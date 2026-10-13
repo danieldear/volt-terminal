@@ -148,7 +148,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .commands(catalog::lifecycle::commands())
                 .requests(|app, sender| app.requests = Some(sender))
                 .on_close_request(catalog::lifecycle::close_request)
-                .messages(|app, sender| app.sender = Some(sender), catalog::update);
+                .messages(|app, sender| app.sender = Some(sender), catalog::update)
+                // Under `cargo volt dev`, code changes restart on the same page.
+                .dev_state(catalog::dev_save, catalog::dev_load);
             #[cfg(all(feature = "native-desktop", target_os = "macos"))]
             let application = application.desktop(catalog::lifecycle::desktop(), |_, _| {});
             application

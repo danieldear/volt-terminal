@@ -209,7 +209,7 @@ impl Glow {
     }
 }
 /// A declarative interaction patch; its closure executes once while building.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct VisualStyle {
     pub(crate) color: Option<String>,
     pub(crate) background: Option<String>,
@@ -321,7 +321,7 @@ impl Ambient {
         (cycle + self.phase).rem_euclid(1.)
     }
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Effects {
     pub scroll_passthrough: bool,
     pub base: VisualStyle,

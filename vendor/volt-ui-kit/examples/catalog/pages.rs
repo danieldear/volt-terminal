@@ -54,11 +54,14 @@ pub enum Page {
     Disclosure,
     DataDisplay,
     Charts,
+    ThemeEditor,
+    Dashboard,
 }
 use Page::*;
-pub const PAGES: [Page; 47] = [
+pub const PAGES: [Page; 49] = [
     Introduction,
     Theming,
+    ThemeEditor,
     Accessibility,
     Layout,
     Utilities,
@@ -102,6 +105,7 @@ pub const PAGES: [Page; 47] = [
     ApplicationLifecycle,
     Documents,
     DesktopServices,
+    Dashboard,
     SignIn,
     Settings,
 ];
@@ -155,6 +159,8 @@ impl Page {
             Disclosure => "Overlays",
             DataDisplay => "Data display",
             Charts => "Charts",
+            ThemeEditor => "Theme editor",
+            Dashboard => "Dashboard",
         }
     }
     pub fn slug(self) -> String {
@@ -165,9 +171,11 @@ impl Page {
     }
     pub fn group(self) -> &'static str {
         match self {
-            Introduction | Theming | Accessibility | Layout | Utilities => "Getting started",
-            BackgroundTasks | ApplicationLifecycle | Documents | DesktopServices | SignIn
-            | Settings => "Patterns",
+            Introduction | Theming | ThemeEditor | Accessibility | Layout | Utilities => {
+                "Getting started"
+            }
+            BackgroundTasks | ApplicationLifecycle | Documents | DesktopServices | Dashboard
+            | SignIn | Settings => "Patterns",
             _ => "Components",
         }
     }
@@ -177,6 +185,8 @@ impl Page {
             self,
             Accessibility
                 | Utilities
+                | ThemeEditor
+                | Dashboard
                 | Icons
                 | DateTime
                 | FormInputs
@@ -256,6 +266,8 @@ impl Page {
             Disclosure => "Collapsibles, accordions, drawers, toasts, a command palette and rich menus.",
             DataDisplay => "Avatars, alerts, skeletons, breadcrumbs, pagination, steps and more.",
             Charts => "Sparklines, bar charts and line charts drawn with vector paths.",
+            ThemeEditor => "Edit every colour role for light and dark, check contrast, export JSON.",
+            Dashboard => "A dense analytics screen: KPIs, candlesticks, donut, stacked charts and orders.",
         }
     }
 }
@@ -347,12 +359,14 @@ pub fn doc(page: Page, app: &App) -> Doc {
         Settings => settings_doc(app),
         Navigation => navigation_doc(app),
         Utilities => super::kit::utilities_doc(),
-        Icons => super::kit::icons_doc(),
+        Icons => super::kit::icons_doc(app),
         DateTime => super::kit::dates_doc(app),
         FormInputs => super::kit::forms_doc(app),
         Disclosure => super::kit::disclosure_doc(app),
         DataDisplay => super::kit::display_doc(app),
-        Charts => super::kit::charts_doc(),
+        Charts => super::kit::charts_doc(app),
+        ThemeEditor => super::kit::theme_editor_doc(app),
+        Dashboard => super::kit::dashboard_doc(app),
     }
 }
 

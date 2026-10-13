@@ -110,7 +110,7 @@ macro_rules! numeric_rounding {
 }
 numeric_rounding!(f32, f64, i32, i64, isize, u32, u64, usize, i16, u16, i8, u8);
 /// Editable visual overrides. Text color and typography inherit; surfaces do not.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NodeStyle {
     pub color: Option<String>,
@@ -143,7 +143,7 @@ pub(crate) struct NodeStyle {
     #[serde(skip)]
     pub strikethrough: Option<bool>,
 }
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FontSlant {
     Normal,
@@ -160,7 +160,7 @@ pub(crate) fn parse_color(value: &str) -> Option<[f32; 4]> {
     }
     Some(color)
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
     #[serde(rename = "type")]
@@ -327,7 +327,7 @@ impl std::fmt::Debug for Node {
     }
 }
 /// Rust-only editable role; schema-v1 remains unchanged.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[cfg_attr(not(feature = "rust-ui"), allow(dead_code))]
 pub(crate) struct EditorOptions {
     pub multiline: bool,
@@ -340,7 +340,7 @@ pub(crate) struct EditorOptions {
     /// Extra logical inset (leading, trailing) for icons inside the field.
     pub inset: [f32; 2],
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SliderProps {
     pub value: f32,
     pub min: f32,
@@ -358,7 +358,7 @@ pub(crate) enum OverlayKind {
     Popup,
     Tooltip,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(not(feature = "rust-ui"), allow(dead_code))]
 pub(crate) struct Overlay {
     pub kind: OverlayKind,
@@ -370,7 +370,7 @@ pub(crate) struct Overlay {
     /// The anchor stays in the input scope (combobox fields keep typing).
     pub keep_anchor: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct VirtualListProps {
     pub count: usize,
     pub start: usize,
@@ -379,7 +379,7 @@ pub(crate) struct VirtualListProps {
     pub overscan: usize,
     pub on_window_change: Option<String>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(not(feature = "rust-ui"), allow(dead_code))]
 pub(crate) struct SplitProps {
     pub axis: Direction,
@@ -398,14 +398,14 @@ pub(crate) enum ProgressKind {
     Bar,
     Spinner,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(not(feature = "rust-ui"), allow(dead_code))]
 pub(crate) struct ProgressProps {
     pub value: Option<f32>,
     pub kind: ProgressKind,
     pub period_ms: u32,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SurfaceContent {
     pub image: Option<crate::graphics::BackgroundImage>,
     pub canvas: crate::graphics::Canvas,
@@ -593,6 +593,11 @@ impl Bindings {
 impl Document {
     pub fn root(&self) -> &Node {
         &self.root
+    }
+    /// Layout reuse temporarily detaches child lists to compare nodes
+    /// shallowly; every list is restored before returning.
+    pub(crate) fn root_mut_for_reuse(&mut self) -> &mut Node {
+        &mut self.root
     }
     /// Runtime-owned edits (e.g. a divider drag) between recompositions.
     #[cfg_attr(not(feature = "rust-ui"), allow(dead_code))]
@@ -1041,7 +1046,7 @@ fn check_node(
     {
         return Err(error(path, "invalid image opacity"));
     }
-    if n.surface.canvas.paths.len() > 256
+    if n.surface.canvas.paths.len() > crate::graphics::MAX_CANVAS_PATHS
         || n.surface.canvas.paths.iter().any(|p| {
             !p.path.is_valid()
                 || (parse_color(&p.color).is_none() && crate::ColorToken::parse(&p.color).is_none())

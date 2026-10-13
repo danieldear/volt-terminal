@@ -279,10 +279,10 @@ pub struct RasterPainter {
     #[cfg(feature = "native-gpu")]
     gpu_ink: BTreeMap<(cosmic_text::fontdb::ID, u16), Option<[f32; 4]>>,
     /// Hashed, not ordered: ordering compares whole paragraphs on every lookup.
-    text: std::collections::HashMap<TextKey, (Buffer, u64)>,
+    text: crate::fasthash::FxHashMap<TextKey, (Buffer, u64)>,
     /// Unwrapped sizes by a hash of text and style, so layout can answer
     /// "does it fit?" without building a key or touching a shaped buffer.
-    natural: std::collections::HashMap<u64, [f32; 2]>,
+    natural: crate::fasthash::FxHashMap<u64, [f32; 2]>,
     clock: u64,
     glyph_bytes: usize,
     pub text_cache_misses: u64,
@@ -709,8 +709,8 @@ impl RasterPainter {
             swash: SwashCache::new(),
             #[cfg(feature = "native-gpu")]
             gpu_ink: BTreeMap::new(),
-            text: std::collections::HashMap::new(),
-            natural: std::collections::HashMap::new(),
+            text: Default::default(),
+            natural: Default::default(),
             text_cache_misses: 0,
             shape_draw_calls: 0,
             effect_cache_misses: 0,
@@ -1144,7 +1144,13 @@ impl RasterPainter {
                 dst.copy_from_slice(src);
                 continue;
             }
-            for ((d, s), c) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)).zip(cov) {
+            for ((d, s), c) in dst
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<4>().0.iter())
+                .zip(cov)
+            {
                 if *c == 0 {
                     continue;
                 }
@@ -2020,7 +2026,7 @@ impl RasterPainter {
     }
     fn measure_unbounded(&mut self, text: &str, style: &TextStyle) -> [f32; 2] {
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = crate::fasthash::FxHasher::default();
         text.hash(&mut h);
         style.family.hash(&mut h);
         style.weight.hash(&mut h);
@@ -2730,8 +2736,10 @@ fn blit_tint(
         let input = &source.data()[si * 4..(si + width) * 4];
         let coverage = &mask.data()[di..di + width];
         for ((target, input), clip_alpha) in target
-            .chunks_exact_mut(4)
-            .zip(input.chunks_exact(4))
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(input.as_chunks::<4>().0.iter())
             .zip(coverage)
         {
             if *clip_alpha == 0 || input[3] == 0 {
@@ -2753,8 +2761,10 @@ fn composite_layer(dest: &mut Pixmap, source: &Pixmap, opacity: u8) {
     let scale = |value: u8| ((u32::from(value) * opacity + 127) / 255) as u8;
     for (target, input) in dest
         .data_mut()
-        .chunks_exact_mut(4)
-        .zip(source.data().chunks_exact(4))
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(source.data().as_chunks::<4>().0.iter())
     {
         if input[3] != 0 {
             blend_premultiplied(target, input, &scale);

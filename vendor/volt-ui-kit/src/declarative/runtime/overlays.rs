@@ -18,7 +18,7 @@ pub(super) struct OverlayState {
     focus_pending: bool,
     focus_target: Option<String>,
     tooltip_pointer: Option<[f32; 2]>,
-    visible_tooltips: BTreeSet<String>,
+    pub(super) visible_tooltips: BTreeSet<String>,
     tooltip_ids: BTreeSet<String>,
     tooltip_layout_dirty: bool,
     tooltips_inactive: bool,
@@ -37,6 +37,21 @@ pub(super) fn collect_overlay_nodes(root: &Node) -> Vec<&Node> {
     let mut nodes = Vec::new();
     visit(root, &mut nodes);
     nodes
+}
+/// Overlay roots to lay out and paint: every non-tooltip overlay, plus the
+/// tooltips currently shown. References into the installed document.
+pub(super) fn visible_overlays<'a>(
+    root: &'a Node,
+    visible_tooltips: &BTreeSet<String>,
+) -> Vec<&'a Node> {
+    collect_overlay_nodes(root)
+        .into_iter()
+        .filter(|node| {
+            node.overlay.as_ref().is_none_or(|options| {
+                options.kind != OverlayKind::Tooltip || visible_tooltips.contains(&node.id)
+            })
+        })
+        .collect()
 }
 fn scopes(root: &Node) -> Vec<Scope> {
     fn keys(node: &Node, ids: &mut BTreeSet<String>) {
@@ -360,17 +375,8 @@ impl Runtime {
     pub(super) fn take_tooltip_layout_change(&mut self) -> bool {
         std::mem::take(&mut self.overlays.tooltip_layout_dirty)
     }
-    pub(super) fn visible_overlay_nodes(&self) -> Vec<Node> {
-        collect_overlay_nodes(self.document.root())
-            .into_iter()
-            .filter(|node| {
-                node.overlay.as_ref().is_none_or(|options| {
-                    options.kind != OverlayKind::Tooltip
-                        || self.overlays.visible_tooltips.contains(&node.id)
-                })
-            })
-            .cloned()
-            .collect()
+    pub(super) fn visible_overlay_nodes(&self) -> Vec<&Node> {
+        visible_overlays(self.document.root(), &self.overlays.visible_tooltips)
     }
     pub(super) fn portal_hit_passthrough(&self, id: &str) -> bool {
         self.overlays.tooltip_ids.contains(id)

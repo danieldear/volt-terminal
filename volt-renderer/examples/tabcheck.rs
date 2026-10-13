@@ -117,8 +117,12 @@ fn main() -> Result<()> {
                             }
                             // Only the light may change; accents, titles, close and +
                             // buttons, other tabs and terminal content must be intact.
-                            for (i, (a, b)) in
-                                idle.chunks_exact(4).zip(result.chunks_exact(4)).enumerate()
+                            for (i, (a, b)) in idle
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .zip(result.as_chunks::<4>().0.iter())
+                                .enumerate()
                             {
                                 if a != b {
                                     let x = (i % width as usize) as f32 + 0.5;

@@ -23,7 +23,7 @@ impl Image {
         if count == 0 || count > 16_777_216 || count * 4 != pixels.len() as u64 {
             return Err("invalid image dimensions/data (16 MP maximum)");
         }
-        for p in pixels.chunks_exact_mut(4) {
+        for p in pixels.as_chunks_mut::<4>().0.iter_mut() {
             for i in 0..3 {
                 p[i] = ((u16::from(p[i]) * u16::from(p[3]) + 127) / 255) as u8;
             }
@@ -123,6 +123,11 @@ pub enum PathCommand {
     Cubic([f32; 2], [f32; 2], [f32; 2]),
     Close,
 }
+/// Most commands one [`VectorPath`] may hold.
+pub const MAX_PATH_COMMANDS: usize = 1024;
+/// Most paths one [`Canvas`] may hold.
+pub const MAX_CANVAS_PATHS: usize = 256;
+
 /// Paths use local logical coordinates. Fills/clips use the even-odd rule.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VectorPath {
@@ -211,7 +216,7 @@ impl VectorPath {
                     PathCommand::Line(_) | PathCommand::Quad(..) | PathCommand::Cubic(..)
                 )
             })
-            && self.commands.len() <= 1024
+            && self.commands.len() <= MAX_PATH_COMMANDS
             && matches!(self.commands[0], PathCommand::Move(_))
             && self.commands.iter().all(|c| match c {
                 PathCommand::Move(p) | PathCommand::Line(p) => valid(p),

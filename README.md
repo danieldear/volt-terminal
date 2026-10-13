@@ -102,7 +102,7 @@ the [publication review](docs/publication-security.md) for the audit's limits.
 
 ### Prerequisites
 
-- Rust 1.87+ (`rustup update stable`)
+- Rust 1.89+ (`rustup update stable`)
 - macOS: Xcode Command Line Tools (`xcode-select --install`)
 - Linux: `libudev-dev` and a Wayland/X11 compositor
 

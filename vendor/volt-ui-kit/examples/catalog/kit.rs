@@ -5,7 +5,10 @@ use super::{
     App,
 };
 use std::path::PathBuf;
-use volt_ui_kit::ui::{prelude::*, Element as El, ALL_ICONS};
+use volt_ui_kit::{
+    contrast_ratio, hex, parse_hex,
+    ui::{prelude::*, short_number, Element as El, Palette, ALL_ICONS},
+};
 
 /// Demo state for these pages, kept apart from the older catalog fields.
 pub struct State {
@@ -47,6 +50,24 @@ pub struct State {
     pub slide: usize,
     pub alert: bool,
     pub step: usize,
+    /// Theme editor: the role being edited, the import box and its result.
+    pub theme_role: ColorToken,
+    pub theme_import: String,
+    pub theme_message: Option<(bool, String)>,
+    /// Icons page: SVG icons added by drop or paste.
+    pub custom_icons: Vec<(String, SvgIcon)>,
+    pub svg_paste: String,
+    pub svg_message: Option<(bool, String)>,
+    /// Dashboard: price range (0 = 1M, 1 = 3M, 2 = 6M) and selected order.
+    pub dash_range: u8,
+    pub dash_order: Option<u32>,
+    /// Chart selections (click again to clear).
+    pub dash_candle: Option<usize>,
+    pub dash_slice: Option<usize>,
+    pub dash_month: Option<usize>,
+    pub dash_quarter: Option<usize>,
+    /// Charts page: the selected column in the interactive demo.
+    pub chart_pick: Option<usize>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -93,6 +114,19 @@ impl Default for State {
             slide: 0,
             alert: true,
             step: 1,
+            theme_role: ColorToken::Primary,
+            theme_import: String::new(),
+            theme_message: None,
+            custom_icons: Vec::new(),
+            svg_paste: String::new(),
+            svg_message: None,
+            dash_range: 0,
+            dash_order: Some(2),
+            dash_candle: None,
+            dash_slice: None,
+            dash_month: None,
+            dash_quarter: None,
+            chart_pick: None,
         }
     }
 }
@@ -136,7 +170,7 @@ fn caption(value: impl Into<String>) -> volt_ui_kit::ui::Text<App> {
 
 // ------------------------------------------------------------------ Icons
 
-pub fn icons_doc() -> Doc {
+pub fn icons_doc(app: &App) -> Doc {
     let tiles: Vec<El<App>> = ALL_ICONS
         .iter()
         .map(|glyph| {
@@ -179,6 +213,7 @@ pub fn icons_doc() -> Doc {
                 gallery,
                 r#"icon(Icon::Search)"#,
             ),
+            custom_icons_section(app),
             section(
                 "icons-style",
                 "Size, colour and stroke",
@@ -196,6 +231,18 @@ icon(Icon::Settings).size(32.).stroke(1.)"#,
             ),
             (".accessible_label(text)", "Announce a meaningful icon."),
             ("ALL_ICONS", "Every glyph, for galleries and pickers."),
+            (
+                "SvgIcon::parse(markup) / ::load(path)",
+                "Any SVG icon or drawing.",
+            ),
+            (
+                "svg_icon(&svg)",
+                ".size / .color / .stroke / .keep_colors(true)",
+            ),
+            (
+                "IconSet::from_dir(path)",
+                "A folder of .svg files, by name: set.icon(\"arrow-left\").",
+            ),
         ],
     }
 }
@@ -1156,7 +1203,35 @@ pagination(app.page, 20).on_change(|app: &mut App, p| app.page = p)"#,
 
 // ----------------------------------------------------------------- Charts
 
-pub fn charts_doc() -> Doc {
+pub fn charts_doc(app: &App) -> Doc {
+    let s = &app.kit;
+    let quarters = ["Q1", "Q2", "Q3", "Q4"];
+    let picked = s.chart_pick.filter(|i| *i < 4);
+    let interactive = vstack![
+        stacked_bar_chart(
+            quarters,
+            [
+                ("Product", vec![120., 160., 190., 240.]),
+                ("Services", vec![80., 90., 120., 130.]),
+            ],
+        )
+        .key("chart-demo")
+        .size(560., 240.)
+        .selected(picked)
+        .on_select(|app: &mut App, i| {
+            app.kit.chart_pick = if app.kit.chart_pick == Some(i) {
+                None
+            } else {
+                Some(i)
+            };
+        }),
+        muted(match picked {
+            Some(i) => format!("Selected {} · click it again to clear", quarters[i]),
+            None =>
+                "Hover a column for its values; click to select it. Tab and Enter work too.".into(),
+        }),
+    ]
+    .gap(10., Axis::Vertical);
     let visits = [12., 18., 14., 22., 30., 26., 34., 41., 38., 47., 52., 49.];
     let sparks = hstack![
         vstack![
@@ -1195,6 +1270,16 @@ pub fn charts_doc() -> Doc {
     Doc {
         sections: vec![
             section(
+                "chart-interactive",
+                "Interactive charts",
+                "Give a chart a key for value tooltips on hover or focus; add selected/on_select for clicks. Area, candlestick, donut and stacked-bar charts all work this way.",
+                interactive,
+                r#"stacked_bar_chart(["Q1", "Q2", "Q3", "Q4"], series)
+    .key("revenue")                 // tooltips + focusable points
+    .selected(app.quarter)
+    .on_select(|app: &mut App, i| app.quarter = Some(i))"#,
+            ),
+            section(
                 "chart-spark",
                 "Sparkline",
                 "A compact trend beside a number.",
@@ -1225,6 +1310,10 @@ pub fn charts_doc() -> Doc {
             (
                 "line_chart(series, w, h)",
                 "(name, values) series in theme colours.",
+            ),
+            (
+                ".key(k) / .selected(i) / .on_select(f)",
+                "Area, candlestick, donut, stacked bars: tooltips, keyboard and click selection.",
             ),
         ],
     }
@@ -1485,6 +1574,859 @@ button(..).hover_style(|s| s.offset(0., -3.).shadow(volt_ui_kit::ui::tokens::sha
                 "tokens::{space, radius, text_size, shadow, motion}",
                 "Design scales.",
             ),
+        ],
+    }
+}
+
+// ------------------------------------------------------------ Theme editor
+
+fn editing_dark(app: &App) -> bool {
+    app.mode == ThemeMode::Dark
+}
+/// Change the palette being edited, starting a custom theme from the current
+/// preset (both modes) the first time.
+fn edit_palette(app: &mut App, f: impl FnOnce(&mut Palette)) {
+    let dark = editing_dark(app);
+    let mut custom = app.custom_palettes.clone().unwrap_or_else(|| {
+        let mut light = super::preset_palette(app, false);
+        let mut dark_p = super::preset_palette(app, true);
+        light.name = "Custom".into();
+        dark_p.name = "Custom".into();
+        [light, dark_p]
+    });
+    f(&mut custom[usize::from(dark)]);
+    app.custom_palettes = Some(custom);
+}
+fn grade(ratio: f32) -> (&'static str, Severity) {
+    if ratio >= 7. {
+        ("AAA", Severity::Success)
+    } else if ratio >= 4.5 {
+        ("AA", Severity::Success)
+    } else if ratio >= 3. {
+        ("AA large", Severity::Warning)
+    } else {
+        ("Fail", Severity::Error)
+    }
+}
+fn grade_badge(ratio: f32) -> El<App> {
+    let (label, severity) = grade(ratio);
+    let tint = match severity {
+        Severity::Success => ColorToken::Success,
+        Severity::Warning => ColorToken::Warning,
+        _ => ColorToken::Error,
+    };
+    hstack![text(format!("{ratio:.1}:1 · {label}"))
+        .font_size(11.)
+        .font_weight(600)
+        .color(tint)]
+    .padding(8., Edge::Horizontal)
+    .height(22.)
+    .align(Align::Center)
+    .rounded(Rounding::Full)
+    .background(tint.alpha(12))
+    .into()
+}
+
+pub fn theme_editor_doc(app: &App) -> Doc {
+    let dark = editing_dark(app);
+    let palette = super::effective_palette(app, dark);
+    let selected = app.kit.theme_role;
+    let groups: [(&str, &[ColorToken]); 3] = [
+        (
+            "Surfaces & text",
+            &[
+                ColorToken::Base100,
+                ColorToken::Base200,
+                ColorToken::Base300,
+                ColorToken::BaseContent,
+                ColorToken::Muted,
+                ColorToken::Border,
+            ],
+        ),
+        (
+            "Brand",
+            &[
+                ColorToken::Primary,
+                ColorToken::PrimaryContent,
+                ColorToken::Secondary,
+                ColorToken::SecondaryContent,
+                ColorToken::Accent,
+                ColorToken::AccentContent,
+                ColorToken::Neutral,
+                ColorToken::NeutralContent,
+            ],
+        ),
+        (
+            "Status",
+            &[
+                ColorToken::Info,
+                ColorToken::InfoContent,
+                ColorToken::Success,
+                ColorToken::SuccessContent,
+                ColorToken::Warning,
+                ColorToken::WarningContent,
+                ColorToken::Error,
+                ColorToken::ErrorContent,
+            ],
+        ),
+    ];
+    let mut roles: Vec<El<App>> = Vec::new();
+    for (title, tokens) in groups {
+        roles.push(caption(title.to_uppercase()).letter_spacing(0.06).into());
+        for &token in tokens {
+            let value = hex(palette.color(token));
+            let active = token == selected;
+            let row = zstack![
+                button("")
+                    .key(format!("role-{}", token.name()))
+                    .accessible_label(format!("Edit {}", token.name()))
+                    .variant(ButtonVariant::Ghost)
+                    .height(34.)
+                    .background(if active {
+                        ColorToken::BaseContent.alpha(8)
+                    } else {
+                        String::from("#00000000")
+                    })
+                    .on_click(move |app: &mut App| app.kit.theme_role = token),
+                hstack![
+                    vstack![]
+                        .width(18.)
+                        .height(18.)
+                        .rounded(5.)
+                        .background(value.clone())
+                        .border_color(ColorToken::BaseContent.alpha(15))
+                        .border_width(1.),
+                    text(token.name())
+                        .font_size(13.)
+                        .font_weight(if active { 600 } else { 400 })
+                        .flex(1.),
+                    text(value)
+                        .font_size(12.)
+                        .font_family("SF Mono")
+                        .color(ColorToken::Muted),
+                ]
+                .key(format!("role-{}-label", token.name()))
+                .gap(10., Axis::Horizontal)
+                .align(Align::Center)
+                .padding(10., Edge::Horizontal)
+                .scroll_passthrough(true),
+            ]
+            .key(format!("role-{}-row", token.name()))
+            .align(Align::Stretch)
+            .height(34.);
+            roles.push(row.into());
+        }
+    }
+    let role_list = vstack(roles)
+        .key("theme-roles")
+        .gap(2., Axis::Vertical)
+        .width(300.);
+    let pair = selected.content_pair();
+    let (bg, fg) = (palette.color(selected), palette.color(pair));
+    let ratio = contrast_ratio(bg, fg);
+    let editor = vstack![
+        hstack![
+            text(selected.name()).font_size(18.).font_weight(600),
+            spacer(),
+            grade_badge(ratio),
+        ]
+        .align(Align::Center),
+        muted(format!("Contrast against {}", pair.name())),
+        // A live sample of this role with its paired role on top.
+        hstack![text("Aa  The quick brown fox")
+            .font_size(15.)
+            .font_weight(500)
+            .color(hex(fg))]
+        .key("role-sample")
+        .height(52.)
+        .padding(16., Edge::Horizontal)
+        .align(Align::Center)
+        .rounded(10.)
+        .background(hex(bg))
+        .border_color(ColorToken::Border)
+        .border_width(1.),
+        color_picker(hex(bg))
+            .key("theme-picker")
+            .on_change(move |app: &mut App, value| {
+                if let Some(c) = parse_hex(&value) {
+                    edit_palette(app, |p| p.set(selected, c));
+                }
+            }),
+    ]
+    .key("theme-editor-panel")
+    .gap(12., Axis::Vertical)
+    .width(320.);
+    let controls = hstack![
+        segmented_control([(false, "Light"), (true, "Dark")])
+            .key("theme-mode")
+            .selected(dark)
+            .on_select(|app: &mut App, dark| {
+                app.mode = if dark {
+                    ThemeMode::Dark
+                } else {
+                    ThemeMode::Light
+                }
+            }),
+        muted(if app.custom_palettes.is_some() {
+            "Editing your custom theme (both modes are kept)"
+        } else {
+            "Editing starts a custom theme from the current preset"
+        }),
+        spacer(),
+        button("Reset to preset")
+            .key("theme-reset")
+            .variant(ButtonVariant::Outline)
+            .enabled(app.custom_palettes.is_some())
+            .on_click(|app: &mut App| app.custom_palettes = None),
+    ]
+    .gap(12., Axis::Horizontal)
+    .align(Align::Center)
+    .width(640.);
+    let workspace = vstack![
+        controls,
+        hstack![role_list, editor].gap(28., Axis::Horizontal),
+    ]
+    .gap(18., Axis::Vertical);
+    // Every role in use: the whole Catalog is already re-themed live.
+    let preview = vstack![
+        hstack![
+            button("Primary")
+                .key("tp-primary")
+                .variant(ButtonVariant::Primary)
+                .on_click(|_: &mut App| {}),
+            button("Neutral")
+                .key("tp-neutral")
+                .on_click(|_: &mut App| {}),
+            button("Soft")
+                .key("tp-soft")
+                .variant(ButtonVariant::Soft)
+                .on_click(|_: &mut App| {}),
+            button("Outline")
+                .key("tp-outline")
+                .variant(ButtonVariant::Outline)
+                .on_click(|_: &mut App| {}),
+            button("Delete")
+                .key("tp-danger")
+                .variant(ButtonVariant::Danger)
+                .on_click(|_: &mut App| {}),
+        ]
+        .gap(8., Axis::Horizontal),
+        hstack![
+            badge("Neutral"),
+            badge("Primary")
+                .background(ColorToken::Primary)
+                .color(ColorToken::PrimaryContent),
+            badge("Secondary")
+                .background(ColorToken::Secondary)
+                .color(ColorToken::SecondaryContent),
+            badge("Accent")
+                .background(ColorToken::Accent)
+                .color(ColorToken::AccentContent),
+            badge("Info")
+                .background(ColorToken::Info)
+                .color(ColorToken::InfoContent),
+            badge("Success")
+                .background(ColorToken::Success)
+                .color(ColorToken::SuccessContent),
+            badge("Warning")
+                .background(ColorToken::Warning)
+                .color(ColorToken::WarningContent),
+            badge("Error")
+                .background(ColorToken::Error)
+                .color(ColorToken::ErrorContent),
+        ]
+        .gap(6., Axis::Horizontal)
+        .wrap(true),
+        alert("Heads up")
+            .severity(Severity::Info)
+            .description("Info, success, warning and error use their own roles."),
+        hstack![
+            text_field("Text field")
+                .key("tp-field")
+                .width(220.)
+                .on_change(|_: &mut App, _| {}),
+            toggle("Switch", true)
+                .key("tp-toggle")
+                .on_change(|_: &mut App, _| {}),
+            progress(0.6).key("tp-progress").width(160.),
+        ]
+        .gap(16., Axis::Horizontal)
+        .align(Align::Center),
+    ]
+    .gap(14., Axis::Vertical)
+    .width(640.);
+    let json = palette.to_json();
+    let message: El<App> = match &app.kit.theme_message {
+        Some((ok, text)) => text_with(
+            text.clone(),
+            if *ok {
+                ColorToken::Success
+            } else {
+                ColorToken::Error
+            },
+        ),
+        None => muted("Paste a theme file and apply it to the mode you are editing.").into(),
+    };
+    let export = vstack![
+        hstack![
+            vstack![
+                caption(format!(
+                    "{} theme JSON",
+                    if dark { "DARK" } else { "LIGHT" }
+                )),
+                text_area(json)
+                    .key("theme-json")
+                    .read_only(true)
+                    .on_change(|_: &mut App, _| {})
+                    .width(310.)
+                    .height(240.)
+                    .font_family("SF Mono")
+                    .font_size(11.),
+            ]
+            .gap(6., Axis::Vertical),
+            vstack![
+                caption("IMPORT"),
+                text_area(app.kit.theme_import.clone())
+                    .key("theme-import")
+                    .placeholder("{ \"primary\": \"#7C3AED\", ... }")
+                    .on_change(|app: &mut App, v| app.kit.theme_import = v)
+                    .width(310.)
+                    .height(200.)
+                    .font_family("SF Mono")
+                    .font_size(11.),
+                button("Apply theme")
+                    .key("theme-apply")
+                    .variant(ButtonVariant::Primary)
+                    .on_click(|app: &mut App| {
+                        let dark = editing_dark(app);
+                        let base = super::effective_palette(app, dark);
+                        match Palette::from_json(&app.kit.theme_import, &base) {
+                            Ok(p) => {
+                                edit_palette(app, |slot| *slot = p);
+                                app.kit.theme_message = Some((
+                                    true,
+                                    format!(
+                                        "Applied to the {} theme.",
+                                        if dark { "dark" } else { "light" }
+                                    ),
+                                ));
+                            }
+                            Err(e) => app.kit.theme_message = Some((false, e)),
+                        }
+                    }),
+            ]
+            .gap(6., Axis::Vertical),
+        ]
+        .gap(20., Axis::Horizontal),
+        message,
+    ]
+    .gap(10., Axis::Vertical);
+    Doc {
+        sections: vec![
+            section(
+                "theme-roles",
+                "Colour roles",
+                "Pick a role, then a colour. The whole Catalog updates live; contrast is checked against the role drawn on top.",
+                workspace,
+                r##"let mut palette = Palette::light();
+palette.set(ColorToken::Primary, parse_hex("#7C3AED").unwrap());
+palette.set(ColorToken::PrimaryContent, parse_hex("#FFFFFF").unwrap());
+let theme = UiTheme::from_palette(palette);"##,
+            ),
+            section(
+                "theme-preview",
+                "Preview",
+                "Components drawn with every role.",
+                preview,
+                r#"button("Primary").variant(ButtonVariant::Primary)
+badge("Success").background(ColorToken::Success).color(ColorToken::SuccessContent)"#,
+            ),
+            section(
+                "theme-file",
+                "Export & import",
+                "Themes are plain JSON: every role as hex. Missing roles keep the base palette.",
+                export,
+                r#"let palette = Palette::from_json(include_str!("brand.json"), &Palette::light())?;
+let json = palette.to_json(); // save or share"#,
+            ),
+        ],
+        api: vec![
+            ("Palette::light() / ::dark()", "Built-in starting points."),
+            ("palette.set(ColorToken::…, rgba)", "Change one of the 22 roles."),
+            ("Palette::to_json / from_json(text, &base)", "Theme files; partial files override only listed roles."),
+            ("UiTheme::from_palette(palette)", "Use it for a window."),
+            ("contrast_ratio(a, b)", "WCAG ratio; 4.5 for body text (AA), 3 for large."),
+            ("ColorToken::ALL / .content_pair()", "Every role and the role drawn on it."),
+        ],
+    }
+}
+fn text_with(value: String, color: ColorToken) -> El<App> {
+    text(value).font_size(13.).color(color).into()
+}
+
+// -------------------------------------------------------- Custom SVG icons
+
+const SAMPLE_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>"##;
+const SAMPLE_ART: &str = r##"<svg viewBox="0 0 48 48"><rect x="4" y="8" width="40" height="32" rx="6" fill="#6366F1"/><circle cx="16" cy="20" r="4" fill="#FDE68A"/><polygon points="8,36 20,24 28,32 34,26 40,36" fill="#A5B4FC"/></svg>"##;
+
+pub fn custom_icons_section(app: &App) -> Section {
+    let s = &app.kit;
+    let builtin_samples = hstack![
+        svg_icon(&SvgIcon::parse(SAMPLE_SVG).unwrap()).size(28.),
+        svg_icon(&SvgIcon::parse(SAMPLE_SVG).unwrap())
+            .size(28.)
+            .color(ColorToken::Primary),
+        svg_icon(&SvgIcon::parse(SAMPLE_SVG).unwrap())
+            .size(28.)
+            .stroke(1.),
+        svg_icon(&SvgIcon::parse(SAMPLE_ART).unwrap())
+            .size(40.)
+            .keep_colors(true),
+    ]
+    .gap(20., Axis::Horizontal)
+    .align(Align::Center);
+    let mut tiles: Vec<El<App>> = s
+        .custom_icons
+        .iter()
+        .enumerate()
+        .map(|(i, (name, svg))| {
+            vstack![
+                svg_icon(svg).size(26.).key(format!("custom-icon-{i}")),
+                text(name.clone())
+                    .font_size(11.)
+                    .color(ColorToken::Muted)
+                    .max_lines(1),
+            ]
+            .align(Align::Center)
+            .gap(8., Axis::Vertical)
+            .padding(12., Edge::Vertical)
+            .into()
+        })
+        .collect();
+    let gallery: El<App> = if tiles.is_empty() {
+        muted("Icons you add appear here.").into()
+    } else {
+        grid(std::mem::take(&mut tiles))
+            .key("custom-icon-grid")
+            .min_column_width(96.)
+            .gap(6., Axis::Both)
+            .width(640.)
+            .into()
+    };
+    let message: El<App> = match &s.svg_message {
+        Some((ok, m)) => text_with(
+            m.clone(),
+            if *ok {
+                ColorToken::Success
+            } else {
+                ColorToken::Error
+            },
+        ),
+        None => spacer().height(0.).flex(0.).into(),
+    };
+    let demo = vstack![
+        builtin_samples,
+        hstack![
+            vstack![drop_zone()
+                .key("svg-drop")
+                .title("Drop .svg files")
+                .description("Lucide, Heroicons, Tabler, Material Symbols, your own…")
+                .accept(["svg"])
+                .height(170.)
+                .on_drop(|app: &mut App, paths| {
+                    let mut added = 0;
+                    let mut errors = vec![];
+                    for path in paths {
+                        let name = path
+                            .file_stem()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("icon")
+                            .to_owned();
+                        match SvgIcon::load(&path) {
+                            Ok(svg) => {
+                                app.kit.custom_icons.push((name, svg));
+                                added += 1;
+                            }
+                            Err(e) => errors.push(e),
+                        }
+                    }
+                    app.kit.svg_message = Some(match errors.first() {
+                        Some(e) => (false, e.clone()),
+                        None => (true, format!("Added {added} icon(s).")),
+                    });
+                })]
+            .flex(1.),
+            vstack![
+                text_area(s.svg_paste.clone())
+                    .key("svg-paste")
+                    .placeholder("…or paste <svg> markup")
+                    .on_change(|app: &mut App, v| app.kit.svg_paste = v)
+                    .height(126.)
+                    .font_family("SF Mono")
+                    .font_size(11.),
+                button("Add pasted icon")
+                    .key("svg-add")
+                    .variant(ButtonVariant::Outline)
+                    .on_click(|app: &mut App| match SvgIcon::parse(&app.kit.svg_paste) {
+                        Ok(svg) => {
+                            let n = app.kit.custom_icons.len() + 1;
+                            app.kit.custom_icons.push((format!("pasted-{n}"), svg));
+                            app.kit.svg_paste.clear();
+                            app.kit.svg_message = Some((true, "Added 1 icon.".into()));
+                        }
+                        Err(e) => app.kit.svg_message = Some((false, e)),
+                    }),
+            ]
+            .gap(8., Axis::Vertical)
+            .flex(1.),
+        ]
+        .gap(16., Axis::Horizontal)
+        .width(640.),
+        message,
+        gallery,
+    ]
+    .gap(16., Axis::Vertical)
+    .align(Align::Center);
+    section(
+        "icons-custom",
+        "Your own SVG icons",
+        "Load any icon set or drawing. Icons follow the theme colour; multi-colour art can keep its colours.",
+        demo,
+        r#"let star = SvgIcon::parse(include_str!("star.svg"))?;
+svg_icon(&star).size(24.).color(ColorToken::Primary)
+
+// A whole icon-set folder, by file name:
+let (lucide, _skipped) = IconSet::from_dir("assets/lucide")?;
+lucide.icon("arrow-left").unwrap().size(16.)"#,
+    )
+}
+
+// --------------------------------------------------------------- Dashboard
+
+/// Deterministic pseudo-random walk, so the dashboard looks the same every run.
+fn walk(seed: u32, n: usize, start: f32, step: f32) -> Vec<f32> {
+    let mut state = seed;
+    let mut v = start;
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let r = (state >> 8) as f32 / (1u32 << 24) as f32 - 0.47;
+            v = (v + r * step).max(start * 0.4);
+            v
+        })
+        .collect()
+}
+fn card<C: 'static>(title: &str, extra: Option<El<C>>, body: El<C>) -> El<C> {
+    let mut head: Vec<El<C>> = vec![text(title.to_owned())
+        .font_size(13.)
+        .font_weight(600)
+        .flex(1.)
+        .into()];
+    if let Some(e) = extra {
+        head.push(e);
+    }
+    vstack![hstack(head).align(Align::Center).height(28.), body]
+        .gap(10., Axis::Vertical)
+        .padding(16., Edge::All)
+        // Cards in a row share its height.
+        .flex(1.)
+        .rounded(12.)
+        .background(ColorToken::Base100)
+        .border_color(ColorToken::Border)
+        .border_width(1.)
+        .into()
+}
+const ORDERS: [(&str, &str, &str, &str, &str); 10] = [
+    ("#4821", "Ada Lovelace", "Pro · annual", "Paid", "$1,188.00"),
+    (
+        "#4820",
+        "Grace Hopper",
+        "Team · 12 seats",
+        "Paid",
+        "$2,868.00",
+    ),
+    (
+        "#4819",
+        "Alan Turing",
+        "Pro · monthly",
+        "Refunded",
+        "$99.00",
+    ),
+    (
+        "#4818",
+        "Katherine Johnson",
+        "Enterprise",
+        "Pending",
+        "$14,400.00",
+    ),
+    ("#4817", "Linus Torvalds", "Pro · monthly", "Paid", "$99.00"),
+    (
+        "#4816",
+        "Margaret Hamilton",
+        "Team · 5 seats",
+        "Paid",
+        "$1,195.00",
+    ),
+    (
+        "#4815",
+        "Dennis Ritchie",
+        "Pro · annual",
+        "Failed",
+        "$1,188.00",
+    ),
+    (
+        "#4814",
+        "Barbara Liskov",
+        "Team · 8 seats",
+        "Paid",
+        "$1,912.00",
+    ),
+    ("#4813", "Ken Thompson", "Pro · monthly", "Paid", "$99.00"),
+    (
+        "#4812",
+        "Frances Allen",
+        "Enterprise",
+        "Pending",
+        "$9,600.00",
+    ),
+];
+
+/// Select an index, or clear it when it is already selected.
+fn toggle_pick(slot: &mut Option<usize>, i: usize) {
+    *slot = if *slot == Some(i) { None } else { Some(i) };
+}
+
+pub fn dashboard_doc(app: &App) -> Doc {
+    let s = &app.kit;
+    let kpis = [
+        ("Revenue", "$48,210", "12.5%", true, walk(3, 24, 30., 6.)),
+        ("Active users", "12,840", "4.1%", true, walk(7, 24, 50., 5.)),
+        ("Conversion", "3.42%", "0.4%", false, walk(11, 24, 40., 4.)),
+        ("Avg. order", "$86.20", "2.3%", true, walk(19, 24, 35., 3.)),
+    ];
+    let kpi_cards: Vec<El<App>> = kpis
+        .into_iter()
+        .map(|(label, value, delta, up, trend)| {
+            vstack![
+                stat(label, value).delta(delta, up).hint("vs last month"),
+                sparkline(&trend, 196., 36.),
+            ]
+            .gap(10., Axis::Vertical)
+            .padding(16., Edge::All)
+            .rounded(12.)
+            .background(ColorToken::Base100)
+            .border_color(ColorToken::Border)
+            .border_width(1.)
+            .into()
+        })
+        .collect();
+    let days = [21usize, 63, 126][usize::from(s.dash_range.min(2))];
+    let closes = walk(42, days + 1, 120., 6.);
+    let candles: Vec<Candle> = (0..days)
+        .map(|i| {
+            let (open, close) = (closes[i], closes[i + 1]);
+            let spread = (open - close).abs() * 0.6 + 1.2 + (i % 5) as f32 * 0.3;
+            Candle::new(
+                open,
+                open.max(close) + spread * 0.7,
+                open.min(close) - spread * 0.6,
+                close,
+            )
+            .volume(40. + ((i * 37) % 60) as f32)
+        })
+        .collect();
+    let labels: Vec<String> = (0..days)
+        .map(|i| format!("{}/{}", 1 + i / 21, 1 + i % 21))
+        .collect();
+    // The header follows the selected candle, else the latest close.
+    let (headline, change, caption) = match s.dash_candle.filter(|i| *i < days) {
+        Some(i) => (
+            closes[i + 1],
+            (closes[i + 1] - closes[i]) / closes[i] * 100.,
+            format!("close on {} · click again to clear", labels[i]),
+        ),
+        None => (
+            closes[days],
+            (closes[days] - closes[0]) / closes[0] * 100.,
+            "latest close · click a candle for that day".to_owned(),
+        ),
+    };
+    let price = card(
+        "VOLT · Volt Labs",
+        Some(
+            segmented_control([(0u8, "1M"), (1, "3M"), (2, "6M")])
+                .key("dash-range")
+                .selected(s.dash_range)
+                .on_select(|app: &mut App, v| {
+                    app.kit.dash_range = v;
+                    app.kit.dash_candle = None;
+                })
+                .into(),
+        ),
+        vstack![
+            hstack![
+                text(format!("${headline:.2}"))
+                    .font_size(26.)
+                    .font_weight(700)
+                    .letter_spacing(-0.02),
+                text(format!(
+                    "{}{change:.2}%",
+                    if change >= 0. { "+" } else { "" }
+                ))
+                .font_size(13.)
+                .font_weight(600)
+                .color(if change >= 0. {
+                    ColorToken::Success
+                } else {
+                    ColorToken::Error
+                }),
+                text(caption).font_size(12.).color(ColorToken::Muted),
+            ]
+            .gap(10., Axis::Horizontal)
+            .align(Align::End),
+            El::from(
+                candlestick_chart(candles)
+                    .key("dash-candles")
+                    .size(568., 250.)
+                    .x_labels(labels)
+                    .volume(true)
+                    .selected(s.dash_candle)
+                    .on_select(|app: &mut App, i| toggle_pick(&mut app.kit.dash_candle, i))
+            ),
+        ]
+        .gap(10., Axis::Vertical)
+        .into(),
+    );
+    let traffic = card("Traffic sources", None, {
+        let sources = [
+            ("Search", 4210.),
+            ("Direct", 2980.),
+            ("Social", 1730.),
+            ("Referral", 940.),
+            ("Email", 610.),
+        ];
+        let (value, caption) = match s.dash_slice.filter(|i| *i < sources.len()) {
+            Some(i) => (short_number(sources[i].1), sources[i].0.to_lowercase()),
+            None => ("10.5k".to_owned(), "visits".to_owned()),
+        };
+        vstack![donut_chart(sources)
+            .key("dash-traffic")
+            .size(132.)
+            .thickness(20.)
+            .center(value, caption)
+            .legend(true)
+            .selected(s.dash_slice)
+            .on_select(|app: &mut App, i| toggle_pick(&mut app.kit.dash_slice, i))]
+        .into()
+    });
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let plans = [
+        ("Pro", walk(5, 12, 18., 4.)),
+        ("Team", walk(9, 12, 12., 3.)),
+        ("Enterprise", walk(13, 12, 8., 3.)),
+    ];
+    let month_total = s.dash_month.filter(|m| *m < 12).map(|m| {
+        let total: f32 = plans.iter().map(|(_, v)| v[m]).sum();
+        El::from(
+            text(format!("{} · ${}", months[m], short_number(total * 1000.)))
+                .font_size(13.)
+                .font_weight(600)
+                .color(ColorToken::Primary),
+        )
+    });
+    let revenue = card(
+        "Revenue by plan",
+        month_total,
+        area_chart(plans)
+            .key("dash-revenue")
+            .selected(s.dash_month)
+            .on_select(|app: &mut App, m| toggle_pick(&mut app.kit.dash_month, m))
+            .stacked(true)
+            .size(568., 230.)
+            .x_labels(months)
+            .value_format(|v| format!("${}", short_number(v * 1000.)))
+            .into(),
+    );
+    let regions = card(
+        "Signups by region",
+        None,
+        stacked_bar_chart(
+            ["Q1", "Q2", "Q3", "Q4"],
+            [
+                ("Americas", vec![420., 510., 580., 640.]),
+                ("Europe", vec![310., 360., 400., 470.]),
+                ("Asia", vec![180., 240., 330., 410.]),
+            ],
+        )
+        .key("dash-regions")
+        .selected(s.dash_quarter)
+        .on_select(|app: &mut App, q| toggle_pick(&mut app.kit.dash_quarter, q))
+        .size(266., 230.)
+        .into(),
+    );
+    let orders = card(
+        "Recent orders",
+        Some(
+            badge(format!("{} today", ORDERS.len()))
+                .rounded(Rounding::Full)
+                .into(),
+        ),
+        table(
+            [
+                table_column(0u8, "Order").width(80.),
+                table_column(1, "Customer").width(190.),
+                table_column(2, "Plan").width(170.),
+                table_column(3, "Status").width(110.),
+                table_column(4, "Amount").width(120.).align(Align::End),
+            ],
+            ORDERS.iter().enumerate().map(|(i, o)| {
+                table_row(i as u32, [o.0, o.1, o.2, o.3, o.4]).key(format!("dash-order-{i}"))
+            }),
+        )
+        .key("dash-orders")
+        .width(882.)
+        .selected(s.dash_order)
+        .on_select(|app: &mut App, r| app.kit.dash_order = Some(r))
+        .on_sort(|_: &mut App, _, _| {})
+        .font_size(13.)
+        .into(),
+    );
+    let dashboard = vstack![
+        grid(kpi_cards).columns(4).gap(12., Axis::Both),
+        // Exact column widths: 604 + 12 + 300 = the 916 px inside the frame.
+        hstack![vstack![price].width(604.), vstack![traffic].width(300.)]
+            .gap(12., Axis::Horizontal)
+            .align(Align::Stretch),
+        hstack![vstack![revenue].width(604.), vstack![regions].width(300.)]
+            .gap(12., Axis::Horizontal)
+            .align(Align::Stretch),
+        orders,
+    ]
+    .key("dashboard")
+    .gap(12., Axis::Vertical)
+    .padding(12., Edge::All)
+    .rounded(16.)
+    .background(ColorToken::Base200)
+    .width(940.);
+    Doc {
+        sections: vec![section(
+            "dashboard",
+            "Analytics dashboard",
+            "A dense, data-heavy screen built only from Volt components: stats, sparklines, candlesticks with volume, donut, stacked area and bars, and a sortable table.",
+            dashboard,
+            r#"candlestick_chart(candles).size(560., 250.).x_labels(dates).volume(true)
+donut_chart([("Search", 4210.), ("Direct", 2980.)]).center("10.5k", "visits")
+area_chart([("Pro", pro), ("Team", team)]).stacked(true).x_labels(months)
+stacked_bar_chart(["Q1", "Q2"], [("Americas", vec![420., 510.])])"#,
+        )],
+        api: vec![
+            ("area_chart(series)", ".stacked / .x_labels / .legend / .value_format / .size"),
+            ("candlestick_chart(candles)", "Candle::new(o, h, l, c).volume(v); .volume(true) for a strip"),
+            ("donut_chart(slices)", ".center(value, caption) / .thickness / .legend"),
+            ("stacked_bar_chart(categories, series)", "Series stacked per category, with legend"),
+            ("nice_ticks(lo, hi, n) / short_number(v)", "Axis helpers: round ticks, 1.2k-style labels"),
         ],
     }
 }

@@ -42,7 +42,7 @@ impl Breakpoint {
 /// A base value plus mobile-first minimum-width overrides.
 /// Distinct thresholds are order-independent; equal thresholds use the last rule.
 /// UI build validates every stored value and threshold, including inactive rules.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Responsive<T> {
     base: T,
     rules: Vec<(Breakpoint, T)>,
@@ -101,7 +101,7 @@ impl<T> Responsive<T> {
 }
 
 /// Rust-only property rules. JSON retains its scalar schema and precedence.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ResponsiveLayout {
     pub direction: Option<Responsive<Direction>>,
     pub padding: [Option<Responsive<f32>>; 4],

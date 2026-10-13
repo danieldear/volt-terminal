@@ -60,6 +60,9 @@ pub struct App {
     pub page: Page,
     pub mode: ThemeMode,
     pub theme: usize,
+    /// A fully custom theme from the Theme editor: [light, dark]. Choosing
+    /// a preset accent clears it.
+    pub custom_palettes: Option<[Palette; 2]>,
     pub glass: bool,
     /// Accent tint strength, independent of background opacity.
     pub tint: u8,
@@ -160,6 +163,7 @@ impl App {
             page: Page::Introduction,
             mode: ThemeMode::Light,
             theme: 0,
+            custom_palettes: None,
             glass: false,
             tint: 0,
             opacity: 72,
@@ -345,12 +349,39 @@ fn rgba(v: u32) -> [f32; 4] {
     ]
 }
 
-/// Neutral zinc surfaces with a selectable primary colour.
+/// The palette in use: the Theme editor's custom palette when set, else the
+/// selected preset.
+pub fn effective_palette(app: &App, dark: bool) -> Palette {
+    match &app.custom_palettes {
+        Some(custom) => custom[usize::from(dark)].clone(),
+        None => preset_palette(app, dark),
+    }
+}
+
 pub fn theme(app: &App, system: ThemeMode) -> UiTheme {
     let dark = match app.mode {
         ThemeMode::System => system == ThemeMode::Dark,
         mode => mode == ThemeMode::Dark,
     };
+    let p = effective_palette(app, dark);
+    let mut background = p.base[0];
+    if app.glass {
+        let tint = app.tint as f32 / 100.;
+        // Neutral tint must not invert the sidebar's light/dark text contrast.
+        let tint_color = if app.theme == 0 && app.custom_palettes.is_none() {
+            p.base[1]
+        } else {
+            p.primary
+        };
+        for (i, component) in background.iter_mut().enumerate().take(3) {
+            *component = p.base[0][i] * (1. - tint) + tint_color[i] * tint;
+        }
+    }
+    UiTheme::from_palette(p).with_background_color(background)
+}
+
+/// Neutral zinc surfaces with a selectable primary colour.
+pub fn preset_palette(app: &App, dark: bool) -> Palette {
     let mut p = if dark {
         Palette::dark()
     } else {
@@ -383,7 +414,7 @@ pub fn theme(app: &App, system: ThemeMode) -> UiTheme {
     p.info = rgba(if dark { 0x3B82F6 } else { 0x2563EB });
     p.on_info = rgba(0xFFFFFF);
     let (_, light_primary, dark_primary) = THEMES[app.theme];
-    let p = if app.theme == 0 {
+    if app.theme == 0 {
         // Zinc: the primary colour is the text colour itself.
         let mut p = p;
         p.primary = p.content;
@@ -393,17 +424,7 @@ pub fn theme(app: &App, system: ThemeMode) -> UiTheme {
         p
     } else {
         p.with_accent(rgba(if dark { dark_primary } else { light_primary }))
-    };
-    let mut background = p.base[0];
-    if app.glass {
-        let tint = app.tint as f32 / 100.;
-        // Neutral tint must not invert the sidebar's light/dark text contrast.
-        let tint_color = if app.theme == 0 { p.base[1] } else { p.primary };
-        for (i, component) in background.iter_mut().enumerate().take(3) {
-            *component = p.base[0][i] * (1. - tint) + tint_color[i] * tint;
-        }
     }
-    UiTheme::from_palette(p).with_background_color(background)
 }
 
 pub fn window_background(app: &App) -> volt_ui_kit::native::WindowBackground {
@@ -417,5 +438,47 @@ pub fn window_background(app: &App) -> volt_ui_kit::native::WindowBackground {
         WindowBackground::CompositorBlur { opacity }
     } else {
         WindowBackground::Blur { opacity }
+    }
+}
+
+/// Development restarts (`cargo volt dev`): keep the page and appearance.
+pub fn dev_save(app: &App) -> String {
+    format!(
+        "page={}\nmode={}\ntheme={}\nsidebar={}\nglass={}\n",
+        app.page.slug(),
+        match app.mode {
+            ThemeMode::Dark => "dark",
+            ThemeMode::Light => "light",
+            ThemeMode::System => "system",
+        },
+        app.theme,
+        app.sidebar_width,
+        app.glass
+    )
+}
+pub fn dev_load(app: &mut App, saved: &str) {
+    for line in saved.lines() {
+        match line.split_once('=') {
+            Some(("page", slug)) => {
+                if let Some(page) = PAGES.into_iter().find(|p| p.slug() == slug) {
+                    app.go(page);
+                }
+            }
+            Some(("mode", "dark")) => app.mode = ThemeMode::Dark,
+            Some(("mode", "light")) => app.mode = ThemeMode::Light,
+            Some(("mode", "system")) => app.mode = ThemeMode::System,
+            Some(("theme", v)) => {
+                if let Ok(i) = v.parse::<usize>() {
+                    app.theme = i.min(THEMES.len() - 1);
+                }
+            }
+            Some(("sidebar", v)) => {
+                if let Ok(w) = v.parse::<f32>() {
+                    app.sidebar_width = w.clamp(200., 420.);
+                }
+            }
+            Some(("glass", v)) => app.glass = v == "true",
+            _ => {}
+        }
     }
 }

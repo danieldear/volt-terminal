@@ -265,6 +265,8 @@ pub(crate) struct BoxExtras {
     /// Ambient pulse opacity for this frame (multiplies the visual opacity).
     pub pulse: Option<f32>,
     pub label_inset: Option<f32>,
+    /// Split dividers: painted only on hover/drag/focus (Rust UI builds).
+    #[cfg_attr(not(feature = "rust-ui"), allow(dead_code))]
     pub reveal_handle: bool,
 }
 #[derive(Clone)]
@@ -337,7 +339,11 @@ pub struct Runtime {
     scroll_ends: BTreeMap<String, f32>,
     /// Resolved styles depend only on the document, scale and logical width,
     /// so scroll-only layouts reuse them. Cleared when the document changes.
-    styles_cache: Option<([u32; 2], StyleMap)>,
+    styles_cache: Option<(([u32; 2], usize), StyleMap)>,
+    /// Layout reuse across recompositions: the previous document's measured
+    /// sizes and styles (keyed by its node addresses), its style key and
+    /// bindings, and new→old addresses of nodes unchanged since then.
+    reuse: Reuse,
     /// Last applied `scroll_to` request per scroll view.
     scroll_requests: BTreeMap<String, u32>,
     #[cfg(feature = "rust-ui")]
@@ -395,6 +401,7 @@ impl Runtime {
             scroll_offsets: BTreeMap::new(),
             scroll_ends: BTreeMap::new(),
             styles_cache: None,
+            reuse: Reuse::default(),
             scroll_requests: BTreeMap::new(),
             #[cfg(feature = "rust-ui")]
             editors: RefCell::new(BTreeMap::new()),
@@ -406,7 +413,9 @@ impl Runtime {
             slider_capture: None,
             #[cfg(feature = "rust-ui")]
             slider_values: BTreeMap::new(),
+            #[cfg(feature = "rust-ui")]
             slider_lower: None,
+            #[cfg(feature = "rust-ui")]
             file_hover: None,
             #[cfg(feature = "rust-ui")]
             split_capture: None,
@@ -514,6 +523,11 @@ impl Runtime {
     pub fn document(&self) -> &Document {
         &self.document
     }
+    /// How many measurements the latest layout reused from before the last
+    /// recomposition (subtrees whose content and styles were unchanged).
+    pub fn reused_measurements(&self) -> usize {
+        self.reuse.last_reused
+    }
     pub fn boxes(&self) -> &[LayoutBox] {
         &self.boxes
     }
@@ -567,7 +581,8 @@ impl Runtime {
         keys(next.root(), &mut ids);
         self.scroll_offsets.retain(|id, _| ids.contains(id));
         self.scroll_ends.retain(|id, _| ids.contains(id));
-        self.styles_cache = None;
+        // Keep the outgoing layout's measurements for unchanged subtrees.
+        let previous_styles = self.styles_cache.take();
         self.motion.get_mut().remove(&self.boxes, &ids);
         #[cfg(feature = "rust-ui")]
         let slider_capture = self.slider_capture.clone();
@@ -576,7 +591,13 @@ impl Runtime {
         #[cfg(feature = "rust-ui")]
         let composition = self.editor_composition_snapshot(&next);
         let scrollbar_capture = self.scrollbar_capture.clone();
-        self.document = next;
+        let mut old = std::mem::replace(&mut self.document, next);
+        self.reuse.prepare(
+            &mut old,
+            self.document.root_mut_for_reuse(),
+            previous_styles,
+        );
+        drop(old);
         #[cfg(feature = "rust-ui")]
         {
             self.reconcile_editors();
@@ -658,15 +679,20 @@ impl Runtime {
         self.prepare_overlay_layout(viewport);
         let anchored = self.follow_scroll_ends();
         let mut boxes = vec![];
-        let mut memo = MeasureMemo::new();
-        let style_key = [
-            self.scale.to_bits(),
-            (viewport.width / self.scale).to_bits(),
-        ];
+        let mut memo = MeasureMemo::default();
+        // Styles are keyed by node address, so the cache also records where
+        // the root lives: moving the runtime (and its inline root) re-resolves.
+        let style_key = (
+            [
+                self.scale.to_bits(),
+                (viewport.width / self.scale).to_bits(),
+            ],
+            node_key(self.document.root()),
+        );
         let styles = match self.styles_cache.take() {
             Some((key, styles)) if key == style_key => styles,
             _ => {
-                let mut styles = StyleMap::new();
+                let mut styles = StyleMap::default();
                 resolve_styles(
                     self.document.root(),
                     &InheritedStyle::default(),
@@ -678,6 +704,9 @@ impl Runtime {
                 styles
             }
         };
+        self.reuse.last_reused =
+            self.reuse
+                .seed(self.document.root(), &styles, style_key, values, &mut memo);
         let area = Rect::new(0., 0., viewport.width, viewport.height).unwrap();
         place(
             self.document.root(),
@@ -696,13 +725,15 @@ impl Runtime {
             true,
         );
         #[cfg(feature = "rust-ui")]
-        for node in self.visible_overlay_nodes() {
+        for node in
+            overlays::visible_overlays(self.document.root(), &self.overlays.visible_tooltips)
+        {
             if node.id == self.document.root().id {
                 continue;
             }
             let first = boxes.len();
             place(
-                &node,
+                node,
                 area,
                 area,
                 area,
@@ -718,12 +749,14 @@ impl Runtime {
                 true,
             );
             for b in &mut boxes[first..] {
-                b.depth = b.depth.saturating_sub(styles[&node.id].depth);
+                b.depth = b.depth.saturating_sub(styles[&node_key(node)].depth);
             }
         }
         for b in boxes.iter().filter(|b| anchored.contains(&b.id)) {
             self.scroll_ends.insert(b.id.clone(), b.scroll_max[1]);
         }
+        self.reuse.memo = memo;
+        self.reuse.bindings = Some(values.clone());
         self.styles_cache = Some((style_key, styles));
         self.layout_boxes = boxes;
         self.boxes = self
@@ -2701,7 +2734,7 @@ fn checked(n: &Node, values: &Bindings) -> bool {
         matches!(values.get(name), Some(Value::Bool(true)))
     })
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct ResolvedStyle {
     color_specs: [Option<String>; 4],
     background_opacity: f32,
@@ -2719,7 +2752,7 @@ struct ResolvedStyle {
     depth: usize,
 }
 /// Resolve once per layout, so measurement, allocation, placement, and hits agree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct ResolvedLayout {
     axis: usize,
     padding: [f32; 4],
@@ -2852,7 +2885,7 @@ fn resolve_styles(
         14.
     };
     out.insert(
-        n.id.clone(),
+        node_key(n),
         ResolvedStyle {
             color_specs: [
                 text.color.clone(),
@@ -3046,10 +3079,152 @@ fn intersection(a: Rect, b: Rect) -> Option<Rect> {
 }
 /// Resolved styles by node id. Hashed: auto ids share long prefixes, so an
 /// ordered map spends layout comparing strings.
-type StyleMap = std::collections::HashMap<String, ResolvedStyle>;
+type StyleMap = crate::fasthash::FxHashMap<usize, ResolvedStyle>;
+/// A node's identity within one installed document (its address). Style and
+/// measure caches are rebuilt whenever the document is replaced, so this
+/// never outlives the node; it avoids hashing id strings on the hot path.
+fn node_key(n: &Node) -> usize {
+    std::ptr::from_ref(n) as usize
+}
+/// Reusing measurements across recompositions. A node is *unchanged* when
+/// the previous document had a node with the same id, equal fields and the
+/// same child ids, and all its children are unchanged; at layout time its
+/// resolved style (and its whole subtree's) must also match. Measurement is
+/// a pure function of exactly those inputs plus the available size, so the
+/// previous pass's results for such subtrees seed the new pass's memo.
+#[derive(Default)]
+struct Reuse {
+    /// New node address → old node address, for unchanged nodes.
+    unchanged: crate::fasthash::FxHashMap<usize, usize>,
+    /// The previous document's styles (keyed by old addresses) and style key.
+    styles: Option<(([u32; 2], usize), StyleMap)>,
+    /// Measurements from the latest layout of the current document, and the
+    /// bindings it used; these become "previous" at the next replacement.
+    memo: MeasureMemo,
+    bindings: Option<Bindings>,
+    previous_memo: MeasureMemo,
+    previous_bindings: Option<Bindings>,
+    /// Measurements carried over by the latest layout (diagnostics).
+    last_reused: usize,
+}
+impl Reuse {
+    fn prepare(
+        &mut self,
+        old: &mut Document,
+        new_root: &mut Node,
+        previous_styles: Option<(([u32; 2], usize), StyleMap)>,
+    ) {
+        self.unchanged.clear();
+        self.previous_memo = std::mem::take(&mut self.memo);
+        self.previous_bindings = self.bindings.take();
+        self.styles = previous_styles;
+        if self.styles.is_none() || self.previous_memo.is_empty() {
+            return;
+        }
+        // Match by position: a child is a candidate when the same index in
+        // the old parent holds the same id. Views keep their shape between
+        // recompositions; reordered parts just lose reuse (never correctness).
+        fn walk(
+            new: &mut Node,
+            old: &mut Node,
+            out: &mut crate::fasthash::FxHashMap<usize, usize>,
+        ) -> bool {
+            if new.id != old.id || new.children.len() != old.children.len() {
+                // Still match what lines up underneath.
+                for (n, o) in new.children.iter_mut().zip(old.children.iter_mut()) {
+                    if n.id == o.id {
+                        walk(n, o, out);
+                    }
+                }
+                return false;
+            }
+            let mut children_same = true;
+            for (n, o) in new.children.iter_mut().zip(old.children.iter_mut()) {
+                children_same &= n.id == o.id && walk(n, o, out);
+            }
+            if !children_same {
+                return false;
+            }
+            // Compare the nodes themselves: detach the (already compared)
+            // child lists; moving a Vec keeps its children where they are.
+            let (nc, oc) = (
+                std::mem::take(&mut new.children),
+                std::mem::take(&mut old.children),
+            );
+            let same = *new == *old;
+            new.children = nc;
+            old.children = oc;
+            if same {
+                out.insert(node_key(new), node_key(old));
+            }
+            same
+        }
+        walk(new_root, old.root_mut_for_reuse(), &mut self.unchanged);
+    }
+    /// Seed `memo` with previous measurements of subtrees whose nodes and
+    /// resolved styles are unchanged. Returns how many entries were reused.
+    fn seed(
+        &mut self,
+        root: &Node,
+        styles: &StyleMap,
+        style_key: ([u32; 2], usize),
+        values: &Bindings,
+        memo: &mut MeasureMemo,
+    ) -> usize {
+        let usable = !self.unchanged.is_empty()
+            && self.previous_bindings.as_ref() == Some(values)
+            && self
+                .styles
+                .as_ref()
+                .is_some_and(|(key, _)| key.0 == style_key.0);
+        if !usable {
+            self.unchanged.clear();
+            return 0;
+        }
+        let old_styles = &self.styles.as_ref().unwrap().1;
+        // Subtrees whose styles also match: old address → new address.
+        let mut clean = crate::fasthash::FxHashMap::<usize, usize>::default();
+        fn styled(
+            n: &Node,
+            styles: &StyleMap,
+            old_styles: &StyleMap,
+            unchanged: &crate::fasthash::FxHashMap<usize, usize>,
+            clean: &mut crate::fasthash::FxHashMap<usize, usize>,
+        ) -> bool {
+            let mut all = true;
+            for c in &n.children {
+                all &= styled(c, styles, old_styles, unchanged, clean);
+            }
+            let key = node_key(n);
+            let Some(&old) = unchanged.get(&key) else {
+                return false;
+            };
+            let same = all
+                && match (styles.get(&key), old_styles.get(&old)) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                };
+            if same {
+                clean.insert(old, key);
+            }
+            same
+        }
+        styled(root, styles, old_styles, &self.unchanged, &mut clean);
+        let mut reused = 0;
+        for (&(old, w, h, axes), size) in &self.previous_memo {
+            if let Some(&new) = clean.get(&old) {
+                memo.insert((new, w, h, axes), *size);
+                reused += 1;
+            }
+        }
+        // One-shot: the next layout of this document measures afresh.
+        self.unchanged.clear();
+        reused
+    }
+}
 /// Per-layout-pass measurement memo. The document is immutable during a
 /// pass, so a node's address identifies it without cloning its id string.
-type MeasureMemo = std::collections::HashMap<(usize, u32, u32, [bool; 2]), [f32; 2]>;
+type MeasureMemo = crate::fasthash::FxHashMap<(usize, u32, u32, [bool; 2]), [f32; 2]>;
 /// Natural scroll sizing propagates through automatic-size descendants. Explicit
 /// dimensions establish a bounded inner layout again (so spacers still fill a
 /// fixed-height panel). Auto keeps the cross axis bounded for responsive flex.
@@ -3096,7 +3271,7 @@ fn sized_box(l: &ResolvedLayout, avail: [f32; 2]) -> [f32; 2] {
 }
 /// Takes part in flow layout: not an overlay and not hidden at this width.
 fn in_flow(c: &Node, styles: &StyleMap) -> bool {
-    c.overlay.is_none() && !styles[&c.id].layout.hidden
+    c.overlay.is_none() && !styles[&node_key(c)].layout.hidden
 }
 fn natural_children(n: &Node, l: &ResolvedLayout, inherited: [bool; 2]) -> [bool; 2] {
     let main = l.axis;
@@ -3158,7 +3333,7 @@ fn grid_cells(
     styles: &StyleMap,
     natural: [bool; 2],
 ) -> (Cells, f32) {
-    let l = &styles[&n.id].layout;
+    let l = &styles[&node_key(n)].layout;
     let (col_gap, row_gap) = grid_gaps(l);
     let count = match columns {
         super::extras::GridColumns::Count(c) => usize::from(c.max(1)),
@@ -3174,7 +3349,7 @@ fn grid_cells(
         if !in_flow(child, styles) {
             continue;
         }
-        let span = styles[&child.id].layout.span.min(count);
+        let span = styles[&node_key(child)].layout.span.min(count);
         if col + span > count {
             col = 0;
             row += 1;
@@ -3220,7 +3395,7 @@ fn wrap_cells(
     styles: &StyleMap,
     natural: [bool; 2],
 ) -> (Cells, [f32; 2]) {
-    let l = &styles[&n.id].layout;
+    let l = &styles[&node_key(n)].layout;
     let (gap, line_gap) = (l.gap, l.cross_gap);
     let mut lines: Vec<Vec<(usize, [f32; 2])>> = vec![vec![]];
     let mut used = 0.;
@@ -3282,7 +3457,7 @@ fn intrinsic(
     natural_axes: [bool; 2],
 ) -> [f32; 2] {
     let key = (
-        std::ptr::from_ref(n) as usize,
+        node_key(n),
         avail[0].to_bits(),
         avail[1].to_bits(),
         natural_axes,
@@ -3290,7 +3465,7 @@ fn intrinsic(
     if let Some(size) = memo.get(&key) {
         return *size;
     }
-    let resolved = &styles[&n.id];
+    let resolved = &styles[&node_key(n)];
     let lay = &resolved.layout;
     let limit = [0, 1].map(|a| {
         let base = fixed_size(lay, a, avail[a]).map_or(avail[a], |v| v.min(avail[a]));
@@ -3372,7 +3547,7 @@ fn intrinsic(
         }
         _ => {
             let (sizes, gap) = child_sizes(n, content, v, m, s, memo, styles, child_natural);
-            let axis = styles[&n.id].layout.axis;
+            let axis = styles[&node_key(n)].layout.axis;
             let mut result = [0_f32; 2];
             for size in sizes {
                 result[axis] += size[axis];
@@ -3429,8 +3604,8 @@ fn child_sizes(
     styles: &StyleMap,
     natural_axes: [bool; 2],
 ) -> (Vec<[f32; 2]>, f32) {
-    let axis = styles[&n.id].layout.axis;
-    let gap = styles[&n.id].layout.gap.min(
+    let axis = styles[&node_key(n)].layout.axis;
+    let gap = styles[&node_key(n)].layout.gap.min(
         available[axis]
             / n.children
                 .iter()
@@ -3477,7 +3652,12 @@ fn child_sizes(
         } else if !natural_axes[axis] && total_flex > 0. && room > natural {
             size[axis] += (room - natural) * child.flex / total_flex;
         }
-        size[axis] = clamp_axis(&styles[&child.id].layout, axis, size[axis], available[axis]);
+        size[axis] = clamp_axis(
+            &styles[&node_key(child)].layout,
+            axis,
+            size[axis],
+            available[axis],
+        );
         if axis == 0 {
             let measured = intrinsic(
                 child,
@@ -3512,14 +3692,14 @@ fn place(
     visible: bool,
 ) {
     let [x, y, aw, ah] = area.bounds();
-    let [w, h] = sized_box(&styles[&n.id].layout, [aw, ah]);
+    let [w, h] = sized_box(&styles[&node_key(n)].layout, [aw, ah]);
     let Some(bounds) = Rect::new(x, y, w, h) else {
         return;
     };
     let intersection_clip = intersection(bounds, ancestor);
     let visible = visible && intersection_clip.is_some();
     let clip = intersection_clip.unwrap_or(ancestor);
-    let mut resolved = styles[&n.id].clone();
+    let mut resolved = styles[&node_key(n)].clone();
     if resolved.round_full {
         resolved.radius = Some(w.min(h) * 0.5);
     }
@@ -3536,7 +3716,7 @@ fn place(
         clip,
         enabled: enabled(n, v),
         checked: checked(n, v),
-        text_style: styles[&n.id].text.clone(),
+        text_style: styles[&node_key(n)].text.clone(),
         style: resolved,
         text: if n.editor.as_ref().is_some_and(|o| o.password) {
             "<redacted>".into()
@@ -3576,7 +3756,7 @@ fn place(
         #[cfg(feature = "rust-ui")]
         access_table: n.access_table,
         effects: n.effects.clone(),
-        depth: styles[&n.id].depth,
+        depth: styles[&node_key(n)].depth,
         ancestor_clip: ancestor,
         effect_clip: effect_ancestor,
         clip_regions: regions.to_vec(),
@@ -3639,10 +3819,10 @@ fn place(
     } else {
         effect_ancestor
     };
-    let [top, right, bottom, left] = styles[&n.id].layout.padding;
+    let [top, right, bottom, left] = styles[&node_key(n)].layout.padding;
     let mut start = [x + left, y + top];
     let mut available = [(w - (left + right)).max(0.), (h - (top + bottom)).max(0.)];
-    let child_natural = natural_children(n, &styles[&n.id].layout, natural_axes);
+    let child_natural = natural_children(n, &styles[&node_key(n)].layout, natural_axes);
     if available.contains(&0.) {
         return;
     }
@@ -3659,17 +3839,17 @@ fn place(
             }
         }
         if mode == super::Scroll::Auto {
-            let cross = 1 - styles[&n.id].layout.axis;
+            let cross = 1 - styles[&node_key(n)].layout.axis;
             measure[cross] = n
                 .children
                 .iter()
-                .filter_map(|child| styles[&child.id].layout.size[cross])
+                .filter_map(|child| styles[&node_key(child)].layout.size[cross])
                 .fold(available[cross], |a, b| a.max(b));
         }
         let (sizes, gap) = child_sizes(n, measure, v, m, s, memo, styles, child_natural);
-        let main = styles[&n.id].layout.axis;
+        let main = styles[&node_key(n)].layout.axis;
         let mut content = [0_f32; 2];
-        let lay = &styles[&n.id].layout;
+        let lay = &styles[&node_key(n)].layout;
         let arranged_height = if let Some(columns) = lay.grid {
             Some(
                 grid_cells(
@@ -3828,10 +4008,10 @@ fn place(
         for child in n.children.iter().filter(|c| in_flow(c, styles)) {
             let mut size = intrinsic(child, available, v, m, s, memo, styles, child_natural);
             if n.align == Align::Stretch {
-                if !has_fixed(&styles[&child.id].layout, 0) {
+                if !has_fixed(&styles[&node_key(child)].layout, 0) {
                     size[0] = available[0];
                 }
-                if !has_fixed(&styles[&child.id].layout, 1) {
+                if !has_fixed(&styles[&node_key(child)].layout, 1) {
                     size[1] = available[1];
                 }
             }
@@ -3892,7 +4072,7 @@ fn place(
         }
         return;
     }
-    let lay = &styles[&n.id].layout;
+    let lay = &styles[&node_key(n)].layout;
     let arranged = if let Some(columns) = lay.grid {
         Some(
             grid_cells(
@@ -3950,7 +4130,7 @@ fn place(
         }
         return;
     }
-    let axis = styles[&n.id].layout.axis;
+    let axis = styles[&node_key(n)].layout.axis;
     let cross = 1 - axis;
     let (sizes, gap) = child_sizes(n, available, v, m, s, memo, styles, child_natural);
     let occupied = sizes.iter().map(|size| size[axis]).sum::<f32>()
@@ -3978,7 +4158,7 @@ fn place(
             continue;
         }
         if n.align == Align::Stretch
-            || (child.kind == Kind::Spacer && !has_fixed(&styles[&child.id].layout, cross))
+            || (child.kind == Kind::Spacer && !has_fixed(&styles[&node_key(child)].layout, cross))
         {
             size[cross] = available[cross];
         }
@@ -3986,7 +4166,7 @@ fn place(
         if axis == 1
             && n.align == Align::Start
             && n.flow.is_none()
-            && !has_fixed(&styles[&child.id].layout, 0)
+            && !has_fixed(&styles[&node_key(child)].layout, 0)
             && child.kind != Kind::Badge
         {
             size[cross] = available[cross];

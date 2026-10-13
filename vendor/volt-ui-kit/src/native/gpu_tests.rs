@@ -538,7 +538,7 @@ fn actual_gpu_fake_italic_leans_like_software() {
 
 #[test]
 fn viewport_command_reservation_counts_all_64_words_per_vello_tile() {
-    // Vello 0.6 coarse.wgsl reserves 64 words for EVERY viewport tile,
+    // Vello coarse.wgsl reserves 64 words for EVERY viewport tile,
     // even an empty one. At 8K these alone consume its entire PTCL buffer,
     // so the frame is split into strips that each fit. (The old 2-word
     // estimate admitted such frames to the GPU in one overflowing pass.)

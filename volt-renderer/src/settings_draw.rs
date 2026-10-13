@@ -299,7 +299,7 @@ impl Renderer {
                 // UI buffers draw all shapes before text. Remove obscured glyph
                 // quads before adding the popup text, so underlying rows cannot bleed.
                 let mut visible = Vec::with_capacity(g.len());
-                for quad in g.chunks_exact(6) {
+                for quad in g.as_chunks::<6>().0.iter() {
                     let mut bounds = [
                         f32::INFINITY,
                         f32::INFINITY,
