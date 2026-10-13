@@ -697,7 +697,7 @@ mod svg_doc {
     }
     fn points(value: &str, close: bool) -> Option<VectorPath> {
         let n = numbers(value);
-        let mut pairs = n.chunks_exact(2);
+        let mut pairs = n.as_chunks::<2>().0.iter();
         let first = pairs.next()?;
         let mut p = VectorPath::new().move_to(first[0], first[1]);
         for xy in pairs {

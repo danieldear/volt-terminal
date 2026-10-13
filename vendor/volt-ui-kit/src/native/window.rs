@@ -2332,7 +2332,7 @@ impl AnimationClock {
         // `now + interval`, which drifts later every frame by however long the
         // frame took. After a missed slot (a stall), rebase on `now` rather
         // than catching up in a burst.
-        let next = self.next_frame.map_or(now, |d| d) + self.interval;
+        let next = self.next_frame.unwrap_or(now) + self.interval;
         self.next_frame = Some(if next > now {
             next
         } else {

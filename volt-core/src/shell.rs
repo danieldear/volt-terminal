@@ -92,7 +92,9 @@ impl PromptMarks {
             .collect();
         let output_count = self.outputs.len();
         self.outputs = positions[old_count..old_count + output_count * 2]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter_map(|p| {
                 let start = mapped(p[0], false)?;
                 let end = mapped(p[1], true)?;

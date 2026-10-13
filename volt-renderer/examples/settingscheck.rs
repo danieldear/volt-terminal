@@ -225,8 +225,10 @@ fn main() -> Result<()> {
                     anyhow::ensure!(enabled != first, "toggle state did not repaint");
                     let row = l.row(3);
                     for (pixel, (off, on)) in first
-                        .chunks_exact(4)
-                        .zip(enabled.chunks_exact(4))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(enabled.as_chunks::<4>().0.iter())
                         .enumerate()
                     {
                         if off != on {

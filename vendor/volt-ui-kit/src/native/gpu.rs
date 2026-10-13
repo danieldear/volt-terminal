@@ -65,11 +65,16 @@ fn report_fallback_once(reason: &str) {
 fn unpremultiply(data: &[u8]) -> Cow<'_, [u8]> {
     // Opaque assets (and already-zero transparent pixels) are already straight
     // alpha. Borrow them for queue.write_texture instead of cloning up to 64 MiB.
-    if data.chunks_exact(4).all(|p| p[3] == 0 || p[3] == 255) {
+    if data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .all(|p| p[3] == 0 || p[3] == 255)
+    {
         return Cow::Borrowed(data);
     }
     let mut out = data.to_vec();
-    for p in out.chunks_exact_mut(4) {
+    for p in out.as_chunks_mut::<4>().0.iter_mut() {
         let a = u16::from(p[3]);
         if a != 0 && a != 255 {
             for c in &mut p[..3] {
@@ -874,7 +879,7 @@ impl GpuOffscreenRenderer {
                 // tiny-skia Pixmap (and PNG saving) require premultiplied RGBA;
                 // Vello's render target is straight RGBA. Only explicit
                 // verification readback does this CPU conversion.
-                for p in dst.chunks_exact_mut(4) {
+                for p in dst.as_chunks_mut::<4>().0.iter_mut() {
                     for i in 0..3 {
                         p[i] = ((u16::from(p[i]) * u16::from(p[3]) + 127) / 255) as u8;
                     }
@@ -907,7 +912,7 @@ mod tests {
         let data = [255, 128, 64, 255].repeat(2048 * 2048);
         let old = |data: &[u8]| {
             let mut out = data.to_vec();
-            for p in out.chunks_exact_mut(4) {
+            for p in out.as_chunks_mut::<4>().0.iter_mut() {
                 let a = u16::from(p[3]);
                 if a != 0 && a != 255 {
                     for c in &mut p[..3] {

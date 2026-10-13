@@ -23,7 +23,7 @@ impl Image {
         if count == 0 || count > 16_777_216 || count * 4 != pixels.len() as u64 {
             return Err("invalid image dimensions/data (16 MP maximum)");
         }
-        for p in pixels.chunks_exact_mut(4) {
+        for p in pixels.as_chunks_mut::<4>().0.iter_mut() {
             for i in 0..3 {
                 p[i] = ((u16::from(p[i]) * u16::from(p[3]) + 127) / 255) as u8;
             }

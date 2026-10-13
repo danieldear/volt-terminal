@@ -1088,7 +1088,7 @@ impl GpuSceneEncoder {
                         }
                     }
                     SwashContent::Color => {
-                        for p in image.data.chunks_exact(4) {
+                        for p in image.data.as_chunks::<4>().0.iter() {
                             rgba.extend([
                                 ((u16::from(p[0]) * u16::from(p[3]) + 127) / 255) as u8,
                                 ((u16::from(p[1]) * u16::from(p[3]) + 127) / 255) as u8,
