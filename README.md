@@ -51,9 +51,11 @@ including the dynamic Services submenu, is genuine.
 
 ## Shared UI toolkit
 
-The v0.1.14 source includes the UI update, terminal compatibility batch and
+The v0.1.15 source includes the refreshed UI Kit 0.4.0 integration (Rust 1.89+),
+while retaining Volt’s wgpu 29 renderer, terminal compatibility batch and
 Unicode row-cache buffer reuse. The maintainer reports real-app results near
-23 seconds and has accepted this build for release; this is not an independent
+23 seconds for the v0.1.14 Unicode fix; this integration has not had a new
+full-app benchmark. This is not an independent
 matched benchmark or a claim of universal speedup. See the
 [performance investigation](docs/unicode-rendering-performance.md).
 

@@ -8,7 +8,7 @@ changes with the toolkit's `scripts/sync_into_volt.py` and validate the resultin
 ## Current integration
 
 The toolkit snapshot is version **0.4.0**, pinned to merged upstream commit
-`5547694aea097aea57d8e32ec7e8a42315924a2e` (2026-10-12). Settings, onboarding, workspace cards,
+`000c5d083562c67d7fd6392f128b63efc827f201` (2026-10-13). Settings, onboarding, workspace cards,
 task controls, search and tab layout continue to use its shared paint/layout
 recipes. Boolean Settings rows now use the toolkit's declarative **Toggle**
 control: rounded track, sliding-position knob and an explicit On/Off label.
@@ -47,7 +47,7 @@ images, effects and toolkit input dispatch require additional adapters. Its
 no-op toolkit handler is never dispatched; actual input uses Volt's existing
 Settings row handlers.
 
-The 0.4.0 import captures 206 files from a clean archive of the merged commit,
+The current 0.4.0 import captures 188 files from a clean archive of the merged commit,
 not a mutable working tree. `SOURCE.json` inventories every imported file; the
 validation test also checks that manifest, package and consumer versions match.
 The toolkit repository itself is unchanged. This supersedes the initial 179-file
@@ -74,7 +74,7 @@ its native application host. Theme colors remain Volt's current theme colors.
 - `RUST_MIN_STACK=33554432 cargo test --locked --workspace`
 - `cargo test --locked --workspace --exclude volt-ui-kit` (ordinary host test stacks)
 - `cargo clippy --locked --workspace --all-targets -- -D warnings`
-- `cargo +1.87 check --locked --workspace`
+- `cargo +1.89.0 check --locked --workspace --all-targets`
 - Python validation tests, including the independent vendored hash inventory
 - `settingscheck`: switch state changes, cache hits/rebuilds, hide/show, footer
   icons, four themes and backing scales 1 / 1.5 / 2
@@ -88,9 +88,11 @@ Controls are composed only when the Settings geometry cache invalidates. The
 ordinary terminal rendering path does not instantiate a toolkit runtime or
 parse a UI document per frame.
 
-## Upstream integration caveats — 0.4.0
+## Upstream integration caveats — historical 0.4.0 snapshot
 
-The merged source has two relevant integration issues, preserved transparently:
+The earlier snapshot had two relevant integration issues, preserved here as
+historical evidence. Declarative-only compilation now passes in the current
+upstream snapshot; the test-only stack allowance remains in Volt:
 
 - `--features declarative` alone fails to compile: `Runtime` initializes
   `slider_lower` and `file_hover` without the `rust-ui` guards used on their
@@ -202,3 +204,24 @@ The maintainer reports real-app performance near 23 seconds and has accepted
 the build for release. This does not turn the historical failed offscreen
 batches into passes or establish a universal throughput claim. See the
 [fix, repeated measurements and acceptance boundaries](unicode-rendering-performance.md).
+
+## v0.1.15 integration validation — 2026-10-13
+
+The snapshot now includes upstream's Vello 0.11 / wgpu 30 native-host update,
+chart path-limit fixes and Rust 1.98 Clippy cleanup. Volt enables only `rust-ui`:
+its active renderer remains wgpu 29 with cosmic-text 0.11; the toolkit native GPU
+host is not enabled. Building from source now requires **Rust 1.89 or newer**.
+
+Before the version-only release preparation, current main passed 717 Rust
+tests/doc-tests, 36 Python validations, strict Clippy (Rust 1.94 and 1.98),
+Rust 1.89 all-target checks, dependency and reachable-history secret scans,
+and 512 GPU cases. The 188-file snapshot matches canonical upstream exactly.
+Native Mac QA covered settings dropdowns, switches, slider previews and Cancel,
+Unicode output, tab dragging and traffic lights without altering user settings.
+
+Canonical toolkit local default/all-feature, feature-isolation, packaging and
+nine Metal GPU checks passed. Its separate hosted CI did not start because of
+an account billing/spending-limit blocker; this is not a failed toolkit test.
+Volt's own Linux/macOS CI passed. Full-app TermMark was not rerun for this
+integration; no new throughput improvement or no-regression claim is made.
+Historical benchmark evidence above remains unchanged.
