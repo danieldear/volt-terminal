@@ -17,6 +17,9 @@ category = "developer-tool"
 name = "volt"
 path = "src/main.rs"
 
+[features]
+ui-gpu-prototype = ["volt-ui/ui-gpu-prototype"]
+
 [dependencies]
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

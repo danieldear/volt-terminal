@@ -1,10 +1,38 @@
 # UI-only GPU renderer prototype
 
-This experiment is **not enabled in Volt**, is not part of the v0.1.15 release,
+This experiment is **not enabled by default in Volt**, is not part of the v0.1.15 release,
 and does not replace the terminal renderer. It consumes the same pinned toolkit
 snapshot as the released integration; no toolkit/vendor source is changed.
 
-## Run
+## Run the real Volt test build (macOS)
+
+```sh
+bash scripts/macos/build_ui_gpu_preview.sh --open
+```
+
+This builds **Volt UI GPU Preview.app** separately, with the actual terminal,
+Meow, tabs, splits, workspace features and the existing Settings UI. The app
+uses an isolated preview configuration under `target/macos-ui-gpu/config`,
+including when opened through Launch Services directly. No system install or
+public release is changed. The bundle is development ad-hoc signed, not a new
+notarized release. Close this preview before rebuilding; the helper refuses to
+replace a running preview.
+
+**First integrated surface: Settings only.** Cmd+, opens the existing overlay;
+Esc/Cancel restores the preview draft. Other cards/search and the terminal
+renderer remain on their current renderer. Use the same font, grid/window size,
+scrollback and configuration when comparing full-app throughput; this profile
+is isolated and may differ from your daily settings.
+
+The binary must be compiled with `ui-gpu-prototype` **and** launched with
+`VOLT_UI_GPU_SETTINGS=1`. Without either, the existing UI path remains active.
+The helper/bundle sets both for the preview. Its isolated task trust store is
+also fresh: a shield on an idle task means the task file needs review, not an
+icon-rendering regression. Existing approvals are not copied or bypassed.
+Normal builds do not compile the
+bridge or its counters.
+
+## Standalone diagnostic harness
 
 ```sh
 # Requires a real GPU; fails if the measured scene falls back to software.
@@ -120,3 +148,61 @@ colored traffic lights in the focused window, no white title strip, readable
 neutral controls and palette changes without mixed light/dark tokens. These
 changes affect only the standalone prototype; v0.1.15 remains unchanged.
 Timings from different preview dimensions must not be treated as a speedup.
+
+## Real Volt integration — 2026-10-13
+
+```text
+Real Volt window / PTY / tabs / splits / existing input handlers
+  Terminal and other overlays -> existing wgpu 29 renderer
+  Settings cache invalidates   -> existing Volt mesh + glyph atlas
+                                 -> toolkit Vello GPU (wgpu 30)
+                                 -> bounded readback + upload ON CHANGE
+  Unchanged Settings frames   -> cached premultiplied texture composite
+  Settings hidden            -> texture dropped, no UI GPU render/upload
+```
+
+The bridge deliberately reuses the exact host layout, labels, icons and glyph
+bitmaps; it does not replace settings callbacks or font shaping with a separate
+application. Vello paints the existing background meshes and glyph images.
+The original mesh remains available for fail-safe fallback. The terminal's
+atlas, row caches, native window chrome, key routing and shell paths are retained.
+
+This is a **cached CPU-transfer bridge**, not zero-copy: changed Settings scenes
+pay GPU completion/readback plus cross-device upload. Static terminal/UI frames
+do not repeat those transfers. The second GPU device and compositor pipeline
+initialize lazily; pipelines/devices are reused, not recreated on every change.
+The UI device can remain resident after closing Settings; default builds have
+no such device. A compatible zero-copy texture/device API remains a later gate.
+
+The bridge caps the framebuffer at 8,388,608 pixels (32 MiB transferred per
+successful rebuild), validates mesh/glyph bounds and caps glyph bytes/vertices.
+Unsupported/oversized/device-failed scenes fall back to the original renderer
+rather than showing stale UI. Clear/rebuild follows hide/reopen, small-window
+layout suppression, resize, scale/font/atlas reset, theme and dropdown changes.
+A cached texture is composited last, preserving modal occlusion over terminal
+text and other UI.
+
+### Validation
+
+- `settingsgpucheck`: 24 actual Volt renderer palette/DPI/switch-state cases,
+  plus dropdown, resize/small-window recovery, font reset, hide/reopen and
+  terminal restoration. Device/pipeline reuse and dirty-only transfer counters
+  are asserted. Cached output must match exactly between static submissions.
+- Legacy/Vello image differences are reported separately; the median mean
+  channel difference was approximately 0.22/255, not bit-identical output.
+- Native real-app QA verified shell/Unicode output, existing tabs/splits,
+  Settings open/reopen, theme dropdown/preview, scrolling/right-aligned switch
+  and Cancel. The isolated configuration remained unchanged after cancellation.
+- Full-app TermMark has **not** been run for this build. No throughput/no-regression
+  claim follows from offscreen fixtures or from keeping the terminal algorithm.
+
+```sh
+cargo run --locked --release -p volt-renderer --example settingsgpucheck --features ui-gpu-prototype
+```
+
+Final local gates for the real integration: 891 opt-in Rust tests/doc-tests
+and 717 default Rust tests/doc-tests, 38 Python validations, strict Clippy and
+Rust 1.89 all-target checks passed. Launch Services environment isolation was
+verified both with a dedicated benign environment fixture and the real preview
+opened without explicit environment arguments; Settings activated Vello in that
+launch. The running-app replacement guard was also exercised successfully.

@@ -7,6 +7,9 @@ rust-version.workspace = true
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
+[features]
+ui-gpu-prototype = ["volt-renderer/ui-gpu-prototype"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = "1"

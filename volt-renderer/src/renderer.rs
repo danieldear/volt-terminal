@@ -427,6 +427,8 @@ pub struct Renderer {
     pub settings_controls: Vec<crate::settings::SettingsControl>,
     pub settings_dropdown: Option<crate::settings::SettingsDropdown>,
     settings_cache: Option<settings_draw::SettingsGeometry>,
+    #[cfg(feature = "ui-gpu-prototype")]
+    settings_gpu: settings_gpu::SettingsGpuLayer,
     pub task_form: Option<crate::task_form::TaskFormView>,
     /// Task buttons where the workspace card sits while it's closed.
     pub task_strip: Option<crate::task_strip::TaskStripView>,
@@ -837,6 +839,8 @@ impl Renderer {
             theme_editor_cache: None,
             settings: None,
             settings_cache: None,
+            #[cfg(feature = "ui-gpu-prototype")]
+            settings_gpu: settings_gpu::SettingsGpuLayer::from_environment(),
             settings_toggles: Vec::new(),
             settings_controls: Vec::new(),
             settings_dropdown: None,
@@ -1693,6 +1697,8 @@ impl Renderer {
                     pass.draw(glyph_range, 0..1);
                 }
             }
+            #[cfg(feature = "ui-gpu-prototype")]
+            self.settings_gpu.composite(&mut pass);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         if let Some(output) = output {
@@ -1718,6 +1724,13 @@ impl Renderer {
         inspector: Option<InspectorInfo>,
         read_only: bool,
     ) {
+        #[cfg(feature = "ui-gpu-prototype")]
+        if self.settings.is_none() {
+            if self.settings_gpu.ready() {
+                self.settings_cache = None;
+            }
+            self.settings_gpu.hide();
+        }
         if self.atlas.full {
             self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
             self.workspace_card_cache = None;
@@ -3016,6 +3029,12 @@ mod placement_tests {
 
 #[path = "search_palette_draw.rs"]
 mod search_palette_draw;
+
+#[cfg(feature = "ui-gpu-prototype")]
+#[path = "settings_gpu.rs"]
+mod settings_gpu;
+#[cfg(feature = "ui-gpu-prototype")]
+pub use settings_gpu::SettingsGpuStats;
 
 #[path = "settings_draw.rs"]
 mod settings_draw;
