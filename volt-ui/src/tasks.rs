@@ -235,6 +235,53 @@ pub fn strip_state(run: Option<RunState>, trusted: bool) -> volt_renderer::task_
     }
 }
 
+/// Shared task presentation for the compact card, review modal, and future
+/// sidebar. No approval or execution happens while constructing this view.
+pub fn review_view(
+    tasks: &ProjectTasks,
+    task: &TaskDef,
+    mode: volt_renderer::task_review::ReviewMode,
+) -> volt_renderer::task_review::TaskReview {
+    volt_renderer::task_review::TaskReview {
+        mode,
+        name: task.name.clone(),
+        directory: execution_directory(tasks, task).display().to_string(),
+        command: task.run.clone(),
+        scroll: 0,
+        primary_focus: true,
+    }
+}
+pub fn permissions_view(tasks: &ProjectTasks) -> volt_renderer::task_review::TaskReview {
+    let command = tasks
+        .tasks
+        .iter()
+        .map(|t| {
+            format!(
+                "{}{}\nDirectory: {}\n{}",
+                t.name,
+                if t.confirm { " · ask every run" } else { "" },
+                execution_directory(tasks, t).display(),
+                t.run,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    volt_renderer::task_review::TaskReview {
+        mode: volt_renderer::task_review::ReviewMode::TrustFile,
+        name: format!("{} saved tasks · .volt/tasks.toml", tasks.tasks.len()),
+        directory: tasks.root.display().to_string(),
+        command,
+        scroll: 0,
+        primary_focus: false,
+    }
+}
+fn execution_directory(tasks: &ProjectTasks, task: &TaskDef) -> PathBuf {
+    task.cwd
+        .as_deref()
+        .map(|sub| tasks.root.join(sub))
+        .unwrap_or_else(|| tasks.root.clone())
+}
+
 /// The line to type for `task`. In the task's own folder it is the command
 /// as written; elsewhere it runs in a subshell so the shell's folder is kept.
 pub fn command_line(
@@ -243,10 +290,7 @@ pub fn command_line(
     shell: &str,
     here: Option<&Path>,
 ) -> String {
-    let dir = match task.cwd.as_deref() {
-        Some(sub) => tasks.root.join(sub),
-        None => tasks.root.clone(),
-    };
+    let dir = execution_directory(tasks, task);
     if here.is_some_and(|here| here == dir) {
         return task.run.clone();
     }
@@ -389,6 +433,28 @@ mod tests {
         assert_eq!(launch_gate(&saved, &confirm), LaunchGate::Confirm);
         saved.trusted = false;
         assert_eq!(launch_gate(&saved, &confirm), LaunchGate::ReviewOnce);
+    }
+
+    #[test]
+    fn review_views_preserve_commands_directories_and_confirmation_policy() {
+        use volt_renderer::task_review::ReviewMode;
+        let mut saved = tasks("/repo");
+        let mut build = task("echo SAFE_END", Some("sub"));
+        build.confirm = true;
+        saved.tasks.push(build.clone());
+        let v = review_view(&saved, &build, ReviewMode::Confirm);
+        assert_eq!(v.command, build.run);
+        assert_eq!(v.directory, "/repo/sub");
+        assert_eq!(launch_gate(&saved, &build), LaunchGate::ReviewOnce);
+        let trust = permissions_view(&saved);
+        assert!(trust.command.contains("Directory: /repo/sub"));
+        assert!(trust.command.ends_with("echo SAFE_END"));
+        assert!(trust.command.contains("ask every run"));
+        assert!(!trust.primary_focus);
+        assert!(
+            !saved.trusted,
+            "view construction must not approve anything"
+        );
     }
 
     #[test]

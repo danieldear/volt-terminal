@@ -8,7 +8,8 @@ use volt_config::Color;
 pub const FIELD_COUNT: usize = 22;
 pub const BASE_FIELDS: usize = 6;
 
-const PANEL_W: f32 = 300.;
+const PANEL_W: f32 = 620.;
+const LEFT_W: f32 = 300.;
 const PANEL_H: f32 = 420.;
 const MARGIN: f32 = 12.;
 const PAD: f32 = 14.;
@@ -19,9 +20,9 @@ const CELL: f32 = 28.;
 const GAP: f32 = 6.;
 const DETAIL_Y: f32 = 318.;
 const FOOTER_Y: f32 = 360.;
-const BUTTON_H: f32 = 26.;
-const SAVE_W: f32 = 84.;
-const REVERT_W: f32 = 66.;
+const BUTTON_H: f32 = 28.;
+const SAVE_W: f32 = 110.;
+const REVERT_W: f32 = 84.;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditorRow {
@@ -36,6 +37,10 @@ pub struct EditorRow {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThemeEditorView {
     pub subtitle: String,
+    pub picked: Color,
+    pub picker_hue: f32,
+    pub picker_open: bool,
+    pub picked_label: String,
     /// The six base-color rows.
     pub rows: Vec<EditorRow>,
     pub ansi: [Color; 16],
@@ -53,6 +58,11 @@ pub struct ThemeEditorView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditorHit {
     Field(usize),
+    SaturationValue,
+    Hue,
+    Channel(usize),
+    Preset(usize),
+    Back,
     Close,
     Revert,
     Save,
@@ -70,12 +80,18 @@ pub struct ThemeEditorLayout {
     pub w: f32,
     pub h: f32,
     pub scale: f32,
+    pub compact: bool,
+    pub picker_open: bool,
 }
 
 impl ThemeEditorLayout {
     pub fn new(width: f32, height: f32, top: f32, scale: f32) -> Option<Self> {
-        let s = scale.max(0.1);
-        let (w, h) = (PANEL_W * s, PANEL_H * s);
+        if ![width, height, top, scale].into_iter().all(f32::is_finite) || scale <= 0. {
+            return None;
+        }
+        let s = scale;
+        let compact = width < (PANEL_W + 2. * MARGIN) * s;
+        let (w, h) = (if compact { LEFT_W } else { PANEL_W } * s, PANEL_H * s);
         if width < w + 2. * MARGIN * s || height - top < h + 2. * MARGIN * s {
             return None;
         }
@@ -85,6 +101,8 @@ impl ThemeEditorLayout {
             w,
             h,
             scale: s,
+            compact,
+            picker_open: false,
         })
     }
 
@@ -95,11 +113,11 @@ impl ThemeEditorLayout {
     }
 
     pub fn base_row(&self, i: usize) -> [f32; 4] {
-        self.rect(8., ROW_Y0 + i as f32 * ROW_H, PANEL_W - 16., ROW_H - 2.)
+        self.rect(8., ROW_Y0 + i as f32 * ROW_H, LEFT_W - 16., ROW_H - 2.)
     }
 
     pub fn detail_row(&self) -> [f32; 4] {
-        self.rect(8., DETAIL_Y, PANEL_W - 16., ROW_H - 2.)
+        self.rect(8., DETAIL_Y, LEFT_W - 16., ROW_H - 2.)
     }
 
     /// Hex field inside a row rect.
@@ -124,7 +142,7 @@ impl ThemeEditorLayout {
     }
 
     pub fn ansi_cell(&self, i: usize) -> [f32; 4] {
-        let x0 = (PANEL_W - (8. * CELL + 7. * GAP)) / 2.;
+        let x0 = (LEFT_W - (8. * CELL + 7. * GAP)) / 2.;
         let (col, row) = ((i % 8) as f32, (i / 8) as f32);
         self.rect(
             x0 + col * (CELL + GAP),
@@ -135,12 +153,17 @@ impl ThemeEditorLayout {
     }
 
     pub fn save_button(&self) -> [f32; 4] {
-        self.rect(PANEL_W - PAD - SAVE_W, FOOTER_Y, SAVE_W, BUTTON_H)
+        self.rect(
+            self.w / self.scale - PAD - SAVE_W,
+            FOOTER_Y,
+            SAVE_W,
+            BUTTON_H,
+        )
     }
 
     pub fn revert_button(&self) -> [f32; 4] {
         self.rect(
-            PANEL_W - PAD - SAVE_W - 8. - REVERT_W,
+            self.w / self.scale - PAD - SAVE_W - 8. - REVERT_W,
             FOOTER_Y,
             REVERT_W,
             BUTTON_H,
@@ -148,7 +171,49 @@ impl ThemeEditorLayout {
     }
 
     pub fn name_field(&self) -> [f32; 4] {
-        self.rect(PAD, FOOTER_Y, PANEL_W - 2. * PAD - SAVE_W - 8., BUTTON_H)
+        self.rect(
+            PAD,
+            FOOTER_Y,
+            self.w / self.scale - 2. * PAD - SAVE_W - 8.,
+            BUTTON_H,
+        )
+    }
+
+    pub fn picker_rect(&self) -> [f32; 4] {
+        self.rect(
+            if self.compact { 14. } else { 316. },
+            84.,
+            if self.compact { 272. } else { 286. },
+            126.,
+        )
+    }
+    pub fn hue_rect(&self) -> [f32; 4] {
+        let r = self.picker_rect();
+        [r[0], self.y + 224. * self.scale, r[2], 14. * self.scale]
+    }
+    pub fn channel_rect(&self, i: usize) -> [f32; 4] {
+        let r = self.picker_rect();
+        [
+            r[0] + 24. * self.scale,
+            self.y + (246. + i as f32 * 26.) * self.scale,
+            r[2] - 60. * self.scale,
+            16. * self.scale,
+        ]
+    }
+    pub fn preset_rect(&self, i: usize) -> [f32; 4] {
+        let r = self.picker_rect();
+        [
+            r[0] + i as f32 * (r[2] / 12.),
+            self.y + 326. * self.scale,
+            r[2] / 12. - 3. * self.scale,
+            20. * self.scale,
+        ]
+    }
+    pub fn back_button(&self) -> [f32; 4] {
+        self.rect(8., 6., 36., 28.)
+    }
+    pub fn picker_visible(&self) -> bool {
+        !self.compact || self.picker_open
     }
 
     pub fn hit(&self, x: f32, y: f32, naming: bool) -> EditorHit {
@@ -156,7 +221,7 @@ impl ThemeEditorLayout {
         if !inside([self.x, self.y, self.w, self.h]) {
             return EditorHit::Outside;
         }
-        if inside(self.rect(PANEL_W - 34., 0., 34., 34.)) {
+        if inside(self.rect(self.w / self.scale - 34., 0., 34., 34.)) {
             return EditorHit::Close;
         }
         if inside(self.save_button()) {
@@ -164,6 +229,26 @@ impl ThemeEditorLayout {
         }
         if !naming && inside(self.revert_button()) {
             return EditorHit::Revert;
+        }
+        if self.compact && self.picker_open && !naming && inside(self.back_button()) {
+            return EditorHit::Back;
+        }
+        if self.picker_visible() && !naming {
+            if inside(self.picker_rect()) {
+                return EditorHit::SaturationValue;
+            }
+            if inside(self.hue_rect()) {
+                return EditorHit::Hue;
+            }
+            if let Some(i) = (0..3).find(|&i| inside(self.channel_rect(i))) {
+                return EditorHit::Channel(i);
+            }
+            if let Some(i) = (0..12).find(|&i| inside(self.preset_rect(i))) {
+                return EditorHit::Preset(i);
+            }
+        }
+        if self.compact && self.picker_open {
+            return EditorHit::Body;
         }
         if let Some(i) = (0..BASE_FIELDS).find(|&i| inside(self.base_row(i))) {
             return EditorHit::Field(i);
@@ -175,9 +260,97 @@ impl ThemeEditorLayout {
     }
 }
 
+pub const PRESETS: [Color; 12] = [
+    Color::rgb(239, 68, 68),
+    Color::rgb(249, 115, 22),
+    Color::rgb(245, 158, 11),
+    Color::rgb(234, 179, 8),
+    Color::rgb(34, 197, 94),
+    Color::rgb(20, 184, 166),
+    Color::rgb(59, 130, 246),
+    Color::rgb(99, 102, 241),
+    Color::rgb(168, 85, 247),
+    Color::rgb(236, 72, 153),
+    Color::rgb(255, 255, 255),
+    Color::rgb(0, 0, 0),
+];
+pub fn rgb_to_hsv(c: Color) -> [f32; 3] {
+    let [r, g, b] = [c.r as f32 / 255., c.g as f32 / 255., c.b as f32 / 255.];
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let h = if d == 0. {
+        0.
+    } else if max == r {
+        60. * ((g - b) / d).rem_euclid(6.)
+    } else if max == g {
+        60. * ((b - r) / d + 2.)
+    } else {
+        60. * ((r - g) / d + 4.)
+    };
+    [h, if max == 0. { 0. } else { d / max }, max]
+}
+pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Color {
+    if ![h, s, v].into_iter().all(f32::is_finite) {
+        return Color::rgb(0, 0, 0);
+    }
+    let h = h.rem_euclid(360.) / 60.;
+    let s = s.clamp(0., 1.);
+    let v = v.clamp(0., 1.);
+    let c = v * s;
+    let x = c * (1. - (h % 2. - 1.).abs());
+    let m = v - c;
+    let a = match h as u8 {
+        0 => [c, x, 0.],
+        1 => [x, c, 0.],
+        2 => [0., c, x],
+        3 => [0., x, c],
+        4 => [x, 0., c],
+        _ => [c, 0., x],
+    };
+    let [r, g, b] = a.map(|a| ((a + m) * 255.).round().clamp(0., 255.) as u8);
+    Color::rgb(r, g, b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picker_targets_roundtrip_and_compact_navigation() {
+        for scale in [1., 1.5, 2.] {
+            for width in [400., 1000.] {
+                let mut l = ThemeEditorLayout::new(width * scale, 800. * scale, 30. * scale, scale)
+                    .unwrap();
+                l.picker_open = true;
+                let center = |r: [f32; 4]| (r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
+                for (r, target) in [
+                    (l.picker_rect(), EditorHit::SaturationValue),
+                    (l.hue_rect(), EditorHit::Hue),
+                ] {
+                    let (x, y) = center(r);
+                    assert_eq!(l.hit(x, y, false), target);
+                    assert_eq!(l.hit(x, y, true), EditorHit::Body);
+                }
+                for i in 0..3 {
+                    let (x, y) = center(l.channel_rect(i));
+                    assert_eq!(l.hit(x, y, false), EditorHit::Channel(i));
+                }
+                for i in 0..12 {
+                    let (x, y) = center(l.preset_rect(i));
+                    assert_eq!(l.hit(x, y, false), EditorHit::Preset(i));
+                }
+            }
+        }
+        for c in PRESETS.into_iter().chain([
+            Color::rgb(128, 128, 128),
+            Color::rgb(1, 2, 3),
+            Color::rgb(251, 121, 19),
+        ]) {
+            let [h, s, v] = rgb_to_hsv(c);
+            assert_eq!(hsv_to_rgb(h, s, v), c);
+        }
+    }
 
     #[test]
     fn hits_line_up_with_drawn_geometry_at_every_scale() {

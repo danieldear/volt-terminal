@@ -23,7 +23,6 @@ const ACCENT: [f32; 4] = [0.48, 0.72, 0.98, 1.];
 const INVALID: [f32; 4] = [0.88, 0.42, 0.46, 1.];
 const SWATCH_EDGE: [f32; 4] = [1., 1., 1., 0.22];
 const BUTTON: [f32; 4] = [0.32, 0.32, 0.37, 1.];
-const BUTTON_FILL: [f32; 4] = [0.24, 0.24, 0.29, 1.];
 const OK: [f32; 4] = [0.55, 0.82, 0.58, 1.];
 const ERROR: [f32; 4] = [0.95, 0.52, 0.52, 1.];
 
@@ -54,6 +53,10 @@ impl Renderer {
             self.workspace_card_top_offset(),
             self.scale_factor,
         )
+        .map(|mut l| {
+            l.picker_open = self.theme_editor.as_ref().is_some_and(|v| v.picker_open);
+            l
+        })
     }
 
     pub(super) fn draw_theme_editor(
@@ -108,58 +111,90 @@ impl Renderer {
         let pad = 14. * s;
         self.card_text(
             glyphs,
-            "Customize theme",
-            x + pad,
+            if l.compact && l.picker_open {
+                "Pick color"
+            } else {
+                "Customize theme"
+            },
+            x + if l.compact && l.picker_open {
+                50. * s
+            } else {
+                pad
+            },
             y + 12. * s,
             13. * s,
             TEXT,
         );
         let subtitle = fit(&v.subtitle, w - 2. * pad - 20. * s, 11. * s);
         self.card_text(glyphs, &subtitle, x + pad, y + 31. * s, 11. * s, SECONDARY);
-        self.card_text(glyphs, "×", x + w - 26. * s, y + 7. * s, 17. * s, SECONDARY);
+        volt_ui_kit::Painter::card_icon(
+            self,
+            bg,
+            volt_ui_kit::CardIcon::Close,
+            x + w - 26. * s,
+            y + 10. * s,
+            0.8 * s,
+            SECONDARY,
+        );
 
         // The name field owns the keyboard while naming; no color is focused.
         let focus = v.naming.is_none().then_some(v.focus);
-        self.card_text(glyphs, "Base colors", x + pad, y + 49. * s, 11. * s, MUTED);
-        for (i, row) in v.rows.iter().enumerate() {
-            let rect = l.base_row(i);
-            self.draw_editor_row(bg, glyphs, l, rect, row, focus == Some(i));
-        }
+        if !l.compact || !l.picker_open {
+            self.card_text(glyphs, "Base colors", x + pad, y + 49. * s, 11. * s, MUTED);
+            for (i, row) in v.rows.iter().enumerate() {
+                let rect = l.base_row(i);
+                self.draw_editor_row(bg, glyphs, l, rect, row, focus == Some(i));
+            }
 
-        self.card_text(
-            glyphs,
-            "ANSI palette · normal, then bright",
-            x + pad,
-            y + 229. * s,
-            11. * s,
-            MUTED,
-        );
-        for (i, color) in v.ansi.iter().enumerate() {
-            let [cx, cy, cw, ch] = l.ansi_cell(i);
-            if focus == Some(BASE_FIELDS + i) {
+            self.card_text(
+                glyphs,
+                "ANSI palette · normal, then bright",
+                x + pad,
+                y + 229. * s,
+                11. * s,
+                MUTED,
+            );
+            for (i, color) in v.ansi.iter().enumerate() {
+                let [cx, cy, cw, ch] = l.ansi_cell(i);
+                if focus == Some(BASE_FIELDS + i) {
+                    self.card_round(
+                        bg,
+                        [cx - 3. * s, cy - 3. * s, cw + 6. * s, ch + 6. * s],
+                        6. * s,
+                        TEXT,
+                    );
+                    self.card_round(
+                        bg,
+                        [cx - 1.5 * s, cy - 1.5 * s, cw + 3. * s, ch + 3. * s],
+                        5. * s,
+                        PANEL,
+                    );
+                }
+                self.card_round(bg, [cx, cy, cw, ch], 4. * s, SWATCH_EDGE);
                 self.card_round(
                     bg,
-                    [cx - 3. * s, cy - 3. * s, cw + 6. * s, ch + 6. * s],
-                    6. * s,
-                    TEXT,
-                );
-                self.card_round(
-                    bg,
-                    [cx - 1.5 * s, cy - 1.5 * s, cw + 3. * s, ch + 3. * s],
-                    5. * s,
-                    PANEL,
+                    [cx + s, cy + s, cw - 2. * s, ch - 2. * s],
+                    3. * s,
+                    color.to_f32(),
                 );
             }
-            self.card_round(bg, [cx, cy, cw, ch], 4. * s, SWATCH_EDGE);
-            self.card_round(
+            let detail_focused = focus.is_some_and(|f| f >= BASE_FIELDS);
+            self.draw_editor_row(bg, glyphs, l, l.detail_row(), &v.detail, detail_focused);
+        }
+        if l.picker_visible() {
+            self.draw_color_picker(bg, glyphs, v, l);
+        }
+        if l.compact && l.picker_open {
+            use volt_ui_kit::Painter;
+            self.card_icon(
                 bg,
-                [cx + s, cy + s, cw - 2. * s, ch - 2. * s],
-                3. * s,
-                color.to_f32(),
+                volt_ui_kit::CardIcon::ArrowLeft,
+                l.back_button()[0] + 8. * s,
+                l.back_button()[1] + 6. * s,
+                s,
+                SECONDARY,
             );
         }
-        let detail_focused = focus.is_some_and(|f| f >= BASE_FIELDS);
-        self.draw_editor_row(bg, glyphs, l, l.detail_row(), &v.detail, detail_focused);
 
         self.draw_rect(
             bg,
@@ -205,33 +240,45 @@ impl Renderer {
             }
             None => {
                 let r = l.revert_button();
-                self.card_round(bg, r, 5. * s, BUTTON);
-                self.card_round(
+                volt_ui_kit::button::Button {
+                    label: "Revert",
+                    icon: Some(volt_ui_kit::CardIcon::Refresh),
+                    enabled: true,
+                }
+                .paint(
+                    self,
                     bg,
-                    [r[0] + s, r[1] + s, r[2] - 2. * s, r[3] - 2. * s],
-                    4. * s,
-                    PANEL,
+                    glyphs,
+                    r,
+                    s,
+                    volt_ui_kit::button::ButtonColors {
+                        surface: BUTTON,
+                        text: TEXT,
+                    },
                 );
-                let label_x = r[0] + (r[2] - Self::approx_text_width("Revert", 12. * s)) / 2.;
-                let ly = Self::editor_text_y(r[1], r[3], 12. * s);
-                self.card_text(glyphs, "Revert", label_x, ly, 12. * s, TEXT);
             }
         }
-        self.card_round(bg, save, 5. * s, BUTTON);
-        self.card_round(
-            bg,
-            [save[0] + s, save[1] + s, save[2] - 2. * s, save[3] - 2. * s],
-            4. * s,
-            BUTTON_FILL,
-        );
         let label = if v.naming.is_some() {
             "Save"
         } else {
             v.save_label.as_str()
         };
-        let label_x = save[0] + (save[2] - Self::approx_text_width(label, 12. * s)) / 2.;
-        let ly = Self::editor_text_y(save[1], save[3], 12. * s);
-        self.card_text(glyphs, label, label_x, ly, 12. * s, TEXT);
+        volt_ui_kit::button::Button {
+            label,
+            icon: Some(volt_ui_kit::CardIcon::Check),
+            enabled: true,
+        }
+        .paint(
+            self,
+            bg,
+            glyphs,
+            save,
+            s,
+            volt_ui_kit::button::ButtonColors {
+                surface: [0.83, 0.62, 0.18, 1.],
+                text: FIELD,
+            },
+        );
 
         let (message, color) = match &v.status {
             Some((message, true)) => (message.as_str(), ERROR),
@@ -241,6 +288,144 @@ impl Renderer {
         };
         let text = fit(message, w - 2. * pad, 11. * s);
         self.card_text(glyphs, &text, x + pad, y + 394. * s, 11. * s, color);
+    }
+
+    fn draw_color_picker(
+        &mut self,
+        bg: &mut Vec<BgVertex>,
+        g: &mut Vec<GlyphVertex>,
+        v: &ThemeEditorView,
+        l: &ThemeEditorLayout,
+    ) {
+        use crate::theme_editor::{hsv_to_rgb, rgb_to_hsv, PRESETS};
+        let s = l.scale;
+        let r = l.picker_rect();
+        self.card_text(g, &v.picked_label, r[0], l.y + 52. * s, 12. * s, TEXT);
+        self.card_round(
+            bg,
+            [r[0] + r[2] - 26. * s, l.y + 48. * s, 26. * s, 24. * s],
+            5. * s,
+            SWATCH_EDGE,
+        );
+        self.card_round(
+            bg,
+            [r[0] + r[2] - 24. * s, l.y + 50. * s, 22. * s, 20. * s],
+            4. * s,
+            v.picked.to_f32(),
+        );
+        // Small bilinear mesh: smooth color selection without textures or
+        // another device. Geometry is cached until the selected color changes.
+        for yy in 0..16 {
+            for xx in 0..16 {
+                let u = xx as f32 / 16.;
+                let v0 = yy as f32 / 16.;
+                let du = 1. / 16.;
+                self.editor_gradient(
+                    bg,
+                    [r[0] + r[2] * u, r[1] + r[3] * v0, r[2] * du, r[3] * du],
+                    [
+                        hsv_to_rgb(v.picker_hue, u, 1. - v0).to_f32(),
+                        hsv_to_rgb(v.picker_hue, u + du, 1. - v0).to_f32(),
+                        hsv_to_rgb(v.picker_hue, u + du, 1. - v0 - du).to_f32(),
+                        hsv_to_rgb(v.picker_hue, u, 1. - v0 - du).to_f32(),
+                    ],
+                );
+            }
+        }
+        let hue = l.hue_rect();
+        for i in 0..60 {
+            let a = hsv_to_rgb(i as f32 * 6., 1., 1.).to_f32();
+            let b = hsv_to_rgb((i + 1) as f32 * 6., 1., 1.).to_f32();
+            self.editor_gradient(
+                bg,
+                [
+                    hue[0] + i as f32 * hue[2] / 60.,
+                    hue[1],
+                    hue[2] / 60.,
+                    hue[3],
+                ],
+                [a, b, b, a],
+            );
+        }
+        let [_, sat, val] = rgb_to_hsv(v.picked);
+        let (cx, cy) = (r[0] + sat * r[2], r[1] + (1. - val) * r[3]);
+        self.card_round(bg, [cx - 4. * s, cy - 4. * s, 8. * s, 8. * s], 4. * s, TEXT);
+        self.card_round(
+            bg,
+            [cx - 2. * s, cy - 2. * s, 4. * s, 4. * s],
+            2. * s,
+            FIELD,
+        );
+        let hx = hue[0] + hue[2] * v.picker_hue / 360.;
+        self.card_round(
+            bg,
+            [hx - 3. * s, hue[1] - 2. * s, 6. * s, hue[3] + 4. * s],
+            3. * s,
+            TEXT,
+        );
+        let picker_theme = volt_config::Theme::dark();
+        for (i, (name, value)) in [("R", v.picked.r), ("G", v.picked.g), ("B", v.picked.b)]
+            .into_iter()
+            .enumerate()
+        {
+            let track = l.channel_rect(i);
+            let channel_color = [PRESETS[0], PRESETS[4], PRESETS[6]][i];
+            self.card_text(g, name, r[0], track[1], 11. * s, channel_color.to_f32());
+            self.draw_toolkit_slider(bg, g, track, s, [value as f32, 0., 255.], &picker_theme);
+            self.card_text(
+                g,
+                &value.to_string(),
+                r[0] + r[2] - 30. * s,
+                track[1],
+                11. * s,
+                SECONDARY,
+            );
+        }
+        for (i, color) in PRESETS.into_iter().enumerate() {
+            let p = l.preset_rect(i);
+            self.card_round(
+                bg,
+                p,
+                4. * s,
+                if color == v.picked { TEXT } else { SWATCH_EDGE },
+            );
+            self.card_round(
+                bg,
+                [p[0] + s, p[1] + s, p[2] - 2. * s, p[3] - 2. * s],
+                3. * s,
+                color.to_f32(),
+            );
+        }
+    }
+    fn editor_gradient(&self, b: &mut Vec<BgVertex>, r: [f32; 4], colors: [[f32; 4]; 4]) {
+        let pos = |x: f32, y: f32| {
+            [
+                x / self.config.width as f32 * 2. - 1.,
+                1. - y / self.config.height as f32 * 2.,
+            ]
+        };
+        let a = BgVertex {
+            pos: pos(r[0], r[1]),
+            color: colors[0],
+        };
+        let c = BgVertex {
+            pos: pos(r[0] + r[2], r[1] + r[3]),
+            color: colors[2],
+        };
+        b.extend_from_slice(&[
+            a,
+            BgVertex {
+                pos: pos(r[0] + r[2], r[1]),
+                color: colors[1],
+            },
+            c,
+            a,
+            c,
+            BgVertex {
+                pos: pos(r[0], r[1] + r[3]),
+                color: colors[3],
+            },
+        ]);
     }
 
     fn draw_editor_row(

@@ -338,6 +338,7 @@ pub struct PaneDivider {
 /// volt-renderer has no knowledge of `volt-ui`'s `TextPrompt` type, so the
 /// caller flattens it into this small POD struct each frame.
 pub struct PromptOverlay<'a> {
+    pub task_review: Option<&'a crate::task_review::TaskReview>,
     pub title: &'a str,
     pub text: &'a str,
     /// Read-only destination preview; enable bounded horizontal paging.
@@ -418,6 +419,7 @@ pub struct Renderer {
     search_palette_cache: Option<search_palette_draw::SearchGeometry>,
     pub workspace_card: Option<crate::workspace_card::WorkspaceCard>,
     workspace_card_cache: Option<workspace_card_draw::CardGeometry>,
+    workspace_layout_cache: std::cell::RefCell<Option<workspace_card_draw::LayoutCache>>,
     /// Theme editor panel; drawn in the top layer, above the search palette.
     pub theme_editor: Option<crate::theme_editor::ThemeEditorView>,
     theme_editor_cache: Option<theme_editor_draw::EditorGeometry>,
@@ -433,6 +435,7 @@ pub struct Renderer {
     /// Task buttons where the workspace card sits while it's closed.
     pub task_strip: Option<crate::task_strip::TaskStripView>,
     task_form_cache: Option<task_form_draw::FormGeometry>,
+    task_review_cache: Option<task_review_draw::ReviewGeometry>,
     task_strip_cache: Option<task_strip_draw::StripGeometry>,
     row_cache: Vec<CachedRow>,
     cache_context: Option<([f32; 8], Theme, CursorStyle)>,
@@ -835,6 +838,7 @@ impl Renderer {
             search_palette_cache: None,
             workspace_card: None,
             workspace_card_cache: None,
+            workspace_layout_cache: std::cell::RefCell::new(None),
             theme_editor: None,
             theme_editor_cache: None,
             settings: None,
@@ -847,6 +851,7 @@ impl Renderer {
             task_form: None,
             task_strip: None,
             task_form_cache: None,
+            task_review_cache: None,
             task_strip_cache: None,
             tab_bar_height,
             custom_tab_bar: true,
@@ -1040,6 +1045,7 @@ impl Renderer {
         self.search_palette_cache = None;
         self.theme_editor_cache = None;
         self.task_form_cache = None;
+        self.task_review_cache = None;
         self.settings_cache = None;
         self.task_strip_cache = None;
         self.shape_cache.clear();
@@ -1737,6 +1743,7 @@ impl Renderer {
             self.search_palette_cache = None;
             self.theme_editor_cache = None;
             self.task_form_cache = None;
+            self.task_review_cache = None;
             self.settings_cache = None;
             self.task_strip_cache = None;
             self.row_cache.clear();
@@ -2622,7 +2629,12 @@ impl Renderer {
             );
         }
 
-        if let Some(p) = prompt.as_ref() {
+        if prompt.as_ref().is_none_or(|p| p.task_review.is_none()) {
+            self.task_review_cache = None;
+        }
+        if let Some(v) = prompt.as_ref().and_then(|p| p.task_review) {
+            self.draw_task_review(&mut bg_verts, &mut glyph_verts, v, theme);
+        } else if let Some(p) = prompt.as_ref() {
             let box_w = (420.0 * self.scale_factor).min((sw - 40.0).max(200.0));
             let box_h = 72.0 * self.scale_factor;
             let box_x = (sw - box_w) / 2.0;
@@ -3040,6 +3052,8 @@ pub use settings_gpu::SettingsGpuStats;
 mod settings_draw;
 #[path = "task_form_draw.rs"]
 mod task_form_draw;
+#[path = "task_review_draw.rs"]
+mod task_review_draw;
 #[path = "task_strip_draw.rs"]
 mod task_strip_draw;
 #[path = "theme_editor_draw.rs"]

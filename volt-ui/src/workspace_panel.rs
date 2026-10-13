@@ -12,7 +12,7 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant},
 };
-use volt_renderer::workspace_card::{CardIcon, CardRow, CardTone, WorkspaceCard};
+use volt_renderer::workspace_card::{BlockKind, CardIcon, CardRow, CardTone, WorkspaceCard};
 use winit::event_loop::EventLoopProxy;
 
 #[derive(Clone, Debug, Default)]
@@ -159,17 +159,6 @@ impl WorkspacePanel {
                 };
                 self.scroll = 0;
                 self.selected_file = None;
-            }
-        }
-        // Bring newly disclosed content into view instead of expanding below
-        // the fold at the bottom of a short window.
-        if self.expanded == Some(id)
-            || self.selected_item == Some(id)
-            || ((1000..1032).contains(&id) && self.selected_task.is_some())
-            || ((200..300).contains(&id) && self.selected_file == Some(id - 200))
-        {
-            if let Some(row) = self.card().rows.iter().position(|r| r.action == Some(id)) {
-                self.scroll = row.saturating_sub(1);
             }
         }
     }
@@ -413,29 +402,13 @@ impl WorkspacePanel {
             scroll: self.scroll,
             ..Default::default()
         };
-        let mut row = |label: &str, detail: &str, icon, action, section, expanded| {
-            card.rows.push(CardRow {
-                label: safe_label(
-                    label,
-                    if icon == CardIcon::Notice {
-                        160
-                    } else if detail.is_empty() {
-                        27
-                    } else {
-                        27usize.saturating_sub(
-                            unicode_width::UnicodeWidthStr::width(detail).min(14) + 2,
-                        )
-                    },
-                ),
-                detail: safe_label(detail, 14),
-                icon,
-                action,
-                section,
-                expanded,
-                tone: CardTone::Muted,
-                diff: None,
-            })
-        };
+        macro_rules! row {
+            ($label:expr, $detail:expr, $icon:expr, $action:expr, $section:expr, $expanded:expr $(,)?) => {
+                card.rows.push(CardRow::new(
+                    $label, $detail, $icon, $action, $section, $expanded,
+                ))
+            };
+        }
         for (id, label, icon) in [
             (0, "Changes", CardIcon::Branch),
             (5, "Project", CardIcon::Folder),
@@ -485,7 +458,7 @@ impl WorkspacePanel {
                 },
                 _ => String::new(),
             };
-            row(label, &detail, icon, Some(id), true, expanded);
+            row!(label, &detail, icon, Some(id), true, expanded);
             if !expanded {
                 continue;
             }
@@ -493,7 +466,7 @@ impl WorkspacePanel {
                 0 => {
                     if let Some(s) = s {
                         if s.files.is_empty() {
-                            row(
+                            row!(
                                 if s.error.is_some() {
                                     "Repository unavailable"
                                 } else {
@@ -507,8 +480,8 @@ impl WorkspacePanel {
                             );
                         }
                         for (i, (status, path)) in s.files.iter().take(100).enumerate() {
-                            row(
-                                &safe_label(path, 22),
+                            row!(
+                                path,
                                 status,
                                 CardIcon::File,
                                 Some(200 + i),
@@ -516,26 +489,23 @@ impl WorkspacePanel {
                                 self.selected_file == Some(i),
                             );
                             if self.selected_file == Some(i) {
-                                row(
-                                    &format!("Index: {}", status_name(status.as_bytes()[0])),
+                                row!(
+                                    &format!(
+                                        "Index: {}\nWorking tree: {}",
+                                        status_name(status.as_bytes()[0]),
+                                        status_name(status.as_bytes()[1])
+                                    ),
                                     "",
                                     CardIcon::File,
                                     None,
                                     false,
-                                    false,
+                                    false
                                 );
-                                row(
-                                    &format!("Worktree: {}", status_name(status.as_bytes()[1])),
-                                    "",
-                                    CardIcon::File,
-                                    None,
-                                    false,
-                                    false,
-                                );
+                                card.rows.last_mut().unwrap().kind = BlockKind::Paragraph;
                             }
                         }
                         if s.files.len() > 100 {
-                            row(
+                            row!(
                                 "First 100 changes shown",
                                 "",
                                 CardIcon::File,
@@ -545,7 +515,7 @@ impl WorkspacePanel {
                             );
                         }
                     } else {
-                        row(
+                        row!(
                             "Reading repository…",
                             "",
                             CardIcon::Folder,
@@ -557,58 +527,14 @@ impl WorkspacePanel {
                 }
                 1 => {
                     if let Some(message) = &self.task_message {
-                        row(message, "", CardIcon::Notice, None, false, false);
+                        row!(message, "", CardIcon::Notice, None, false, false);
                     }
                     if let Some(custom) = &self.custom_tasks {
                         if let Some(problem) = &custom.problem {
-                            for line in display_lines(problem) {
-                                row(&line, "", CardIcon::File, None, false, false);
-                            }
-                        } else if !custom.tasks.is_empty() && !custom.trusted {
-                            // Someone else's commands: show them all before anything runs.
-                            row(
-                                "Review before running:",
-                                "",
-                                CardIcon::File,
-                                None,
-                                false,
-                                false,
-                            );
-                            for (i, task) in custom.tasks.iter().enumerate() {
-                                row(
-                                    &task.name,
-                                    crate::tasks::find_run(
-                                        self.task_run.as_ref(),
-                                        &self.task_results,
-                                        &custom.root,
-                                        task,
-                                    )
-                                    .map(|r| crate::tasks::state_label(r.state))
-                                    .unwrap_or("Review"),
-                                    CardIcon::Play,
-                                    Some(TASK_ROWS + i),
-                                    false,
-                                    false,
-                                );
-                                for line in task_command_lines(&format!("Command: {}", task.run)) {
-                                    row(&line, "", CardIcon::File, None, false, false);
-                                }
-                                for line in display_lines(&format!(
-                                    "In: {}",
-                                    task.cwd.as_deref().unwrap_or("Project folder")
-                                )) {
-                                    row(&line, "", CardIcon::Folder, None, false, false);
-                                }
-                            }
-                            row(
-                                "Trust these tasks",
-                                "",
-                                CardIcon::Play,
-                                Some(TRUST_ROW),
-                                false,
-                                false,
-                            );
+                            row!(problem, "", CardIcon::Notice, None, false, false);
                         } else {
+                            // Keep this an actionable list. Full commands and
+                            // permissions belong in the read-only review dialog.
                             for (i, task) in custom.tasks.iter().enumerate() {
                                 let status = crate::tasks::find_run(
                                     self.task_run.as_ref(),
@@ -617,8 +543,8 @@ impl WorkspacePanel {
                                     task,
                                 )
                                 .map(|r| crate::tasks::state_label(r.state))
-                                .unwrap_or("");
-                                row(
+                                .unwrap_or(if custom.trusted { "" } else { "Review" });
+                                row!(
                                     &task.name,
                                     status,
                                     CardIcon::Play,
@@ -627,8 +553,18 @@ impl WorkspacePanel {
                                     false,
                                 );
                             }
+                            if !custom.trusted && !custom.tasks.is_empty() {
+                                row!(
+                                    "Review permissions",
+                                    "",
+                                    CardIcon::File,
+                                    Some(TRUST_ROW),
+                                    false,
+                                    false,
+                                );
+                            }
                         }
-                        row(
+                        row!(
                             "Add task",
                             "",
                             CardIcon::Plus,
@@ -637,7 +573,7 @@ impl WorkspacePanel {
                             false,
                         );
                         if custom.file().exists() || custom.problem.is_some() {
-                            row(
+                            row!(
                                 "Edit tasks file",
                                 "",
                                 CardIcon::Edit,
@@ -650,7 +586,7 @@ impl WorkspacePanel {
                     if let (Some(s), Some(custom)) = (s, &self.custom_tasks) {
                         let suggestions = crate::tasks::suggested_tasks(&s.project.tasks, custom);
                         if !suggestions.is_empty() {
-                            row(
+                            row!(
                                 "Suggested tasks",
                                 &suggestions.len().to_string(),
                                 CardIcon::Plus,
@@ -664,7 +600,7 @@ impl WorkspacePanel {
                         }
                         for (i, _) in suggestions {
                             let task = &s.project.tasks[i];
-                            row(
+                            row!(
                                 &task.label,
                                 "",
                                 CardIcon::Plus,
@@ -673,21 +609,25 @@ impl WorkspacePanel {
                                 self.selected_task.as_ref() == Some(task),
                             );
                             if self.selected_task.as_ref() == Some(task) {
-                                for line in
-                                    task_command_lines(&format!("Command: {}", task.argv.join(" ")))
-                                        .into_iter()
-                                        .chain(display_lines(&format!(
-                                            "In: {}",
-                                            task.cwd.display()
-                                        )))
-                                        .chain(display_lines(&format!(
-                                            "Definition: {}",
-                                            task.definition
-                                        )))
-                                {
-                                    row(&line, "", CardIcon::File, None, false, false);
-                                }
-                                row(
+                                row!(&task.argv.join(" "), "", CardIcon::File, None, false, false);
+                                card.rows.last_mut().unwrap().kind = BlockKind::Code;
+                                row!(
+                                    &format!("Directory\n{}", task.cwd.display()),
+                                    "",
+                                    CardIcon::Folder,
+                                    None,
+                                    false,
+                                    false
+                                );
+                                row!(
+                                    &format!("Defined in {}", task.definition),
+                                    "",
+                                    CardIcon::File,
+                                    None,
+                                    false,
+                                    false
+                                );
+                                row!(
                                     "Add to tasks file",
                                     "",
                                     CardIcon::Plus,
@@ -701,22 +641,36 @@ impl WorkspacePanel {
                 }
                 5 => {
                     if let Some(s) = s {
-                        for line in display_lines(&s.project.root.display().to_string()) {
-                            row(&line, "", CardIcon::Folder, None, false, false);
-                        }
-                        for tag in &s.project.tags {
-                            row(tag, "Detected", CardIcon::File, None, false, false);
-                        }
+                        row!(
+                            &format!(
+                                "{}\n{}",
+                                if s.repository {
+                                    "Repository root"
+                                } else {
+                                    "Project root"
+                                },
+                                s.project.root.display()
+                            ),
+                            "",
+                            CardIcon::Folder,
+                            None,
+                            false,
+                            false
+                        );
+                        // Project tags already appear in the card subtitle. Do
+                        // not turn each discovery signal into another file item.
                         for file in &s.project.evidence {
-                            row(file, "Found", CardIcon::File, None, false, false);
+                            row!(file, "Manifest", CardIcon::File, None, false, false);
                         }
                     }
                 }
                 6 => {
                     if let Some(s) = s {
-                        row(&s.branch, "Current", CardIcon::Branch, None, false, false);
+                        if s.git_details.branches.is_empty() {
+                            row!(&s.branch, "Current", CardIcon::Branch, None, false, false);
+                        }
                         if s.git_details.upstream.is_empty() {
-                            row(
+                            row!(
                                 "No upstream configured",
                                 "",
                                 CardIcon::Link,
@@ -725,13 +679,16 @@ impl WorkspacePanel {
                                 false,
                             );
                         } else {
-                            for line in
-                                display_lines(&format!("Upstream: {}", s.git_details.upstream))
-                            {
-                                row(&line, "", CardIcon::Link, None, false, false);
-                            }
+                            row!(
+                                &format!("Upstream\n{}", s.git_details.upstream),
+                                "",
+                                CardIcon::Link,
+                                None,
+                                false,
+                                false
+                            );
                             if let Some((a, b)) = s.git_details.ahead_behind {
-                                row(
+                                row!(
                                     &format!("Ahead {a} · behind {b}"),
                                     "",
                                     CardIcon::Branch,
@@ -740,7 +697,7 @@ impl WorkspacePanel {
                                     false,
                                 );
                             }
-                            row(
+                            row!(
                                 "Compared with local refs",
                                 "",
                                 CardIcon::Link,
@@ -750,7 +707,7 @@ impl WorkspacePanel {
                             );
                         }
                         if matches!(self.pull_request, Some(PrState::Unavailable)) {
-                            row(
+                            row!(
                                 "GitHub status unavailable",
                                 "",
                                 CardIcon::Link,
@@ -760,7 +717,7 @@ impl WorkspacePanel {
                             );
                         }
                         if matches!(self.pull_request, Some(PrState::None)) {
-                            row(
+                            row!(
                                 "No PR for this branch",
                                 "",
                                 CardIcon::Link,
@@ -770,7 +727,7 @@ impl WorkspacePanel {
                             );
                         }
                         for (i, b) in s.git_details.branches.iter().enumerate() {
-                            row(
+                            row!(
                                 &b.name,
                                 if b.current { "Current" } else { "" },
                                 CardIcon::Branch,
@@ -779,12 +736,15 @@ impl WorkspacePanel {
                                 self.selected_item == Some(4000 + i),
                             );
                             if self.selected_item == Some(4000 + i) {
-                                for line in display_lines(&format!(
-                                    "{} {} {}",
-                                    b.name, b.upstream, b.tracking
-                                )) {
-                                    row(&line, "", CardIcon::Branch, None, false, false);
-                                }
+                                row!(
+                                    &format!("Upstream: {}\n{}", b.upstream, b.tracking),
+                                    "",
+                                    CardIcon::Branch,
+                                    None,
+                                    false,
+                                    false
+                                );
+                                card.rows.last_mut().unwrap().kind = BlockKind::Paragraph;
                             }
                         }
                     }
@@ -793,7 +753,7 @@ impl WorkspacePanel {
                     if let Some(s) = s {
                         for (i, w) in s.git_details.worktrees.iter().enumerate() {
                             let current = w.path == s.root;
-                            row(
+                            row!(
                                 &w.branch,
                                 if current {
                                     "Current"
@@ -809,28 +769,31 @@ impl WorkspacePanel {
                                 false,
                                 false,
                             );
-                            for line in display_lines(&w.path.display().to_string()) {
-                                row(&line, "", CardIcon::Folder, None, false, false);
-                            }
+                            row!(
+                                &w.path.display().to_string(),
+                                "",
+                                CardIcon::Folder,
+                                None,
+                                false,
+                                false
+                            );
                         }
                     }
                 }
                 8 => {
                     if let Some(PrState::Found(pr)) = &self.pull_request {
-                        for line in display_lines(&pr.title) {
-                            row(&line, "", CardIcon::Link, None, false, false);
-                        }
-                        row(&pr.state, "", CardIcon::Link, None, false, false);
-                        for line in display_lines(&pr.review) {
-                            row(&line, "", CardIcon::Link, None, false, false);
+                        row!(&pr.title, "", CardIcon::Link, None, false, false);
+                        row!(&pr.state, "", CardIcon::Link, None, false, false);
+                        if !pr.review.is_empty() {
+                            row!(&pr.review, "", CardIcon::Link, None, false, false);
                         }
                         if pr.checks.is_empty() {
-                            row("No checks reported", "", CardIcon::Link, None, false, false);
+                            row!("No checks reported", "", CardIcon::Link, None, false, false);
                         }
                         for (name, status) in &pr.checks {
-                            row(name, status, CardIcon::Link, None, false, false);
+                            row!(name, status, CardIcon::Link, None, false, false);
                         }
-                        row(
+                        row!(
                             "Open on GitHub",
                             "",
                             CardIcon::Link,
@@ -853,26 +816,11 @@ impl WorkspacePanel {
                                     .any(|p| p == "CLAUDE.md" || p.starts_with(".claude/"))
                             };
                             if applies {
-                                row(name, status, CardIcon::Agent, None, false, false);
+                                row!(name, status, CardIcon::Agent, None, false, false);
                             }
                         }
                     }
-                    row(
-                        "Session adapter not connected",
-                        "",
-                        CardIcon::Link,
-                        None,
-                        false,
-                        false,
-                    );
-                    row(
-                        "No context or usage inferred",
-                        "",
-                        CardIcon::File,
-                        None,
-                        false,
-                        false,
-                    );
+                    row!("No agent session connected. Context and usage are not inferred from configuration files.", "", CardIcon::Notice, None, false, false);
                 }
                 3 | 4 => {
                     if let Some(s) = s {
@@ -882,7 +830,7 @@ impl WorkspacePanel {
                             .enumerate()
                             .filter(|(_, c)| c.mcp == (id == 4))
                         {
-                            row(
+                            row!(
                                 &config.label,
                                 if config.mcp { "Configured" } else { "Found" },
                                 CardIcon::File,
@@ -891,22 +839,33 @@ impl WorkspacePanel {
                                 self.selected_item == Some(2000 + i),
                             );
                             if self.selected_item == Some(2000 + i) {
-                                for line in display_lines(&format!("Scope: {}", config.scope))
-                                    .into_iter()
-                                    .chain(display_lines(&config.path.display().to_string()))
-                                {
-                                    row(&line, "", CardIcon::Folder, None, false, false);
-                                }
+                                row!(
+                                    &format!("{} scope\n{}", config.scope, config.path.display()),
+                                    "",
+                                    CardIcon::Folder,
+                                    None,
+                                    false,
+                                    false
+                                );
                                 for server in &config.servers {
-                                    row(server, "Configured", CardIcon::Link, None, false, false);
+                                    row!(server, "Configured", CardIcon::Link, None, false, false);
                                 }
-                                for line in config
-                                    .preview
-                                    .iter()
-                                    .flat_map(|l| display_lines(l))
-                                    .take(40)
-                                {
-                                    row(&line, "", CardIcon::File, None, false, false);
+                                if !config.preview.is_empty() {
+                                    row!(
+                                        &config
+                                            .preview
+                                            .iter()
+                                            .take(40)
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                            .join("\n"),
+                                        "",
+                                        CardIcon::File,
+                                        None,
+                                        false,
+                                        false
+                                    );
+                                    card.rows.last_mut().unwrap().kind = BlockKind::Code;
                                 }
                             }
                         }
@@ -915,11 +874,11 @@ impl WorkspacePanel {
                             for config in
                                 s.configs.iter().filter(|p| p.contains("mcp") == (id == 4))
                             {
-                                row(config, "Found", CardIcon::File, None, false, false);
+                                row!(config, "Found", CardIcon::File, None, false, false);
                             }
                             if id == 4 {
                                 for name in &s.mcp_names {
-                                    row(name, "Not linked", CardIcon::Link, None, false, false);
+                                    row!(name, "Not linked", CardIcon::Link, None, false, false);
                                 }
                             }
                         }
@@ -947,6 +906,17 @@ impl WorkspacePanel {
                 if row.diff.is_some() {
                     row.detail.clear();
                 }
+            } else if row
+                .action
+                .is_some_and(|id| (TASK_ROWS..TASK_ROWS + MAX_TASK_ROWS).contains(&id))
+            {
+                row.tone = match row.detail.as_str() {
+                    "✓ Done" => CardTone::Green,
+                    "✗ Failed" => CardTone::Red,
+                    "Running…" | "Sent" | "Review" => CardTone::Amber,
+                    "Exit unknown" => CardTone::Muted,
+                    _ => CardTone::Blue,
+                };
             } else if row.action.is_some_and(|id| (200..300).contains(&id)) {
                 row.tone = git_tone(&row.detail);
             } else if matches!(
@@ -978,6 +948,7 @@ impl WorkspacePanel {
             card.rows.insert(
                 0,
                 CardRow {
+                    kind: BlockKind::Action,
                     label: "Search".into(),
                     detail: "⌘F".into(),
                     icon: CardIcon::Search,
@@ -992,41 +963,6 @@ impl WorkspacePanel {
         card
     }
 }
-fn display_lines(text: &str) -> Vec<String> {
-    display_lines_limit(text, 512)
-}
-
-// Never hide the end of a command immediately above a Trust or Import action.
-// The config parser bounds saved commands to 1,000 characters, so even the
-// maximum valid command can be inspected in the scrollable card.
-fn task_command_lines(text: &str) -> Vec<String> {
-    display_lines_limit(text, volt_config::tasks::MAX_RUN_CHARS + 64)
-}
-
-fn display_lines_limit(text: &str, max_chars: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar;
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    let mut width = 0;
-    for c in text.chars().take(max_chars) {
-        let c = if c.is_control() { ' ' } else { c };
-        let w = c.width().unwrap_or(0);
-        if width + w > 27 {
-            lines.push(std::mem::take(&mut line));
-            width = 0;
-        }
-        line.push(c);
-        width += w;
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    if text.chars().count() > max_chars {
-        lines.push("… (truncated)".into());
-    }
-    lines
-}
-
 /// Card row actions handled by the app (outside `activate`).
 pub const SEARCH_ROW: usize = 1300;
 pub const TASK_ROWS: usize = 1100;
@@ -1427,15 +1363,58 @@ mod tests {
     }
 
     #[test]
-    fn task_review_shows_the_end_of_long_commands_before_trust() {
-        let command = format!("echo {}SAFE_END", "x".repeat(900));
+    fn project_path_is_a_single_semantic_block() {
+        let root = PathBuf::from("/Users/neo/workspace/rust/terminal-public");
+        let panel = WorkspacePanel {
+            expanded: Some(5),
+            snapshot: Some(Snapshot {
+                repository: true,
+                root: root.clone(),
+                project: Project {
+                    root: root.clone(),
+                    tags: vec!["Rust".into(), "Cargo".into()],
+                    evidence: vec!["Cargo.toml".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let card = panel.card();
+        let paths: Vec<_> = card
+            .rows
+            .iter()
+            .filter(|r| r.label.contains("/Users/neo/"))
+            .collect();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].label.ends_with("terminal-public"));
+        assert_eq!(paths[0].kind, BlockKind::Metadata);
+        assert!(paths[0].action.is_none());
+        assert!(!card.rows.iter().any(|r| r.detail == "Detected"));
+        let layout =
+            volt_renderer::workspace_card::CardLayout::for_card(1000., 700., 0., 1., &card)
+                .unwrap();
+        let index = card
+            .rows
+            .iter()
+            .position(|r| r.label.contains("/Users/neo/"))
+            .unwrap();
+        assert!(layout.blocks[index].label.len() > 1);
+        assert_eq!(
+            layout.blocks[index].label.join(""),
+            paths[0].label.replace('\n', "")
+        );
+    }
+
+    #[test]
+    fn tasks_are_actions_not_command_fragments() {
         let panel = WorkspacePanel {
             expanded: Some(1),
             custom_tasks: Some(ProjectTasks {
                 root: "/repo".into(),
                 tasks: vec![TaskDef {
-                    name: "long command".into(),
-                    run: command,
+                    name: "Build".into(),
+                    run: "echo SAFE_END".into(),
                     ..Default::default()
                 }],
                 source_bytes: Some(std::sync::Arc::from(&b"reviewed"[..])),
@@ -1444,19 +1423,62 @@ mod tests {
             ..Default::default()
         };
         let card = panel.card();
-        let trust = card
+        assert_eq!(
+            card.rows
+                .iter()
+                .filter(|r| r.action == Some(TASK_ROWS))
+                .count(),
+            1
+        );
+        assert!(card
             .rows
             .iter()
-            .position(|row| row.action == Some(TRUST_ROW))
-            .unwrap();
-        assert!(card.rows[..trust]
-            .iter()
-            .map(|row| row.label.as_str())
-            .collect::<String>()
-            .contains("SAFE_END"));
-        assert!(!card.rows[..trust]
-            .iter()
-            .any(|row| row.label.contains("truncated")));
+            .any(|r| r.action == Some(TRUST_ROW) && r.label == "Review permissions"));
+        assert!(!card.rows.iter().any(|r| r.label.contains("SAFE_END")
+            || r.label.starts_with("In:")
+            || r.label.starts_with("Review before")));
+    }
+
+    #[test]
+    fn task_row_colors_follow_real_status_not_the_play_icon() {
+        let mut panel = WorkspacePanel {
+            expanded: Some(1),
+            custom_tasks: Some(ProjectTasks {
+                root: "/repo".into(),
+                tasks: vec![TaskDef {
+                    name: "Build".into(),
+                    run: "true".into(),
+                    ..Default::default()
+                }],
+                trusted: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for (state, tone) in [
+            (crate::tasks::RunState::Running, CardTone::Amber),
+            (crate::tasks::RunState::Finished(0), CardTone::Green),
+            (crate::tasks::RunState::Finished(1), CardTone::Red),
+            (crate::tasks::RunState::Unknown, CardTone::Muted),
+        ] {
+            panel.task_run = Some(crate::tasks::TaskRun {
+                name: "Build".into(),
+                command: "true".into(),
+                cwd: None,
+                root: "/repo".into(),
+                state,
+                sent_at: Instant::now(),
+            });
+            let card = panel.card();
+            assert_eq!(
+                card.rows
+                    .iter()
+                    .find(|r| r.action == Some(TASK_ROWS))
+                    .unwrap()
+                    .tone,
+                tone
+            );
+        }
     }
 
     #[test]

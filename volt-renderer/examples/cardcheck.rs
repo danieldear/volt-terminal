@@ -42,6 +42,7 @@ fn main() -> Result<()> {
                 subtitle: "Visual regression fixture".into(),
                 rows: vec![
                     CardRow {
+                        kind: volt_renderer::workspace_card::BlockKind::Notice,
                         label:
                             "A command is running. Wait for it to finish before starting a task."
                                 .into(),
@@ -54,6 +55,7 @@ fn main() -> Result<()> {
                         diff: None,
                     },
                     CardRow {
+                        kind: volt_renderer::workspace_card::BlockKind::Section,
                         label: "Changes".into(),
                         detail: "3".into(),
                         icon: CardIcon::Branch,
@@ -64,6 +66,7 @@ fn main() -> Result<()> {
                         diff: Some((42, 7)),
                     },
                     CardRow {
+                        kind: volt_renderer::workspace_card::BlockKind::Section,
                         label: "Agent".into(),
                         detail: "Not connected".into(),
                         icon: CardIcon::Agent,
@@ -74,6 +77,7 @@ fn main() -> Result<()> {
                         diff: None,
                     },
                     CardRow {
+                        kind: volt_renderer::workspace_card::BlockKind::Section,
                         label: "Context".into(),
                         detail: String::new(),
                         icon: CardIcon::File,
@@ -84,6 +88,7 @@ fn main() -> Result<()> {
                         diff: None,
                     },
                     CardRow {
+                        kind: volt_renderer::workspace_card::BlockKind::Section,
                         label: "Local models".into(),
                         detail: String::new(),
                         icon: CardIcon::Server,
@@ -173,6 +178,14 @@ fn main() -> Result<()> {
             png.set_depth(png::BitDepth::Eight);
             png.write_header()?.write_image_data(&minimized)?;
             r.workspace_card.as_mut().unwrap().minimized = false;
+            let prior_layout = r.workspace_card_layout().unwrap();
+            r.workspace_card.as_mut().unwrap().hover = Some(100);
+            let hover_layout = r.workspace_card_layout().unwrap();
+            anyhow::ensure!(
+                std::sync::Arc::ptr_eq(&prior_layout, &hover_layout),
+                "hover unnecessarily rewraps workspace content"
+            );
+            r.workspace_card.as_mut().unwrap().hover = None;
             r.workspace_card.as_mut().unwrap().floating = true;
             r.workspace_card.as_mut().unwrap().position = Some([120., 60.]);
             anyhow::ensure!(
@@ -219,6 +232,59 @@ fn main() -> Result<()> {
                 r.grid_size() == (cols, rows),
                 "floating collapse resizes TUI"
             );
+            cases += 1;
+            r.workspace_card.as_mut().unwrap().minimized = false;
+            let mut code = CardRow::new(
+                &format!("{}SAFE_END", "preview line 日本\n".repeat(80)),
+                "",
+                CardIcon::File,
+                None,
+                false,
+                false,
+            );
+            code.kind = volt_renderer::workspace_card::BlockKind::Code;
+            r.workspace_card.as_mut().unwrap().rows = vec![
+                CardRow::new("Project", "", CardIcon::Folder, Some(5), true, true),
+                CardRow::new(
+                    "Repository root\n/Users/neo/workspace/rust/terminal-public",
+                    "",
+                    CardIcon::Folder,
+                    None,
+                    false,
+                    false,
+                ),
+                code,
+                CardRow::new("Add task", "", CardIcon::Plus, Some(1202), false, false),
+            ];
+            r.workspace_card.as_mut().unwrap().scroll = usize::MAX;
+            let end_layout = r.workspace_card_layout().unwrap();
+            anyhow::ensure!(
+                end_layout.blocks.len() == 4,
+                "wrapped content turned into extra items"
+            );
+            let action = &end_layout.blocks[3];
+            let action_rect = end_layout.block_rect(action);
+            anyhow::ensure!(
+                end_layout.hit(
+                    action_rect[0] + 10. * scale,
+                    action_rect[1] + action_rect[3] * 0.5,
+                    r.workspace_card.as_ref().unwrap()
+                ) == Some(1202),
+                "scrolled click hits wrong action"
+            );
+            draw(&mut r, &filled);
+            let scrolled = r.read_offscreen_rgba()?;
+            draw(&mut r, &filled);
+            anyhow::ensure!(
+                scrolled == r.read_offscreen_rgba()?,
+                "scrolled cache differs"
+            );
+            let file =
+                std::fs::File::create(format!("target/cardcheck/blocks-{scale}-{height}.png"))?;
+            let mut png = png::Encoder::new(file, w, h);
+            png.set_color(png::ColorType::Rgba);
+            png.set_depth(png::BitDepth::Eight);
+            png.write_header()?.write_image_data(&scrolled)?;
             cases += 1;
             r.workspace_card = None;
             draw(&mut r, &g);

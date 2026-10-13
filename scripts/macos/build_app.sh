@@ -34,6 +34,29 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${ROOT_DIR}"
+APP_DIR="${ROOT_DIR}/target/macos/Volt.app"
+USER_APPS_DIR="${HOME}/Applications"
+INSTALL_APP="${USER_APPS_DIR}/Volt.app"
+
+ensure_closed() {
+  local bin="$1/Contents/MacOS/Volt"
+  if ps -axo command | awk -v bin="$bin" '$0==bin || index($0,bin" ")==1 {found=1} END {exit !found}'; then
+    echo "Close Volt before replacing its running bundle: $1" >&2
+    exit 1
+  fi
+}
+ensure_closed "${APP_DIR}"
+if [[ "${INSTALL_TO_USER_APPS}" == "true" ]]; then
+  ensure_closed "${INSTALL_APP}"
+  if [[ -e "${INSTALL_APP}" ]]; then
+    ID="$(plutil -extract CFBundleIdentifier raw "${INSTALL_APP}/Contents/Info.plist")"
+    [[ "${ID}" == rs.volt.terminal ]] || {
+      echo "Refusing to replace an unrelated app: ${INSTALL_APP}" >&2
+      exit 1
+    }
+  fi
+fi
 
 if [[ "$MODE" == "release" ]]; then
   BUILD_ARGS=(build --locked --release -p volt)
@@ -66,14 +89,17 @@ if [[ -z "${VERSION}" ]]; then
   VERSION="0.1.0"
 fi
 
-APP_DIR="${ROOT_DIR}/target/macos/Volt.app"
-CONTENTS_DIR="${APP_DIR}/Contents"
+mkdir -p "${ROOT_DIR}/target/macos"
+STAGE="$(mktemp -d "${ROOT_DIR}/target/macos/stage.XXXXXX")"
+INSTALL_STAGE=""
+trap 'rm -rf "${STAGE}"; if [[ -n "${INSTALL_STAGE}" ]]; then rm -rf "${INSTALL_STAGE}"; fi' EXIT
+STAGED_APP="${STAGE}/Volt.app"
+CONTENTS_DIR="${STAGED_APP}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 PLIST_PATH="${CONTENTS_DIR}/Info.plist"
 
 echo "Creating app bundle at ${APP_DIR}..."
-rm -rf "${APP_DIR}"
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 mkdir -p "${RESOURCES_DIR}/shell-integration"
 cp "${ROOT_DIR}/scripts/shell-integration/volt."* "${RESOURCES_DIR}/shell-integration/"
@@ -121,17 +147,36 @@ ${ICON_KEY}
 </plist>
 EOF
 
+bash "${SCRIPT_DIR}/sign_app.sh" "${STAGED_APP}" adhoc
+ensure_closed "${APP_DIR}"
+rm -rf "${APP_DIR}"
+mv "${STAGED_APP}" "${APP_DIR}"
+LAUNCH_APP="${APP_DIR}"
+
 if [[ "${INSTALL_TO_USER_APPS}" == "true" ]]; then
-  USER_APPS_DIR="${HOME}/Applications"
   mkdir -p "${USER_APPS_DIR}"
-  rm -rf "${USER_APPS_DIR}/Volt.app"
-  cp -R "${APP_DIR}" "${USER_APPS_DIR}/Volt.app"
-  echo "Installed to ${USER_APPS_DIR}/Volt.app"
+  INSTALL_STAGE="$(mktemp -d "${USER_APPS_DIR}/.volt-install.XXXXXX")"
+  ditto "${APP_DIR}" "${INSTALL_STAGE}/Volt.app"
+  codesign --verify --deep --strict "${INSTALL_STAGE}/Volt.app"
+  ensure_closed "${INSTALL_APP}"
+  BACKUP=""
+  if [[ -e "${INSTALL_APP}" ]]; then
+    mkdir -p "${ROOT_DIR}/target/macos/install-backups"
+    BACKUP="$(mktemp -d "${ROOT_DIR}/target/macos/install-backups/previous.XXXXXX")"
+    mv "${INSTALL_APP}" "${BACKUP}/Volt.app"
+  fi
+  if ! mv "${INSTALL_STAGE}/Volt.app" "${INSTALL_APP}"; then
+    if [[ -n "${BACKUP}" ]]; then mv "${BACKUP}/Volt.app" "${INSTALL_APP}"; fi
+    exit 1
+  fi
+  LAUNCH_APP="${INSTALL_APP}"
+  echo "Installed to ${INSTALL_APP}"
+  if [[ -n "${BACKUP}" ]]; then echo "Previous app saved at ${BACKUP}"; fi
 fi
 
 echo "Done: ${APP_DIR}"
 echo "Open from Finder to launch Volt directly as a GUI app (no Terminal window)."
 
 if [[ "${OPEN_AFTER_BUILD}" == "true" ]]; then
-  open "${APP_DIR}"
+  open "${LAUNCH_APP}"
 fi

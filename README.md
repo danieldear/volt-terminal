@@ -300,8 +300,9 @@ confirm = true          # optional: show the command and ask before each run
   Its buttons show a shield: clicking one previews that command and its folder,
   Enter runs it **once**, and Escape cancels. That doesn't trust the file or
   its other tasks.
-- For one-click runs, review every command in the card and choose **Trust these
-  tasks**. Any change to the file invalidates trust and pending confirmations.
+- For one-click runs, choose **Review permissions** in the Tasks section.
+  Inspect every command in the scrollable dialog, then choose **Trust tasks**.
+  Trusting a file does not run anything; `confirm = true` still asks each time. Any change to the file invalidates trust and pending confirmations.
 - Tasks you add in Volt to a new or already trusted file are trusted
   automatically. Adding a task never trusts commands you haven't reviewed.
 - Each command must be a single line. Symlinked files or `.volt` folders,

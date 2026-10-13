@@ -17,6 +17,7 @@ pub mod task_form;
 pub mod task_strip;
 
 mod prompt_viewport;
+pub mod task_review;
 
 pub mod settings;
 
