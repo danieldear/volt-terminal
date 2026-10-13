@@ -16,8 +16,9 @@ cargo run --locked -p volt-renderer --example uigpucheck --features ui-gpu-proto
 PNG pairs and `report.json` are written under `target/uigpucheck`. The preview
 uses actual toolkit select/toggle/slider/button components and ordinary Rust
 callbacks. Apply and Reset change only the disposable preview state, not Volt's
-configuration; Build does not execute a command. It uses a native decorated
-window, not Volt's custom tab/window host.
+configuration; Build does not execute a command. It uses a compact hidden-title
+macOS window with native traffic lights, matching Volt’s window-attribute
+policy, but remains a separate toolkit host—not Volt’s custom tab/window host.
 
 ## Architecture boundary
 
@@ -98,3 +99,24 @@ legacy renderer visual/cache gate. No cross-renderer speedup is claimed.
   above; differences are not relabeled as exact matches.
 - v0.1.15 is already published and unchanged. This prototype remains on its
   separate branch; no production renderer switch or new release is implied.
+
+## Window appearance correction — 2026-10-13
+
+The original native preview was visually rejected. Its OS-following theme
+allowed light native chrome and light default controls to appear on a custom
+dark background. The offscreen checks did not catch this because they supplied
+an explicit theme; this was a native-host integration gap, not a renderer fault.
+
+The prototype now explicitly derives every component token from its current
+palette, requests dark native window appearance, and uses `CompactOverlay`
+(transparent title bar, full-size content and hidden title). A reserved empty
+header provides a drag region without putting controls under the native traffic
+lights. The giant caption and redundant window-sized card border are removed;
+the preview starts at 680×500 logical pixels rather than 680×580.
+
+Two opt-in regression tests cover window policy and palette independence from
+OS light/dark mode. The updated 24 GPU cases passed. Native QA confirmed visible
+colored traffic lights in the focused window, no white title strip, readable
+neutral controls and palette changes without mixed light/dark tokens. These
+changes affect only the standalone prototype; v0.1.15 remains unchanged.
+Timings from different preview dimensions must not be treated as a speedup.

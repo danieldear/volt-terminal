@@ -4,9 +4,12 @@ use anyhow::{anyhow, ensure, Result};
 use std::{path::Path, time::Instant};
 use volt_ui_kit::{
     declarative::{Bindings, PaintBatch, Runtime},
-    native::{Application, GpuOffscreenRenderer, RasterPainter, RendererPreference},
+    native::{
+        Application, GpuOffscreenRenderer, NativeOptions, RasterPainter, RendererPreference,
+        SurfaceOptions, WindowChrome,
+    },
     ui::{column, prelude::*, row},
-    Painter, Rect, Theme, Viewport,
+    Painter, Rect, Theme, ThemeMode, UiTheme, Viewport,
 };
 
 type Batch = PaintBatch<<RasterPainter as Painter>::Shape, <RasterPainter as Painter>::Glyph>;
@@ -44,12 +47,19 @@ fn hex(c: [f32; 4]) -> String {
 fn view(s: &Draft) -> Element<Draft> {
     let c = volt_ui_kit::style::Colors::from_theme(&s.theme);
     column(vec![
-        text("Volt · UI renderer prototype")
-            .font_size(23.)
-            .font_weight(600)
+        // Match Volt’s compact hidden-title window; keep controls out of the
+        // native traffic-light area and give empty chrome a real drag region.
+        row::<Draft>(vec![])
+            .key("window-drag")
+            .height(24.)
+            .drag_region(true)
             .into(),
-        text("Isolated preview — no terminal or configuration changes")
-            .font_size(12.)
+        text("Renderer preview")
+            .font_size(19.)
+            .font_weight(400)
+            .into(),
+        text("Isolated UI test • no saved settings changed")
+            .font_size(11.)
             .color(hex(c.muted))
             .into(),
         separator().background(hex(c.border)).into(),
@@ -166,15 +176,13 @@ fn view(s: &Draft) -> Element<Draft> {
         .gap(12., Axis::Both)
         .into(),
     ])
-    .padding(24., Edge::All)
-    .gap(14., Axis::Both)
+    .padding(20., Edge::All)
+    .padding(6., Edge::Top)
+    .gap(12., Axis::Both)
     .font_family("SF Mono")
     .font_size(14.)
     .color(hex(c.text))
-    .background(hex(c.panel))
-    .border_color(hex(c.border))
-    .border_width(1.)
-    .rounded(14.)
+    .background(hex(s.theme.background))
     .into()
 }
 fn scene(p: &mut RasterPainter, draft: &Draft, viewport: Viewport) -> Result<Vec<Batch>> {
@@ -215,7 +223,7 @@ fn probe(out: &Path) -> Result<()> {
     println!("Vello UI probe: {}", gpu.adapter_name);
     let mut results = vec![];
     for scale in [1., 1.5, 2.] {
-        let vp = Viewport::new(680. * scale, 580. * scale, scale).unwrap();
+        let vp = Viewport::new(680. * scale, 500. * scale, scale).unwrap();
         let mut p = RasterPainter::new(vp);
         for name in ["gruvbox", "catppuccin", "dracula", "light"] {
             let t = palette(name);
@@ -339,6 +347,19 @@ fn probe(out: &Path) -> Result<()> {
     );
     Ok(())
 }
+fn preview_options() -> SurfaceOptions {
+    NativeOptions {
+        title: "Volt UI GPU Prototype".into(),
+        size: [680, 500],
+        document_path: None,
+    }
+    .with_chrome(WindowChrome::CompactOverlay)
+    .with_theme(ThemeMode::Dark)
+    .with_reduced_motion(true)
+}
+fn preview_theme(state: &Draft, _system: ThemeMode) -> UiTheme {
+    UiTheme::from_legacy(&state.theme)
+}
 fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("--interactive") => Application::new(
@@ -346,7 +367,11 @@ fn main() -> Result<()> {
             Draft::new(palette("gruvbox"), false),
             view,
         )
-        .size(680, 580)
+        .with_options(preview_options())
+        // The native host otherwise follows the OS light palette even when
+        // custom component backgrounds are dark. All tokens must use the same
+        // application palette, including select text and neutral buttons.
+        .theme_with(preview_theme)
         .renderer(RendererPreference::GpuRequired)
         .run()
         .map_err(|e| anyhow!(e.to_string())),
@@ -354,5 +379,27 @@ fn main() -> Result<()> {
         _ => Err(anyhow!(
             "Use no arguments for GPU checks, or --interactive for an isolated preview."
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn window_shell_keeps_compact_volt_chrome_and_dark_native_appearance() {
+        let o = preview_options();
+        assert_eq!(o.window.chrome, WindowChrome::CompactOverlay);
+        assert_eq!(o.theme, ThemeMode::Dark);
+        assert_eq!(o.window.native.size, [680, 500]);
+        assert!(o.window.reduced_motion);
+    }
+    #[test]
+    fn system_light_mode_cannot_override_component_palette() {
+        for name in ["gruvbox", "catppuccin", "dracula", "light"] {
+            let state = Draft::new(palette(name), false);
+            let expected = UiTheme::from_legacy(&state.theme);
+            assert_eq!(preview_theme(&state, ThemeMode::Light), expected);
+            assert_eq!(preview_theme(&state, ThemeMode::Dark), expected);
+        }
     }
 }
