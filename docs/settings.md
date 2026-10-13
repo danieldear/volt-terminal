@@ -114,7 +114,7 @@ frame. The Settings panel caches its geometry and adds no recurring timer.
 ```
 cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo +1.87.0 check --locked --workspace
+cargo +1.89.0 check --locked --workspace
 cargo run --locked --release -p volt-renderer --example settingscheck
 bash scripts/macos/build_app.sh --release
 ```

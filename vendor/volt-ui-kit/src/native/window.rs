@@ -489,6 +489,7 @@ fn run_host<C: 'static>(
         frames: 0,
         animation_clock: AnimationClock::new(Instant::now()),
         pacing_checked: None,
+        dev_checked: None,
         cursor: crate::declarative::Cursor::Default,
         focused: true,
         occluded: false,
@@ -600,6 +601,8 @@ struct App<C> {
     frames: u64,
     animation_clock: AnimationClock,
     pacing_checked: Option<Instant>,
+    /// Last development poll (theme file, dev restart request).
+    dev_checked: Option<Instant>,
     cursor: crate::declarative::Cursor,
     focused: bool,
     occluded: bool,
@@ -651,6 +654,59 @@ impl<C: 'static> App<C> {
     }
     /// Show the cursor the element under the pointer asks for (pointer over
     /// buttons, I-beam over text fields…). Only calls the OS on a change.
+    /// Theme-file reload and dev-restart handoff. Returns true when the app
+    /// is exiting for a restart.
+    fn dev_poll(&mut self, event_loop: &ActiveEventLoop, now: Instant) -> bool {
+        if self
+            .dev_checked
+            .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(250))
+        {
+            return false;
+        }
+        self.dev_checked = Some(now);
+        if let Some((path, seen)) = self.extensions.theme_file.as_mut() {
+            let modified = std::fs::metadata(&*path).and_then(|m| m.modified()).ok();
+            if modified.is_some() && modified != *seen {
+                *seen = modified;
+                let base = self
+                    .options
+                    .palette
+                    .clone()
+                    .unwrap_or_else(|| self.options.resolve_theme(self.system_theme).palette);
+                match std::fs::read_to_string(&*path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| crate::Palette::from_json(&text, &base))
+                {
+                    Ok(palette) => {
+                        self.options.palette = Some(palette);
+                        self.redraw();
+                    }
+                    Err(e) => eprintln!("Volt UI: theme file {}: {e}", path.display()),
+                }
+            }
+        }
+        let (Some(dir), Some(dev)) = (super::application::dev_dir(), &self.extensions.dev_state)
+        else {
+            return false;
+        };
+        let request = dir.join("restart");
+        if !request.exists() {
+            return false;
+        }
+        let _ = std::fs::write(dir.join("state"), (dev.save)(&self.context));
+        if let Some(w) = &self.window {
+            if let Ok(p) = w.outer_position() {
+                let s = w.inner_size();
+                let _ = std::fs::write(
+                    dir.join("window"),
+                    format!("{} {} {} {}", p.x, p.y, s.width, s.height),
+                );
+            }
+        }
+        let _ = std::fs::remove_file(request);
+        event_loop.exit();
+        true
+    }
     fn update_cursor(&mut self, x: f32, y: f32) {
         use crate::declarative::Cursor;
         use winit::window::CursorIcon;
@@ -1635,6 +1691,13 @@ impl<C: 'static> ApplicationHandler<HostEvent> for App<C> {
                 &w,
                 self.proxy.clone(),
             ));
+            if let Some([x, y, width, height]) = self.extensions.restore_frame.take() {
+                w.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(
+                    width.max(200) as u32,
+                    height.max(150) as u32,
+                ));
+            }
             self.system_theme = if w.theme() == Some(winit::window::Theme::Light) {
                 ThemeMode::Light
             } else {
@@ -2112,6 +2175,17 @@ impl<C: 'static> ApplicationHandler<HostEvent> for App<C> {
         }
         #[cfg(not(feature = "native-gpu"))]
         let _ = &mut deadline;
+        // Development hooks poll cheaply (a file stat) a few times a second,
+        // only when enabled.
+        if self.dev_poll(event_loop, now) {
+            return;
+        }
+        if self.extensions.theme_file.is_some()
+            || (self.extensions.dev_state.is_some() && super::application::dev_dir().is_some())
+        {
+            let next = now + Duration::from_millis(300);
+            deadline = Some(deadline.map_or(next, |d| d.min(next)));
+        }
         event_loop.set_control_flow(match deadline {
             Some(deadline) => ControlFlow::WaitUntil(deadline),
             None => ControlFlow::Wait,

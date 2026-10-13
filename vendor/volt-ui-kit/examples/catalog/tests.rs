@@ -1192,3 +1192,546 @@ fn divider_drag_cost_per_page() {
         eprintln!("PAGE {ms:7.2}ms {title}");
     }
 }
+
+#[test]
+fn theme_editor_edits_any_role_imports_json_and_presets_reset() {
+    use volt_ui_kit::{hex, ui::ColorToken};
+    let mut app = App::new();
+    app.go(Page::ThemeEditor);
+    let viewport = Viewport::new(1440., 2400., 1.).unwrap();
+    let (doc, mut handlers) = view(&app).build().unwrap().into_parts();
+    let mut runtime = Runtime::new(doc, &handlers, &Bindings::default()).unwrap();
+    let relayout =
+        |app: &App,
+         runtime: &mut Runtime,
+         handlers: &mut volt_ui_kit::declarative::Handlers<'static, App>| {
+            let (doc, next) = view(app).build().unwrap().into_parts();
+            runtime
+                .replace_document(doc, &next, &Bindings::default())
+                .unwrap();
+            *handlers = next;
+            runtime
+                .layout(
+                    viewport,
+                    &Bindings::default(),
+                    &mut RasterPainter::new(viewport),
+                )
+                .unwrap();
+        };
+    relayout(&app, &mut runtime, &mut handlers);
+    let click = |id: &str,
+                 app: &mut App,
+                 runtime: &mut Runtime,
+                 handlers: &mut volt_ui_kit::declarative::Handlers<'static, App>| {
+        let b = runtime
+            .boxes()
+            .iter()
+            .find(|b| b.id == id)
+            .unwrap_or_else(|| panic!("no {id}"))
+            .bounds
+            .bounds();
+        let (x, y) = (b[0] + b[2] / 2., b[1] + b[3] / 2.);
+        runtime.pointer_down(x, y);
+        runtime.pointer_up_outcome(x, y, handlers, app).unwrap();
+    };
+    // Choose the border role, then a swatch colour: a custom theme starts.
+    click("role-border", &mut app, &mut runtime, &mut handlers);
+    relayout(&app, &mut runtime, &mut handlers);
+    assert_eq!(app.kit.theme_role, ColorToken::Border);
+    click(
+        "theme-picker-swatch-0",
+        &mut app,
+        &mut runtime,
+        &mut handlers,
+    );
+    let custom = app.custom_palettes.clone().expect("custom theme");
+    assert_eq!(hex(custom[0].border), "#EF4444");
+    assert_eq!(hex(theme(&app, ThemeMode::Light).palette.border), "#EF4444");
+    assert_ne!(hex(custom[1].border), "#EF4444", "dark untouched");
+    // Import a partial theme into the light palette.
+    app.kit.theme_import = r##"{"primary": "#7C3AED", "nope": "#000"}"##.into();
+    relayout(&app, &mut runtime, &mut handlers);
+    click("theme-apply", &mut app, &mut runtime, &mut handlers);
+    assert!(
+        !app.kit.theme_message.as_ref().unwrap().0,
+        "unknown role rejected"
+    );
+    app.kit.theme_import = r##"{"primary": "#7C3AED"}"##.into();
+    relayout(&app, &mut runtime, &mut handlers);
+    click("theme-apply", &mut app, &mut runtime, &mut handlers);
+    let custom = app.custom_palettes.clone().unwrap();
+    assert_eq!(hex(custom[0].primary), "#7C3AED");
+    assert_eq!(hex(custom[0].border), "#EF4444", "other edits kept");
+    // Choosing a preset accent returns to presets.
+    app.theme = 2;
+    app.custom_palettes = None;
+    assert_ne!(hex(theme(&app, ThemeMode::Light).palette.border), "#EF4444");
+}
+
+#[cfg(feature = "native-gpu")]
+#[test]
+#[ignore = "GPU budget probe"]
+fn gpu_budget_probe_large_windows() {
+    use volt_ui_kit::native::GpuOffscreenRenderer;
+    let mut gpu = GpuOffscreenRenderer::new().expect("GPU required");
+    for (w, h) in [(1440., 920.), (2000., 1253.), (2560., 1440.)] {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let viewport = Viewport::new(w * 2., h * 2., 2.).unwrap();
+            let mut painter = RasterPainter::new(viewport);
+            for page in PAGES {
+                let mut app = App::new();
+                app.mode = mode;
+                app.glass = std::env::var("PROBE_GLASS").is_ok();
+                app.go(page);
+                let (doc, handlers) = view(&app).build().unwrap().into_parts();
+                let mut runtime = Runtime::new(doc, &handlers, &Bindings::default()).unwrap();
+                runtime
+                    .layout(viewport, &Bindings::default(), &mut painter)
+                    .unwrap();
+                runtime.settle_animations();
+                let ui = theme(&app, mode);
+                let batches = runtime.paint_ui(&mut painter, &ui);
+                gpu.render(&mut painter, &batches, ui.palette.base[0])
+                    .unwrap();
+                if let Some(reason) = gpu.last_over_budget() {
+                    eprintln!("OVER {w}x{h}@2 {mode:?} {page:?}: {reason:?}");
+                }
+            }
+        }
+    }
+    eprintln!("PROBE done");
+}
+
+#[cfg(feature = "native-gpu")]
+#[test]
+#[ignore = "GPU budget probe"]
+fn gpu_budget_probe_transitions_and_overlays() {
+    use std::time::Duration;
+    use volt_ui_kit::native::GpuOffscreenRenderer;
+    let mut gpu = GpuOffscreenRenderer::new().expect("GPU required");
+    let (w, h) = (2000., 1253.);
+    let viewport = Viewport::new(w * 2., h * 2., 2.).unwrap();
+    let mut painter = RasterPainter::new(viewport);
+    let setups: Vec<(&str, Box<dyn Fn(&mut App)>)> = vec![
+        ("plain", Box::new(|_| {})),
+        ("palette", Box::new(|a| a.palette.open = true)),
+        ("nav-drawer", Box::new(|a| a.nav_open = true)),
+        ("dialog", Box::new(|a| a.dialog_open = true)),
+        ("kit-drawer", Box::new(|a| a.kit.drawer = true)),
+        ("kit-palette", Box::new(|a| a.kit.palette.open = true)),
+    ];
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for (name, setup) in &setups {
+            for page in PAGES {
+                let mut app = App::new();
+                app.mode = mode;
+                app.glass = true;
+                // Arrive from another page so the page fade-in runs.
+                app.go(Page::Button);
+                let (doc, handlers) = view(&app).build().unwrap().into_parts();
+                let mut runtime = Runtime::new(doc, &handlers, &Bindings::default()).unwrap();
+                runtime
+                    .layout(viewport, &Bindings::default(), &mut painter)
+                    .unwrap();
+                runtime.settle_animations();
+                app.go(page);
+                setup(&mut app);
+                let (doc, next) = view(&app).build().unwrap().into_parts();
+                runtime
+                    .replace_document(doc, &next, &Bindings::default())
+                    .unwrap();
+                runtime
+                    .layout(viewport, &Bindings::default(), &mut painter)
+                    .unwrap();
+                for step in 0..4 {
+                    runtime.advance_animations(Duration::from_millis(40 * step));
+                    let ui = theme(&app, mode);
+                    let batches = runtime.paint_ui(&mut painter, &ui);
+                    gpu.render(&mut painter, &batches, ui.palette.base[0])
+                        .unwrap();
+                    if let Some(reason) = gpu.last_over_budget() {
+                        eprintln!(
+                            "OVER {mode:?} {name} {page:?} t={}ms: {reason:?}",
+                            40 * step
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("PROBE done");
+}
+
+#[cfg(feature = "native-gpu")]
+#[test]
+#[ignore = "GPU budget probe"]
+fn gpu_budget_probe_many_svg_icons() {
+    use volt_ui_kit::{native::GpuOffscreenRenderer, ui::SvgIcon};
+    let mut gpu = GpuOffscreenRenderer::new().expect("GPU required");
+    // A detailed icon: many curves, like Material Symbols or illustrations.
+    let mut d = String::from("M2 12");
+    for i in 0..60 {
+        let a = i as f32 * 0.21;
+        d.push_str(&format!(
+            " C{:.2} {:.2} {:.2} {:.2} {:.2} {:.2}",
+            12. + 9. * a.cos(),
+            12. + 9. * a.sin(),
+            12. + 7. * (a + 0.1).cos(),
+            12. + 7. * (a + 0.1).sin(),
+            12. + 8. * (a + 0.2).cos(),
+            12. + 8. * (a + 0.2).sin()
+        ));
+    }
+    let svg = SvgIcon::parse(&format!(r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="{d}"/></svg>"#)).unwrap();
+    let viewport = Viewport::new(4000., 2506., 2.).unwrap();
+    let mut painter = RasterPainter::new(viewport);
+    for count in [50usize, 150, 300, 600] {
+        let mut app = App::new();
+        app.glass = true;
+        app.go(Page::Icons);
+        app.kit.custom_icons = (0..count).map(|i| (format!("i{i}"), svg.clone())).collect();
+        let (doc, handlers) = view(&app).build().unwrap().into_parts();
+        let mut runtime = Runtime::new(doc, &handlers, &Bindings::default()).unwrap();
+        runtime
+            .layout(viewport, &Bindings::default(), &mut painter)
+            .unwrap();
+        runtime.settle_animations();
+        // Scroll the custom grid into view.
+        runtime
+            .scroll_outcome(
+                2000.,
+                1200.,
+                [0., 1500.],
+                &mut volt_ui_kit::declarative::Handlers::default(),
+                &mut app,
+            )
+            .ok();
+        runtime
+            .layout(viewport, &Bindings::default(), &mut painter)
+            .unwrap();
+        let ui = theme(&app, ThemeMode::Light);
+        let batches = runtime.paint_ui(&mut painter, &ui);
+        gpu.render(&mut painter, &batches, ui.palette.base[0])
+            .unwrap();
+        eprintln!("ICONS {count}: over_budget={:?}", gpu.last_over_budget());
+    }
+}
+
+#[cfg(feature = "native-gpu")]
+#[test]
+#[ignore = "GPU budget probe"]
+fn gpu_segment_estimates_per_page() {
+    use volt_ui_kit::native::GpuOffscreenRenderer;
+    let mut gpu = GpuOffscreenRenderer::new().expect("GPU required");
+    let viewport = Viewport::new(2880., 1840., 2.).unwrap();
+    let mut painter = RasterPainter::new(viewport);
+    let mut rows = vec![];
+    for page in PAGES {
+        let mut app = App::new();
+        app.glass = true;
+        app.go(page);
+        let (doc, mut handlers) = view(&app).build().unwrap().into_parts();
+        let mut runtime = Runtime::new(doc, &handlers, &Bindings::default()).unwrap();
+        runtime
+            .layout(viewport, &Bindings::default(), &mut painter)
+            .unwrap();
+        runtime.settle_animations();
+        let mut worst = (0u64, 0f32);
+        for step in 0..30 {
+            let ui = theme(&app, ThemeMode::Light);
+            let batches = runtime.paint_ui(&mut painter, &ui);
+            gpu.render(&mut painter, &batches, ui.palette.base[0])
+                .unwrap();
+            let (_, seg) = gpu.last_path_estimate();
+            if seg > worst.0 {
+                worst = (seg, step as f32 * 600.);
+            }
+            let before = runtime.scroll_offset(&format!("page-{}", page.slug()));
+            runtime
+                .scroll_outcome(1800., 1200., [0., 600.], &mut handlers, &mut app)
+                .unwrap();
+            runtime
+                .layout(viewport, &Bindings::default(), &mut painter)
+                .unwrap();
+            if runtime.scroll_offset(&format!("page-{}", page.slug())) == before {
+                break;
+            }
+        }
+        rows.push((worst.0, worst.1, page.title()));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    for (seg, at, title) in rows.iter().take(12) {
+        eprintln!(
+            "SEG {seg:>9} ({:>3}% of cap) at scroll {at:>5}  {title}",
+            seg * 100 / (1 << 21)
+        );
+    }
+}
+
+#[cfg(feature = "native-gpu")]
+#[test]
+fn editor_heavy_pages_keep_far_below_the_gpu_segment_budget() {
+    use volt_ui_kit::native::GpuOffscreenRenderer;
+    let mut gpu = GpuOffscreenRenderer::new().expect("GPU required");
+    let viewport = Viewport::new(2880., 1840., 2.).unwrap();
+    let mut painter = RasterPainter::new(viewport);
+    for page in [Page::ThemeEditor, Page::TextArea, Page::TextField] {
+        let mut app = App::new();
+        app.go(page);
+        let (doc, mut handlers) = view(&app).build().unwrap().into_parts();
+        let mut runtime = Runtime::new(doc, &handlers, &Bindings::default()).unwrap();
+        runtime
+            .layout(viewport, &Bindings::default(), &mut painter)
+            .unwrap();
+        runtime.settle_animations();
+        for _ in 0..6 {
+            let ui = theme(&app, ThemeMode::Light);
+            let batches = runtime.paint_ui(&mut painter, &ui);
+            gpu.render(&mut painter, &batches, ui.palette.base[0])
+                .unwrap();
+            // Unbounded editor rows once clipped at 1,000,000 px wide, which
+            // Vello counted as millions of segments (software fallback).
+            let (_, segments) = gpu.last_path_estimate();
+            assert!(segments < (1 << 21) / 2, "{page:?}: {segments} segments");
+            assert_eq!(gpu.last_over_budget(), None, "{page:?} fell back");
+            runtime
+                .scroll_outcome(1800., 1200., [0., 600.], &mut handlers, &mut app)
+                .unwrap();
+            runtime
+                .layout(viewport, &Bindings::default(), &mut painter)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "timing probe"]
+fn interaction_cost_per_page() {
+    use std::time::Instant;
+    let viewport = Viewport::new(2880., 1840., 2.).unwrap();
+    let mut rows = vec![];
+    let only = std::env::var("PROBE_PAGE").ok();
+    let n: usize = std::env::var("PROBE_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    for page in PAGES {
+        if only.as_deref().is_some_and(|o| o != page.slug()) {
+            continue;
+        }
+        let mut app = App::new();
+        app.go(page);
+        let mut painter = RasterPainter::new(viewport);
+        let (doc, handlers) = view(&app).build().unwrap().into_parts();
+        let mut runtime = Runtime::new(doc, &handlers, &Bindings::default()).unwrap();
+        runtime
+            .layout(viewport, &Bindings::default(), &mut painter)
+            .unwrap();
+        let ui = theme(&app, ThemeMode::Light);
+        let _ = runtime.paint_ui(&mut painter, &ui);
+        let (mut compose, mut install, mut layout, mut paint) = (0., 0., 0., 0.);
+        let big_n = n;
+        for i in 0..big_n {
+            // A small state change, as a click would make.
+            app.checked = i % 2 == 0;
+            let t = Instant::now();
+            let (doc, next) = view(&app).build().unwrap().into_parts();
+            compose += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            runtime
+                .replace_document(doc, &next, &Bindings::default())
+                .unwrap();
+            install += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            runtime
+                .layout(viewport, &Bindings::default(), &mut painter)
+                .unwrap();
+            layout += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let _ = runtime.paint_ui(&mut painter, &ui);
+            paint += t.elapsed().as_secs_f64();
+        }
+        let ms = |v: f64| v * 1000. / big_n as f64;
+        rows.push((
+            ms(compose + install + layout + paint),
+            ms(compose),
+            ms(install),
+            ms(layout),
+            ms(paint),
+            page.title(),
+        ));
+    }
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    eprintln!("COST total   compose install layout  paint  page");
+    for r in rows.iter().take(10) {
+        eprintln!(
+            "COST {:6.2} {:7.2} {:7.2} {:6.2} {:6.2}  {}",
+            r.0, r.1, r.2, r.3, r.4, r.5
+        );
+    }
+}
+
+/// Layout reuse after recomposition must give exactly what a fresh layout of
+/// the same state gives, on every page, including after state changes that
+/// alter some subtrees and leave others untouched.
+#[test]
+fn reused_layout_equals_fresh_layout_on_every_page() {
+    let viewport = Viewport::new(1440., 2400., 1.).unwrap();
+    let snapshot = |rt: &Runtime| -> Vec<(String, [f32; 4], [f32; 4])> {
+        rt.boxes()
+            .iter()
+            .map(|b| (b.id.clone(), b.bounds.bounds(), b.clip.bounds()))
+            .collect()
+    };
+    let changes: [fn(&mut App); 4] = [
+        |a| a.checked = !a.checked,
+        |a| a.name.push_str(" Byron"),
+        |a| a.kit.stars = 2,
+        |a| a.kit.faq = vec![1, 2],
+    ];
+    let mut reused_total = 0;
+    for page in PAGES {
+        let mut app = App::new();
+        app.go(page);
+        let mut painter = RasterPainter::new(viewport);
+        let (doc, handlers) = view(&app).build().unwrap().into_parts();
+        let mut incremental = Runtime::new(doc, &handlers, &Bindings::default()).unwrap();
+        incremental
+            .layout(viewport, &Bindings::default(), &mut painter)
+            .unwrap();
+        for change in changes {
+            change(&mut app);
+            let (doc, next) = view(&app).build().unwrap().into_parts();
+            incremental
+                .replace_document(doc, &next, &Bindings::default())
+                .unwrap();
+            incremental
+                .layout(viewport, &Bindings::default(), &mut painter)
+                .unwrap();
+            let (doc, h) = view(&app).build().unwrap().into_parts();
+            let mut fresh = Runtime::new(doc, &h, &Bindings::default()).unwrap();
+            fresh
+                .layout(
+                    viewport,
+                    &Bindings::default(),
+                    &mut RasterPainter::new(viewport),
+                )
+                .unwrap();
+            assert_eq!(snapshot(&incremental), snapshot(&fresh), "{page:?}");
+            reused_total += incremental.reused_measurements();
+        }
+        // A narrower window must not reuse sizes measured at the old width.
+        let narrow = Viewport::new(900., 2400., 1.).unwrap();
+        let (doc, next) = view(&app).build().unwrap().into_parts();
+        incremental
+            .replace_document(doc, &next, &Bindings::default())
+            .unwrap();
+        incremental
+            .layout(narrow, &Bindings::default(), &mut painter)
+            .unwrap();
+        let (doc, h) = view(&app).build().unwrap().into_parts();
+        let mut fresh = Runtime::new(doc, &h, &Bindings::default()).unwrap();
+        fresh
+            .layout(
+                narrow,
+                &Bindings::default(),
+                &mut RasterPainter::new(narrow),
+            )
+            .unwrap();
+        assert_eq!(snapshot(&incremental), snapshot(&fresh), "{page:?} narrow");
+        assert_eq!(
+            incremental.reused_measurements(),
+            0,
+            "width change reused sizes"
+        );
+    }
+    // Reuse must actually happen (most of each page is unchanged).
+    assert!(
+        reused_total > 10_000,
+        "only {reused_total} measurements reused"
+    );
+}
+
+#[test]
+fn dev_restart_round_trips_page_and_appearance() {
+    let mut app = App::new();
+    app.go(Page::Dashboard);
+    app.mode = ThemeMode::Dark;
+    app.theme = 2;
+    app.sidebar_width = 320.;
+    let saved = dev_save(&app);
+    let mut restored = App::new();
+    dev_load(&mut restored, &saved);
+    assert_eq!(restored.page, Page::Dashboard);
+    assert_eq!(restored.mode, ThemeMode::Dark);
+    assert_eq!((restored.theme, restored.sidebar_width), (2, 320.));
+    dev_load(&mut restored, "page=nope\ntheme=99\nsidebar=9000");
+    assert_eq!(restored.page, Page::Dashboard, "unknown pages are ignored");
+    assert_eq!(
+        (restored.theme, restored.sidebar_width),
+        (THEMES.len() - 1, 420.)
+    );
+}
+
+#[test]
+fn dashboard_builds_for_every_range_and_selection() {
+    // A rejected view keeps the previous screen, so a click that produces an
+    // invalid tree silently does nothing. Every range must build with and
+    // without each chart's selection.
+    for range in 0..3u8 {
+        for pick in [None, Some(0), Some(12), Some(200)] {
+            let mut app = App::new();
+            app.go(Page::Dashboard);
+            app.kit.dash_range = range;
+            app.kit.dash_candle = pick;
+            app.kit.dash_slice = pick.map(|i| i % 5);
+            app.kit.dash_month = pick.map(|i| i % 12);
+            app.kit.dash_quarter = pick.map(|i| i % 4);
+            if let Err(e) = view(&app).build() {
+                panic!("range {range}, pick {pick:?}: {e}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "visual probe"]
+fn dashboard_interaction_snapshot() {
+    let mut app = App::new();
+    app.go(Page::Dashboard);
+    app.mode = ThemeMode::Dark;
+    app.theme = 2;
+    app.kit.dash_range = std::env::var("SNAP_RANGE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    app.kit.dash_candle = Some(12);
+    app.kit.dash_slice = Some(1);
+    app.kit.dash_month = Some(5);
+    app.kit.dash_quarter = Some(2);
+    let viewport = Viewport::new(2880., 2000., 2.).unwrap();
+    let mut painter = RasterPainter::new(viewport);
+    let (doc, handlers) = view(&app).build().unwrap().into_parts();
+    let mut runtime = Runtime::new(doc, &handlers, &Bindings::default()).unwrap();
+    runtime
+        .layout(viewport, &Bindings::default(), &mut painter)
+        .unwrap();
+    runtime.settle_animations();
+    let [x, y, w, h] = runtime
+        .boxes()
+        .iter()
+        .find(|b| b.id == "dash-candles-15")
+        .unwrap()
+        .bounds
+        .bounds();
+    runtime.pointer_move(x + w / 2., y + h / 3.);
+    runtime
+        .layout(viewport, &Bindings::default(), &mut painter)
+        .unwrap();
+    runtime.settle_animations();
+    let ui = theme(&app, ThemeMode::Dark);
+    let batches = runtime.paint_ui(&mut painter, &ui);
+    let pix = painter.rasterize(&batches, ui.palette.base[0]).unwrap();
+    pix.save_png(std::env::var("SNAP").unwrap()).unwrap();
+}

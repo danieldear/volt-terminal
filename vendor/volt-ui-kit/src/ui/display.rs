@@ -929,17 +929,16 @@ pub fn bar_chart<C>(
             );
         }
         let base = to_y(0.);
+        let mut bars = super::charts::PathBatch::new();
         for (i, v) in values.iter().enumerate() {
             if !v.is_finite() {
                 continue;
             }
             let x = i as f32 * slot + (slot - bar) * 0.5;
             let (top, bottom) = (to_y(*v).min(base), to_y(*v).max(base));
-            c.fill(
-                VectorPath::rectangle(x, top, bar, (bottom - top).max(1.)),
-                ColorToken::Primary,
-            );
+            bars.add(VectorPath::rectangle(x, top, bar, (bottom - top).max(1.)));
         }
+        bars.fill(c, ColorToken::Primary);
         c.stroke(
             VectorPath::new().move_to(0., base).line_to(width, base),
             ColorToken::Muted,
@@ -996,8 +995,18 @@ pub fn line_chart<C>(
             if shifted.len() >= 2 {
                 c.stroke(polyline(&shifted), *colour, 2.);
             }
-            for [x, y] in &shifted {
-                c.fill(VectorPath::circle(*x, *y, 2.5), *colour);
+            // Point markers only while they stay apart; packed tighter they
+            // would overlap (and the even-odd fill would punch holes).
+            let spacing = match shifted.as_slice() {
+                [a, b, ..] => (b[0] - a[0]).abs(),
+                _ => f32::MAX,
+            };
+            if spacing >= 6. {
+                let mut dots = super::charts::PathBatch::new();
+                for [x, y] in &shifted {
+                    dots.add(VectorPath::circle(*x, *y, 2.5));
+                }
+                dots.fill(c, *colour);
             }
         }
     })

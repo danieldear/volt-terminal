@@ -256,11 +256,14 @@ fn header(app: &App) -> El<App> {
     .align(Align::Center)
     .visible(responsive(true).at(Breakpoint::Lg, false));
     let themes = menu(
-        THEMES[app.theme].0,
-        THEMES
-            .iter()
-            .enumerate()
-            .map(|(i, (name, ..))| menu_item(i, *name).checked(i == app.theme)),
+        if app.custom_palettes.is_some() {
+            "Custom"
+        } else {
+            THEMES[app.theme].0
+        },
+        THEMES.iter().enumerate().map(|(i, (name, ..))| {
+            menu_item(i, *name).checked(app.custom_palettes.is_none() && i == app.theme)
+        }),
     )
     .key("theme-menu")
     .accessible_label("Accent color")
@@ -270,7 +273,10 @@ fn header(app: &App) -> El<App> {
     .background(ColorToken::Base100)
     .border_color(ColorToken::Border)
     .border_width(1.)
-    .on_action(|app: &mut App, i| app.theme = i)
+    .on_action(|app: &mut App, i| {
+        app.theme = i;
+        app.custom_palettes = None;
+    })
     .on_open_change(|app: &mut App, open| app.theme_menu_open = open);
     toolbar![
         menu_button,

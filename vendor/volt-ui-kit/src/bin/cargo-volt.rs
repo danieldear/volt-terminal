@@ -171,7 +171,7 @@ fn scaffold(destination: &Path, kind: &str, kit: &Path, desktop: bool) -> io::Re
     fs::create_dir(destination)?;
     let result = (|| {
         fs::create_dir(destination.join("src"))?;
-        fs::write(destination.join("Cargo.toml"),format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\nresolver = \"3\"\nrust-version = \"1.87\"\n\n[dependencies]\nvolt-ui-kit = {{ path = {path}, features = [{features}] }}\n"))?;
+        fs::write(destination.join("Cargo.toml"),format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\nresolver = \"3\"\nrust-version = \"1.89\"\n\n[dependencies]\nvolt-ui-kit = {{ path = {path}, features = [{features}] }}\n"))?;
         fs::write(destination.join("src/main.rs"), source)?;
         fs::write(destination.join(".gitignore"), "/target\n")?;
         fs::write(destination.join("README.md"),format!("# {name}\n\nRun `cargo run`. GPU is preferred; no renderer flags needed.\nThis {kind} template is a UI starting point, not a mail backend, AI client or editor engine.\nOn macOS the generated app uses Catalog-style unified chrome: no separate title strip, native traffic lights and a draggable 60pt header with reserved control space. Other platforms retain native window decorations.\nChange window_chrome() to WindowChrome::Native for a standard title bar. Background blur/transparency is not forced.\nCustomize layouts, themes and window backgrounds in Rust.\n\nUse `cargo-volt dev .` for rebuild/restart (state is not retained).\n\nOn macOS, build with `cargo build --release`, then see `cargo-volt bundle --help`\nfor a local .app with explicit identity/resources and ad-hoc signing. This is not\nDeveloper ID signing or notarization; keep bundle resources immutable.\n"))?;
@@ -266,6 +266,11 @@ fn dev(root: &Path) -> io::Result<()> {
     let root = root.canonicalize()?;
     let mut running = Running(None);
     let mut last = None;
+    // Apps that opt in with `Application::dev_state` save their state and
+    // window frame here when asked to restart, and restore them on launch.
+    let handoff = std::env::temp_dir().join(format!("volt-dev-{}", std::process::id()));
+    fs::create_dir_all(&handoff)?;
+    let _ = fs::remove_file(handoff.join("restart"));
     loop {
         let mut hash = 0xcbf29ce484222325;
         // Only source/manifests/config, never generated logs/assets/target.
@@ -281,8 +286,25 @@ fn dev(root: &Path) -> io::Result<()> {
         if last != Some(hash) {
             last = Some(hash);
             if let Some(binary) = rebuild(&root)? {
+                if let Some(child) = running.0.as_mut() {
+                    // Ask for a state-preserving exit; fall back to stopping it.
+                    fs::write(handoff.join("restart"), b"")?;
+                    let asked = std::time::Instant::now();
+                    while asked.elapsed() < Duration::from_secs(3) {
+                        if child.try_wait()?.is_some() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    let _ = fs::remove_file(handoff.join("restart"));
+                }
                 running.stop();
-                running.0 = Some(Command::new(binary).current_dir(&root).spawn()?);
+                running.0 = Some(
+                    Command::new(binary)
+                        .current_dir(&root)
+                        .env("VOLT_DEV_STATE", &handoff)
+                        .spawn()?,
+                );
             } else {
                 eprintln!(
                     "Build failed/no executable; previous app retained. Save a change to retry."
@@ -317,7 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("bundle") if args.get(1).is_some_and(|s| s == "--help") && args.len()==2 => println!("{}", bundle::HELP),
         Some("bundle") => bundle::run(bundle::BundleOptions::parse(&args[1..])?)?,
         Some("dev") if args.len()<=2=>dev(Path::new(args.get(1).map_or(".",String::as_str)))?,
-        _=>return Err(error("Usage: cargo volt new PATH --kit-path PATH [--template minimal|navigation|mail|settings|agent] [--desktop]\n       cargo volt dev [PATH] (runs trusted local project; rebuild/restart, not state-preserving hot reload)\n       cargo volt bundle --help").into()),
+        _=>return Err(error("Usage: cargo volt new PATH --kit-path PATH [--template minimal|navigation|mail|settings|agent] [--desktop]\n       cargo volt dev [PATH] (runs trusted local project; rebuild/restart; apps using Application::dev_state keep state and window)\n       cargo volt bundle --help").into()),
     }
     Ok(())
 }

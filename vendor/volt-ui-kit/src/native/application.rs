@@ -29,6 +29,16 @@ pub(super) type CommandCallback<C> = Box<dyn FnMut(&mut C, &str)>;
 pub(super) type CloseCallback<C> = Box<dyn FnMut(&mut C, CloseReason) -> CloseDecision>;
 pub(super) type BackgroundFn<C> = Box<dyn Fn(&C) -> WindowBackground>;
 pub(super) type RequestPump = Box<dyn Messages<Vec<ApplicationRequest>>>;
+/// Development-only state carried across `cargo volt dev` restarts.
+type DevLoad<C> = Box<dyn Fn(&mut C, &str)>;
+pub(super) struct DevState<C> {
+    pub save: Box<dyn Fn(&C) -> String>,
+    pub load: DevLoad<C>,
+}
+/// The directory `cargo volt dev` gives a running app for restart handoff.
+pub(super) fn dev_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("VOLT_DEV_STATE").map(std::path::PathBuf::from)
+}
 pub(super) struct HostExtensions<C> {
     pub renderer: Option<RendererPreference>,
     pub desktop: Option<super::system::DesktopConfig>,
@@ -37,6 +47,12 @@ pub(super) struct HostExtensions<C> {
     pub close: Option<CloseCallback<C>>,
     pub requests: Option<RequestPump>,
     pub background: Option<BackgroundFn<C>>,
+    pub dev_state: Option<DevState<C>>,
+    /// A theme JSON file reloaded when it changes, and its last seen mtime.
+    pub theme_file: Option<(std::path::PathBuf, Option<std::time::SystemTime>)>,
+    /// Window frame to restore after a dev restart: [x, y, width, height]
+    /// in physical pixels.
+    pub restore_frame: Option<[i32; 4]>,
 }
 impl<C> Default for HostExtensions<C> {
     fn default() -> Self {
@@ -48,6 +64,9 @@ impl<C> Default for HostExtensions<C> {
             close: None,
             requests: None,
             background: None,
+            dev_state: None,
+            theme_file: None,
+            restore_frame: None,
         }
     }
 }
@@ -203,6 +222,29 @@ impl<C: 'static> Application<C> {
         self.options.window.reduced_motion = value;
         self
     }
+    /// Keep state across `cargo volt dev` rebuilds. When the dev runner
+    /// restarts the app after a code change, `save` serialises the state
+    /// (any format) and the window frame is kept; the new build calls `load`
+    /// before its first view. Has no effect outside `cargo volt dev`.
+    pub fn dev_state(
+        mut self,
+        save: impl Fn(&C) -> String + 'static,
+        load: impl Fn(&mut C, &str) + 'static,
+    ) -> Self {
+        self.extensions.dev_state = Some(DevState {
+            save: Box::new(save),
+            load: Box::new(load),
+        });
+        self
+    }
+    /// Load the palette from a theme JSON file (see `Palette::to_json`) and
+    /// reload it live whenever the file changes. Roles the file omits keep
+    /// the palette set with `.palette(..)` (or the default). Ignored when a
+    /// `theme_with` function supplies the theme.
+    pub fn theme_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.extensions.theme_file = Some((path.into(), None));
+        self
+    }
     pub fn theme_with(mut self, theme: impl Fn(&C, ThemeMode) -> UiTheme + 'static) -> Self {
         self.theme = Some(Box::new(theme));
         self
@@ -260,12 +302,33 @@ impl<C: 'static> Application<C> {
         }
         Ok(())
     }
+    /// A dev restart hands over the previous run's state and window frame.
+    fn restore_dev_handoff(&mut self, dir: &std::path::Path) {
+        let Some(dev) = &self.extensions.dev_state else {
+            return;
+        };
+        if let Ok(state) = std::fs::read_to_string(dir.join("state")) {
+            (dev.load)(&mut self.context, &state);
+        }
+        if let Ok(frame) = std::fs::read_to_string(dir.join("window")) {
+            let v: Vec<i32> = frame
+                .split_whitespace()
+                .filter_map(|n| n.parse().ok())
+                .collect();
+            if let [x, y, w, h] = v[..] {
+                self.extensions.restore_frame = Some([x, y, w, h]);
+            }
+        }
+    }
     pub fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Message/request initializers may have changed state after the builder.
         if let Some(background) = &self.extensions.background {
             self.options.background = background(&self.context);
         }
         self.validate()?;
+        if let Some(dir) = dev_dir() {
+            self.restore_dev_handoff(&dir);
+        }
         window::run_ui_extended(
             self.options,
             self.context,
@@ -280,6 +343,27 @@ impl<C: 'static> Application<C> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    #[test]
+    fn dev_handoff_restores_state_and_window_frame_only_when_opted_in() {
+        use crate::ui::spacer;
+        let dir = std::env::temp_dir().join(format!("volt-dev-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("state"), "page=7").unwrap();
+        std::fs::write(dir.join("window"), "120 80 1600 1000").unwrap();
+        let mut app = Application::new("Dev", 0u32, |_| spacer().into()).dev_state(
+            |n| format!("page={n}"),
+            |n, text| *n = text.trim_start_matches("page=").parse().unwrap_or(0),
+        );
+        app.restore_dev_handoff(&dir);
+        assert_eq!(app.context, 7);
+        assert_eq!(app.extensions.restore_frame, Some([120, 80, 1600, 1000]));
+        // Without dev_state nothing is read.
+        let mut plain = Application::new("Dev", 0u32, |_| spacer().into());
+        plain.restore_dev_handoff(&dir);
+        assert_eq!(plain.context, 0);
+        assert_eq!(plain.extensions.restore_frame, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
     use crate::native::{Command, CommandDispatch};
     #[derive(Default)]
     struct State {

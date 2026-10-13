@@ -141,7 +141,7 @@ impl Gradient {
 }
 
 /// Rust-only extensions carried by every node. Defaults change nothing.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct NodeExtras {
     /// Logical min/max width and height.
     pub min: [Option<f32>; 2],

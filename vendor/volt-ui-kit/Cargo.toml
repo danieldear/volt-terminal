@@ -2,11 +2,19 @@
 name = "volt-ui-kit"
 version = "0.4.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.89"
 license = "MIT"
-description = "Renderer-independent desktop UI components extracted from Volt"
+description = "Native desktop interfaces in plain Rust: declarative components, GPU drawing with Vello, themes and accessibility"
 readme = "README.md"
-include = ["docs/**", "src/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "LICENSE", "CHANGELOG.md", "ROADMAP.md"]
+repository = "https://github.com/danieldear/volt-ui-kit"
+keywords = ["gui", "ui", "desktop", "declarative", "gpu"]
+categories = ["gui", "graphics", "rendering", "accessibility"]
+include = ["docs/*.md", "src/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[package.metadata.docs.rs]
+# Document the Rust UI, native host and GPU renderer, not just the core.
+features = ["native-gpu", "native-desktop"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
@@ -32,13 +40,13 @@ accesskit_winit = { version = "=0.34.1", optional = true }
 softbuffer = { version = "0.4.8", optional = true }
 tiny-skia = { version = "0.11.4", optional = true }
 image = { version = "=0.25.8", default-features = false, features = ["png", "jpeg"], optional = true }
-# Vello 0.6 / wgpu 26 retains the crate's Rust 1.87 minimum. Newer Vello
-# releases require newer Rust. This is isolated to the optional native host.
-vello = { version = "=0.6.0", optional = true, default-features = false, features = ["wgpu", "bump_estimate"] }
+# Exact pins: GPU output (alpha encoding, clipping, glyph ink) is validated
+# against these releases. Vello 0.11 sets the crate's Rust 1.89 minimum.
+vello = { version = "=0.11.0", optional = true, default-features = false, features = ["wgpu", "bump_estimate"] }
 pollster = { version = "0.4", optional = true }
-# Reuse Vello 0.6's already-transitive allocator for packing admission. This
+# Reuse Vello's already-transitive atlas allocator for packing admission. This
 # adds no new locked packages and is absent from the default/native CPU build.
-guillotiere = { version = "=0.6.2", optional = true }
+guillotiere = { version = "=0.7.0", optional = true }
 cosmic-text = { version = "0.14.2", optional = true }
 
 # One native compute backend per platform; no unused GLES/WebGPU backend.
@@ -51,11 +59,11 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = ["
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSView", "NSResponder", "NSToolbar", "NSButton", "NSControl", "NSVisualEffectView", "NSGraphics", "NSWorkspace", "NSAccessibility"], optional = true }
 muda = { version = "=0.19.3", default-features = false, optional = true }
 tray-icon = { version = "=0.24.2", default-features = false, optional = true }
-wgpu = { version = "=26.0.1", optional = true, default-features = false, features = ["std", "wgsl", "metal"] }
+wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["std", "wgsl", "metal"] }
 [target.'cfg(target_os = "windows")'.dependencies]
-wgpu = { version = "=26.0.1", optional = true, default-features = false, features = ["std", "wgsl", "dx12"] }
+wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["std", "wgsl", "dx12"] }
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
-wgpu = { version = "=26.0.1", optional = true, default-features = false, features = ["std", "wgsl", "vulkan"] }
+wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["std", "wgsl", "vulkan"] }
 
 # CPU rasterization/shaping must be usable under the documented `cargo run`.
 # These profiles apply only when this repository is the workspace root; consumer
@@ -67,26 +75,10 @@ opt-level = 1
 opt-level = 3
 
 [[example]]
-name = "native_window"
-required-features = ["native"]
-[[example]]
-name = "panels_and_layout"
-required-features = ["native"]
-[[example]]
-name = "buttons_and_events"
-required-features = ["native"]
-[[example]]
-name = "declarative_ui"
-required-features = ["native"]
-[[example]]
 name = "complete_app"
 required-features = ["native"]
 [[example]]
 name = "components"
-required-features = ["native"]
-
-[[example]]
-name = "render_benchmark"
 required-features = ["native"]
 
 [[example]]
