@@ -56,6 +56,9 @@ jobs:
             libxcursor-dev \
             libxinerama-dev
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Clippy opt-in GPU Settings prototype
+        if: matrix.os == 'macos-latest'
+        run: cargo clippy --locked -p volt -p volt-ui -p volt-renderer --all-targets --features volt/ui-gpu-prototype -- -D warnings
 
   test:
     name: Tests
@@ -84,6 +87,14 @@ jobs:
             mesa-vulkan-drivers
       # UI Kit 0.4's deep-tree rejection fixture needs larger test stacks only.
       - run: RUST_MIN_STACK=33554432 cargo test --locked --workspace
+      - name: Test opt-in GPU Settings prototype
+        if: matrix.os == 'macos-latest'
+        # Native toolkit font-alias tests belong to its upstream CI. This host
+        # imports Volt-shaped glyphs, not the toolkit's native text shaper.
+        # The full default workspace suite above still tests the pinned toolkit.
+        run: |
+          RUST_MIN_STACK=33554432 cargo test --locked -p volt -p volt-ui -p volt-renderer --features volt/ui-gpu-prototype
+          cargo run --locked -p volt-renderer --example settingsgpucheck --features ui-gpu-prototype
       - name: Validation script unit tests
         run: python3 -m unittest discover -s scripts/validation -p 'test_*.py'
       - name: Offscreen GPU renderer regressions (Mesa software Vulkan)
@@ -123,4 +134,6 @@ jobs:
         with:
           key: msrv
       - run: cargo check --locked --workspace --all-targets
+      - name: Check opt-in GPU Settings prototype MSRV
+        run: cargo check --locked --workspace --all-targets --features volt/ui-gpu-prototype
       - run: cargo test --locked -p volt-core -p volt-config

@@ -338,6 +338,7 @@ pub struct PaneDivider {
 /// volt-renderer has no knowledge of `volt-ui`'s `TextPrompt` type, so the
 /// caller flattens it into this small POD struct each frame.
 pub struct PromptOverlay<'a> {
+    pub task_review: Option<&'a crate::task_review::TaskReview>,
     pub title: &'a str,
     pub text: &'a str,
     /// Read-only destination preview; enable bounded horizontal paging.
@@ -418,6 +419,7 @@ pub struct Renderer {
     search_palette_cache: Option<search_palette_draw::SearchGeometry>,
     pub workspace_card: Option<crate::workspace_card::WorkspaceCard>,
     workspace_card_cache: Option<workspace_card_draw::CardGeometry>,
+    workspace_layout_cache: std::cell::RefCell<Option<workspace_card_draw::LayoutCache>>,
     /// Theme editor panel; drawn in the top layer, above the search palette.
     pub theme_editor: Option<crate::theme_editor::ThemeEditorView>,
     theme_editor_cache: Option<theme_editor_draw::EditorGeometry>,
@@ -427,10 +429,13 @@ pub struct Renderer {
     pub settings_controls: Vec<crate::settings::SettingsControl>,
     pub settings_dropdown: Option<crate::settings::SettingsDropdown>,
     settings_cache: Option<settings_draw::SettingsGeometry>,
+    #[cfg(feature = "ui-gpu-prototype")]
+    settings_gpu: settings_gpu::SettingsGpuLayer,
     pub task_form: Option<crate::task_form::TaskFormView>,
     /// Task buttons where the workspace card sits while it's closed.
     pub task_strip: Option<crate::task_strip::TaskStripView>,
     task_form_cache: Option<task_form_draw::FormGeometry>,
+    task_review_cache: Option<task_review_draw::ReviewGeometry>,
     task_strip_cache: Option<task_strip_draw::StripGeometry>,
     row_cache: Vec<CachedRow>,
     cache_context: Option<([f32; 8], Theme, CursorStyle)>,
@@ -833,16 +838,20 @@ impl Renderer {
             search_palette_cache: None,
             workspace_card: None,
             workspace_card_cache: None,
+            workspace_layout_cache: std::cell::RefCell::new(None),
             theme_editor: None,
             theme_editor_cache: None,
             settings: None,
             settings_cache: None,
+            #[cfg(feature = "ui-gpu-prototype")]
+            settings_gpu: settings_gpu::SettingsGpuLayer::from_environment(),
             settings_toggles: Vec::new(),
             settings_controls: Vec::new(),
             settings_dropdown: None,
             task_form: None,
             task_strip: None,
             task_form_cache: None,
+            task_review_cache: None,
             task_strip_cache: None,
             tab_bar_height,
             custom_tab_bar: true,
@@ -1036,6 +1045,7 @@ impl Renderer {
         self.search_palette_cache = None;
         self.theme_editor_cache = None;
         self.task_form_cache = None;
+        self.task_review_cache = None;
         self.settings_cache = None;
         self.task_strip_cache = None;
         self.shape_cache.clear();
@@ -1693,6 +1703,8 @@ impl Renderer {
                     pass.draw(glyph_range, 0..1);
                 }
             }
+            #[cfg(feature = "ui-gpu-prototype")]
+            self.settings_gpu.composite(&mut pass);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         if let Some(output) = output {
@@ -1718,12 +1730,20 @@ impl Renderer {
         inspector: Option<InspectorInfo>,
         read_only: bool,
     ) {
+        #[cfg(feature = "ui-gpu-prototype")]
+        if self.settings.is_none() {
+            if self.settings_gpu.ready() {
+                self.settings_cache = None;
+            }
+            self.settings_gpu.hide();
+        }
         if self.atlas.full {
             self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
             self.workspace_card_cache = None;
             self.search_palette_cache = None;
             self.theme_editor_cache = None;
             self.task_form_cache = None;
+            self.task_review_cache = None;
             self.settings_cache = None;
             self.task_strip_cache = None;
             self.row_cache.clear();
@@ -2609,7 +2629,12 @@ impl Renderer {
             );
         }
 
-        if let Some(p) = prompt.as_ref() {
+        if prompt.as_ref().is_none_or(|p| p.task_review.is_none()) {
+            self.task_review_cache = None;
+        }
+        if let Some(v) = prompt.as_ref().and_then(|p| p.task_review) {
+            self.draw_task_review(&mut bg_verts, &mut glyph_verts, v, theme);
+        } else if let Some(p) = prompt.as_ref() {
             let box_w = (420.0 * self.scale_factor).min((sw - 40.0).max(200.0));
             let box_h = 72.0 * self.scale_factor;
             let box_x = (sw - box_w) / 2.0;
@@ -3017,10 +3042,18 @@ mod placement_tests {
 #[path = "search_palette_draw.rs"]
 mod search_palette_draw;
 
+#[cfg(feature = "ui-gpu-prototype")]
+#[path = "settings_gpu.rs"]
+mod settings_gpu;
+#[cfg(feature = "ui-gpu-prototype")]
+pub use settings_gpu::SettingsGpuStats;
+
 #[path = "settings_draw.rs"]
 mod settings_draw;
 #[path = "task_form_draw.rs"]
 mod task_form_draw;
+#[path = "task_review_draw.rs"]
+mod task_review_draw;
 #[path = "task_strip_draw.rs"]
 mod task_strip_draw;
 #[path = "theme_editor_draw.rs"]

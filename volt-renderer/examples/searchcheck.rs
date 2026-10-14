@@ -136,6 +136,7 @@ fn main() -> Result<()> {
                     &[],
                     None,
                     Some(volt_renderer::renderer::PromptOverlay {
+                        task_review: None,
                         title: "Find",
                         read_only: false,
                         text: "needle",

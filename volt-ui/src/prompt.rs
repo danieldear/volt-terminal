@@ -31,17 +31,22 @@ pub enum PromptKind {
     ConfirmTask,
     /// Explicit permission for just this command, not trust for its whole file.
     ReviewTask,
+    TrustTasks,
 }
 
 impl PromptKind {
     /// Confirmations show text the user can read and inspect, not edit.
     pub fn read_only(self) -> bool {
-        matches!(self, Self::OpenLink | Self::ConfirmTask | Self::ReviewTask)
+        matches!(
+            self,
+            Self::OpenLink | Self::ConfirmTask | Self::ReviewTask | Self::TrustTasks
+        )
     }
 }
 
 pub struct TextPrompt {
     pub kind: PromptKind,
+    pub task_review: Option<volt_renderer::task_review::TaskReview>,
     chars: Vec<char>,
     pub cursor: usize,
     /// Populated live as the user types, when `kind == Find`.
@@ -60,6 +65,7 @@ impl TextPrompt {
         let cursor = if kind.read_only() { 0 } else { chars.len() };
         Self {
             kind,
+            task_review: None,
             chars,
             cursor,
             matches: Vec::new(),
@@ -75,6 +81,7 @@ impl TextPrompt {
             PromptKind::OpenLink => "Open link? Enter: open / Esc: cancel",
             PromptKind::ConfirmTask => "Run task? Enter: run / Esc: cancel",
             PromptKind::ReviewTask => "Review task · Enter: run once / Esc: cancel",
+            PromptKind::TrustTasks => "Review task permissions",
             PromptKind::RenameTab => "Change Tab Title",
             PromptKind::RenameTerminal => "Change Terminal Title",
         }
@@ -246,7 +253,11 @@ mod tests {
 
     #[test]
     fn task_review_is_read_only_and_explicitly_authorizes_only_one_run() {
-        for kind in [PromptKind::ReviewTask, PromptKind::ConfirmTask] {
+        for kind in [
+            PromptKind::ReviewTask,
+            PromptKind::ConfirmTask,
+            PromptKind::TrustTasks,
+        ] {
             let mut prompt = TextPrompt::new(kind, "(cd '/repo' && cargo build --release)");
             prompt.move_end();
             prompt.insert_char(';');

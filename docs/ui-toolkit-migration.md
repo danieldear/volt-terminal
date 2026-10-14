@@ -94,10 +94,10 @@ The earlier snapshot had two relevant integration issues, preserved here as
 historical evidence. Declarative-only compilation now passes in the current
 upstream snapshot; the test-only stack allowance remains in Volt:
 
-- `--features declarative` alone fails to compile: `Runtime` initializes
+- `--features declarative` alone failed to compile: `Runtime` initialized
   `slider_lower` and `file_hover` without the `rust-ui` guards used on their
-  declarations. Volt uses `rust-ui` for its new controls, so its active feature
-  graph compiles. The upstream source is not silently patched.
+  declarations. Volt used `rust-ui` for its new controls, so its active feature
+  graph compiled. That snapshot was not silently patched.
 - The Rust UI negative depth-limit fixture overflows an ordinary test thread's
   stack in debug mode. The toolkit-inclusive test suite uses a 32 MiB **test-only**
   `RUST_MIN_STACK`, and CI/release/signing validation applies it only to the

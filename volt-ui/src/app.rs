@@ -621,6 +621,13 @@ impl MainState {
         }
         let editor = self.theme_editor.as_mut()?;
         let naming = editor.is_naming();
+        if !naming && !command && !ctrl {
+            if let PhysicalKey::Code(code) = key {
+                if let Some(outcome) = editor.picker_key(code) {
+                    return self.apply_editor_outcome(outcome);
+                }
+            }
+        }
         let outcome = match key {
             PhysicalKey::Code(KeyCode::KeyS) if command => editor.save(shift),
             PhysicalKey::Code(KeyCode::Backspace) if command => editor.clear(),
@@ -824,6 +831,17 @@ impl MainState {
                 },
                 &preview,
             ));
+            if let Some(prompt) = self.active_prompt.as_mut() {
+                prompt.task_review = Some(crate::tasks::review_view(
+                    &tasks,
+                    &task,
+                    if gate == crate::tasks::LaunchGate::ReviewOnce {
+                        volt_renderer::task_review::ReviewMode::RunOnce
+                    } else {
+                        volt_renderer::task_review::ReviewMode::Confirm
+                    },
+                ));
+            }
             self.sync_workspace_card();
             self.begin_redraw();
             return;
@@ -895,7 +913,69 @@ impl MainState {
         self.sync_workspace_card();
     }
 
-    /// Trust the current tasks file after the user reviewed it in the card.
+    /// Show all commands before granting file-wide trust. This action does not
+    /// launch a task and is bound to the exact reviewed bytes and terminal.
+    fn review_task_permissions(&mut self) {
+        let Some(tasks) = self
+            .tasks
+            .tasks
+            .clone()
+            .filter(|t| !t.tasks.is_empty() && t.problem.is_none())
+        else {
+            return;
+        };
+        let current =
+            volt_config::tasks::load(&tasks.root, volt_config::tasks::trust_dir().as_deref());
+        if current != tasks {
+            self.tasks.refresh();
+            self.set_task_message("Tasks changed. Review again after the list refreshes.");
+            self.sync_workspace_card();
+            self.begin_redraw();
+            return;
+        }
+        let mut prompt = crate::prompt::TextPrompt::new(crate::prompt::PromptKind::TrustTasks, "");
+        prompt.task_review = Some(crate::tasks::permissions_view(&tasks));
+        self.pending_task = Some(crate::tasks::PendingTask {
+            index: 0,
+            pane_pid: self.active_tab().active_pane().pty.child_pid(),
+            tasks,
+        });
+        self.workspace_search.close();
+        self.renderer.search_palette = None;
+        self.workspace_panel.focused = false;
+        self.active_prompt = Some(prompt);
+        self.begin_redraw();
+    }
+
+    fn task_review_layout(&self) -> Option<volt_renderer::task_review::ReviewLayout> {
+        let review = self.active_prompt.as_ref()?.task_review.as_ref()?;
+        let size = self.window.inner_size();
+        volt_renderer::task_review::ReviewLayout::new(
+            size.width as f32,
+            size.height as f32,
+            self.renderer.scale_factor,
+            review,
+        )
+    }
+
+    fn scroll_task_review(&mut self, delta: isize) {
+        let Some(l) = self.task_review_layout() else {
+            return;
+        };
+        if let Some(v) = self
+            .active_prompt
+            .as_mut()
+            .and_then(|p| p.task_review.as_mut())
+        {
+            v.scroll = l
+                .first
+                .saturating_add_signed(delta)
+                .min(l.lines.len().saturating_sub(l.count));
+        }
+        self.begin_redraw();
+    }
+
+    /// Trust the current tasks file after an explicit full-file review.
     fn trust_tasks(&mut self) {
         let Some((root, reviewed)) = self.tasks.tasks.as_ref().and_then(|t| {
             t.source_bytes
@@ -1297,10 +1377,7 @@ impl MainState {
         }
         if let Some(l) = self.renderer.workspace_card_layout() {
             if let Some(card) = self.renderer.workspace_card.as_mut() {
-                self.workspace_panel.scroll = self
-                    .workspace_panel
-                    .scroll
-                    .min(card.rows.len().saturating_sub(l.count));
+                self.workspace_panel.scroll = self.workspace_panel.scroll.min(l.max_scroll);
                 card.scroll = self.workspace_panel.scroll;
             }
         }
@@ -1346,7 +1423,7 @@ impl MainState {
                 return;
             }
             wp::TRUST_ROW => {
-                self.trust_tasks();
+                self.review_task_permissions();
                 return;
             }
             wp::EDIT_TASKS_ROW => {
@@ -1423,6 +1500,13 @@ impl MainState {
             let previous_grid = self.current_grid_size();
             self.workspace_panel.activate(id);
             self.sync_workspace_card();
+            if let (Some(l), Some(card)) = (
+                self.renderer.workspace_card_layout(),
+                self.renderer.workspace_card.as_ref(),
+            ) {
+                self.workspace_panel.scroll = l.scroll_for_action(id, card);
+                self.sync_workspace_card();
+            }
             if previous_grid != self.current_grid_size() {
                 self.resize_all_tabs_to_current_grid();
             }
@@ -2662,7 +2746,8 @@ impl MainState {
             crate::prompt::PromptKind::Find
             | crate::prompt::PromptKind::OpenLink
             | crate::prompt::PromptKind::ConfirmTask
-            | crate::prompt::PromptKind::ReviewTask => None,
+            | crate::prompt::PromptKind::ReviewTask
+            | crate::prompt::PromptKind::TrustTasks => None,
         };
         let initial = rename_initial_text(custom);
         self.active_prompt = Some(crate::prompt::TextPrompt::new(kind, &initial));
@@ -2686,13 +2771,20 @@ impl MainState {
                 // Enter/Shift+Enter cycle matches instead of confirming while
                 // a Find prompt is open; reaching here just closes it.
             }
-            crate::prompt::PromptKind::ConfirmTask | crate::prompt::PromptKind::ReviewTask => {
+            crate::prompt::PromptKind::ConfirmTask
+            | crate::prompt::PromptKind::ReviewTask
+            | crate::prompt::PromptKind::TrustTasks => {
                 if let Some(pending) = self.pending_task.take() {
                     if pending.applies_to(
                         self.tasks.tasks.as_ref(),
                         self.active_tab().active_pane().pty.child_pid(),
                     ) {
-                        self.run_task(pending.index, true);
+                        if prompt.kind == crate::prompt::PromptKind::TrustTasks {
+                            self.trust_tasks();
+                            self.begin_redraw();
+                        } else {
+                            self.run_task(pending.index, true);
+                        }
                     } else {
                         self.tasks.refresh();
                         self.set_task_message("Tasks changed. Select the task again to run it.");
@@ -4316,6 +4408,9 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::Focused(false) => {
+                if let Some(e) = state.theme_editor.as_mut() {
+                    e.picker_release();
+                }
                 state.reported_keys.clear();
                 if let Some(settings) = state.settings.as_mut() {
                     settings.pointer_release();
@@ -4360,6 +4455,9 @@ impl ApplicationHandler<VoltEvent> for App {
                 // A release outside our window may never arrive. Don't let a
                 // later click inherit an old tab drag candidate.
                 state.tab_drag = None;
+                if let Some(e) = state.theme_editor.as_mut() {
+                    e.picker_release();
+                }
                 if let Some(settings) = state.settings.as_mut() {
                     settings.pointer_release();
                 }
@@ -4379,6 +4477,17 @@ impl ApplicationHandler<VoltEvent> for App {
                     }
                     return;
                 }
+                if let Some(l) = state.renderer.theme_editor_layout() {
+                    let outcome = state
+                        .theme_editor
+                        .as_mut()
+                        .and_then(|e| e.picker_move(&l, position.x as f32, position.y as f32));
+                    if let Some(outcome) = outcome {
+                        state.mouse_pos = (position.x as f32, position.y as f32);
+                        state.apply_editor_outcome(outcome);
+                        return;
+                    }
+                }
                 let pointer_moved = state.mouse_pos != (position.x as f32, position.y as f32);
                 state.mouse_pos = (position.x as f32, position.y as f32);
                 if state
@@ -4386,7 +4495,18 @@ impl ApplicationHandler<VoltEvent> for App {
                     .as_ref()
                     .is_some_and(|p| p.kind.read_only())
                 {
-                    state.window.set_cursor(winit::window::CursorIcon::Default);
+                    let button = state.task_review_layout().is_some_and(|l| {
+                        matches!(
+                            l.hit(state.mouse_pos.0, state.mouse_pos.1),
+                            volt_renderer::task_review::ReviewHit::Primary
+                                | volt_renderer::task_review::ReviewHit::Cancel
+                        )
+                    });
+                    state.window.set_cursor(if button {
+                        winit::window::CursorIcon::Pointer
+                    } else {
+                        winit::window::CursorIcon::Default
+                    });
                     return;
                 }
                 if let Some(mut drag) = state.tab_drag {
@@ -4564,6 +4684,12 @@ impl ApplicationHandler<VoltEvent> for App {
                 button,
                 ..
             } => {
+                if button == MouseButton::Left && btn_state == ElementState::Released {
+                    if let Some(e) = state.theme_editor.as_mut() {
+                        e.picker_release();
+                    }
+                }
+
                 if state.settings.is_some() {
                     if btn_state == ElementState::Pressed && button == MouseButton::Left {
                         if let Some(layout) = state.renderer.settings_layout() {
@@ -4588,8 +4714,24 @@ impl ApplicationHandler<VoltEvent> for App {
                     .as_ref()
                     .is_some_and(|p| p.kind.read_only())
                 {
-                    // Confirmation is modal: don't activate the obscured card,
-                    // another task, a tab, or send a click to the terminal.
+                    // Confirmation is modal: never activate obscured controls.
+                    if btn_state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(l) = state.task_review_layout() {
+                            match l.hit(state.mouse_pos.0, state.mouse_pos.1) {
+                                volt_renderer::task_review::ReviewHit::Primary => {
+                                    state.search_mouse_capture = Some(button);
+                                    state.confirm_active_prompt()
+                                }
+                                volt_renderer::task_review::ReviewHit::Cancel => {
+                                    state.search_mouse_capture = Some(button);
+                                    state.active_prompt = None;
+                                    state.pending_task = None;
+                                    state.begin_redraw();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     return;
                 }
                 if button == MouseButton::Left && btn_state == ElementState::Released {
@@ -4680,7 +4822,17 @@ impl ApplicationHandler<VoltEvent> for App {
                             state.search_mouse_capture = Some(button);
                             let outcome = match (button, state.theme_editor.as_mut()) {
                                 (MouseButton::Left, Some(editor)) => match hit {
-                                    EditorHit::Field(i) => Some(editor.focus(i)),
+                                    EditorHit::Field(_)
+                                    | EditorHit::SaturationValue
+                                    | EditorHit::Hue
+                                    | EditorHit::Channel(_)
+                                    | EditorHit::Preset(_)
+                                    | EditorHit::Back => Some(editor.picker_press(
+                                        &l,
+                                        hit,
+                                        state.mouse_pos.0,
+                                        state.mouse_pos.1,
+                                    )),
                                     EditorHit::Close => {
                                         Some(crate::theme_editor::EditorOutcome::Cancel)
                                     }
@@ -5046,6 +5198,13 @@ impl ApplicationHandler<VoltEvent> for App {
                     .as_ref()
                     .is_some_and(|p| p.kind.read_only())
                 {
+                    let dy = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                    };
+                    if dy != 0. {
+                        state.scroll_task_review(if dy < 0. { 3 } else { -3 });
+                    }
                     return;
                 }
                 if state.renderer.task_form_layout().is_some_and(|l| {
@@ -5080,12 +5239,24 @@ impl ApplicationHandler<VoltEvent> for App {
                         if state.workspace_panel.minimized {
                             return;
                         }
-                        let count = state.workspace_panel.card().rows.len();
-                        let max = count.saturating_sub(l.count);
-                        state.workspace_panel.scroll = if dy < 0.0 {
-                            (state.workspace_panel.scroll + 1).min(max)
+                        let amount = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => -y * 28.,
+                            MouseScrollDelta::PixelDelta(p) => {
+                                -p.y as f32 / state.renderer.scale_factor
+                            }
+                        };
+                        if !amount.is_finite() || amount == 0. {
+                            return;
+                        }
+                        let amount = amount.abs().ceil().max(1.) as usize;
+                        state.workspace_panel.scroll = if dy < 0. {
+                            state
+                                .workspace_panel
+                                .scroll
+                                .saturating_add(amount)
+                                .min(l.max_scroll)
                         } else {
-                            state.workspace_panel.scroll.saturating_sub(1)
+                            state.workspace_panel.scroll.saturating_sub(amount)
                         };
                         state.sync_workspace_card();
                         state.begin_redraw();
@@ -5524,17 +5695,8 @@ impl ApplicationHandler<VoltEvent> for App {
                                 };
                                 state.workspace_panel.hover = Some(actions[i]);
                                 if let Some(l) = state.renderer.workspace_card_layout() {
-                                    let row = card
-                                        .rows
-                                        .iter()
-                                        .position(|r| r.action == Some(actions[i]))
-                                        .unwrap_or(0);
-                                    if row < state.workspace_panel.scroll {
-                                        state.workspace_panel.scroll = row;
-                                    }
-                                    if row >= state.workspace_panel.scroll + l.count {
-                                        state.workspace_panel.scroll = row + 1 - l.count;
-                                    }
+                                    state.workspace_panel.scroll =
+                                        l.scroll_for_action(actions[i], &card);
                                 }
                             }
                         }
@@ -5555,6 +5717,55 @@ impl ApplicationHandler<VoltEvent> for App {
                 // in every branch: falling through to terminal input here
                 // would silently leak keystrokes to the PTY while the user
                 // believes they're typing into the overlay.
+                if state
+                    .active_prompt
+                    .as_ref()
+                    .is_some_and(|p| p.task_review.is_some())
+                {
+                    match physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            state.active_prompt = None;
+                            state.pending_task = None;
+                            state.begin_redraw();
+                        }
+                        PhysicalKey::Code(KeyCode::Tab) => {
+                            if let Some(v) = state
+                                .active_prompt
+                                .as_mut()
+                                .and_then(|p| p.task_review.as_mut())
+                            {
+                                v.primary_focus = !v.primary_focus;
+                            }
+                            state.begin_redraw();
+                        }
+                        PhysicalKey::Code(
+                            KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space,
+                        ) => {
+                            if state.task_review_layout().is_some() {
+                                if state
+                                    .active_prompt
+                                    .as_ref()
+                                    .and_then(|p| p.task_review.as_ref())
+                                    .is_some_and(|v| v.primary_focus)
+                                {
+                                    state.confirm_active_prompt();
+                                } else {
+                                    state.active_prompt = None;
+                                    state.pending_task = None;
+                                    state.begin_redraw();
+                                }
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowDown) => state.scroll_task_review(1),
+                        PhysicalKey::Code(KeyCode::ArrowUp) => state.scroll_task_review(-1),
+                        PhysicalKey::Code(KeyCode::PageDown) => state.scroll_task_review(8),
+                        PhysicalKey::Code(KeyCode::PageUp) => state.scroll_task_review(-8),
+                        PhysicalKey::Code(KeyCode::Home) => state.scroll_task_review(isize::MIN),
+                        PhysicalKey::Code(KeyCode::End) => state.scroll_task_review(isize::MAX),
+                        _ => {}
+                    }
+                    return;
+                }
                 if state.active_prompt.is_some() {
                     if state.search_dirty
                         && matches!(
@@ -6163,11 +6374,16 @@ impl ApplicationHandler<VoltEvent> for App {
                         .collect();
                     let search_match = state.current_match_tuple();
                     let prompt_text = state.active_prompt.as_ref().map(|p| p.text());
+                    let task_review = state
+                        .active_prompt
+                        .as_ref()
+                        .and_then(|p| p.task_review.clone());
                     let prompt_overlay =
                         state
                             .active_prompt
                             .as_ref()
                             .map(|p| volt_renderer::PromptOverlay {
+                                task_review: task_review.as_ref(),
                                 title: p.title(),
                                 read_only: p.kind.read_only(),
                                 text: prompt_text.as_deref().unwrap_or(""),

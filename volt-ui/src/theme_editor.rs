@@ -52,6 +52,10 @@ pub struct ThemeEditor {
     fresh: bool,
     naming: Option<(Vec<char>, usize)>,
     status: Option<(String, bool)>,
+    picker_hue: f32,
+    picker_open: bool,
+    picker_drag: Option<volt_renderer::theme_editor::EditorHit>,
+    picker_focus: Option<volt_renderer::theme_editor::EditorHit>,
 }
 
 fn slot(theme: &Theme, i: usize) -> Color {
@@ -90,13 +94,17 @@ impl ThemeEditor {
             base_name: base_name.to_string(),
             target_id,
             original: theme.clone(),
-            working: theme,
+            working: theme.clone(),
             field: 0,
             last_ansi: 0,
             input: String::new(),
             fresh: true,
             naming: None,
             status: None,
+            picker_hue: volt_renderer::theme_editor::rgb_to_hsv(theme.background)[0],
+            picker_open: false,
+            picker_drag: None,
+            picker_focus: None,
         };
         editor.reset_input();
         editor
@@ -117,12 +125,18 @@ impl ThemeEditor {
     fn reset_input(&mut self) {
         self.input = slot(&self.working, self.field).to_hex();
         self.fresh = true;
+        let [h, s, _] = volt_renderer::theme_editor::rgb_to_hsv(slot(&self.working, self.field));
+        if s > 0. {
+            self.picker_hue = h;
+        }
     }
 
     /// Focus a color field, leaving "Save as" if it was open.
     pub fn focus(&mut self, field: usize) -> EditorOutcome {
         if field < FIELD_COUNT {
             self.naming = None;
+            self.picker_drag = None;
+            self.picker_focus = None;
             self.field = field;
             if field >= BASE_FIELDS {
                 self.last_ansi = field - BASE_FIELDS;
@@ -191,6 +205,12 @@ impl ThemeEditor {
         match Color::from_hex(&self.input) {
             Some(color) if color != slot(&self.working, self.field) => {
                 set_slot(&mut self.working, self.field, color);
+                let [h, s, _] = volt_renderer::theme_editor::rgb_to_hsv(color);
+                if s > 0. {
+                    self.picker_hue = h;
+                }
+                self.picker_focus = None;
+                self.picker_drag = None;
                 EditorOutcome::ThemeChanged
             }
             _ => EditorOutcome::Redraw,
@@ -333,6 +353,8 @@ impl ThemeEditor {
     }
 
     pub fn revert(&mut self) -> EditorOutcome {
+        self.picker_release();
+        self.picker_focus = None;
         self.naming = None;
         self.status = None;
         if self.working == self.original {
@@ -364,6 +386,142 @@ impl ThemeEditor {
         }
     }
 
+    pub fn picker_press(
+        &mut self,
+        l: &volt_renderer::theme_editor::ThemeEditorLayout,
+        hit: volt_renderer::theme_editor::EditorHit,
+        x: f32,
+        y: f32,
+    ) -> EditorOutcome {
+        use volt_renderer::theme_editor::EditorHit;
+        if self.is_naming() {
+            return EditorOutcome::Redraw;
+        }
+        match hit {
+            EditorHit::Back => {
+                self.picker_open = false;
+                self.picker_drag = None;
+                self.picker_focus = None;
+                return EditorOutcome::Redraw;
+            }
+            EditorHit::Field(i) => {
+                let o = self.focus(i);
+                if l.compact {
+                    self.picker_open = true;
+                }
+                return o;
+            }
+            EditorHit::Preset(i) if i < volt_renderer::theme_editor::PRESETS.len() => {
+                self.picker_focus = None;
+                self.picker_drag = None;
+                return self.pick_color(volt_renderer::theme_editor::PRESETS[i]);
+            }
+            EditorHit::Channel(i) if i >= 3 => return EditorOutcome::Redraw,
+            EditorHit::Hue | EditorHit::SaturationValue | EditorHit::Channel(_) => {
+                self.picker_focus = Some(hit);
+                self.picker_drag = Some(hit);
+            }
+            _ => return EditorOutcome::Redraw,
+        }
+        self.picker_at(l, hit, x, y)
+    }
+    pub fn picker_release(&mut self) {
+        self.picker_drag = None;
+    }
+    pub fn picker_move(
+        &mut self,
+        l: &volt_renderer::theme_editor::ThemeEditorLayout,
+        x: f32,
+        y: f32,
+    ) -> Option<EditorOutcome> {
+        if self.is_naming() {
+            self.picker_release();
+            return None;
+        }
+        self.picker_drag.map(|hit| self.picker_at(l, hit, x, y))
+    }
+    fn picker_at(
+        &mut self,
+        l: &volt_renderer::theme_editor::ThemeEditorLayout,
+        hit: volt_renderer::theme_editor::EditorHit,
+        x: f32,
+        y: f32,
+    ) -> EditorOutcome {
+        use volt_renderer::theme_editor::{hsv_to_rgb, rgb_to_hsv, EditorHit};
+        if !x.is_finite() || !y.is_finite() {
+            return EditorOutcome::Redraw;
+        }
+        let c = slot(&self.working, self.field);
+        let [_, s, v] = rgb_to_hsv(c);
+        let fraction = |r: [f32; 4]| ((x - r[0]) / r[2]).clamp(0., 1.);
+        let next = match hit {
+            EditorHit::Hue => {
+                self.picker_hue = (fraction(l.hue_rect()) * 360.).min(359.999);
+                hsv_to_rgb(self.picker_hue, s, v)
+            }
+            EditorHit::SaturationValue => {
+                let r = l.picker_rect();
+                hsv_to_rgb(
+                    self.picker_hue,
+                    fraction(r),
+                    1. - ((y - r[1]) / r[3]).clamp(0., 1.),
+                )
+            }
+            EditorHit::Channel(i) => {
+                let mut rgb = [c.r, c.g, c.b];
+                let r = l.channel_rect(i);
+                let f = ((x - r[0] - 8. * l.scale) / (r[2] - 16. * l.scale)).clamp(0., 1.);
+                rgb[i] = (f * 255.).round() as u8;
+                Color::rgb(rgb[0], rgb[1], rgb[2])
+            }
+            _ => c,
+        };
+        self.pick_color(next)
+    }
+    fn pick_color(&mut self, next: Color) -> EditorOutcome {
+        let changed = slot(&self.working, self.field) != next;
+        set_slot(&mut self.working, self.field, next);
+        self.reset_input();
+        self.status = None;
+        if changed {
+            EditorOutcome::ThemeChanged
+        } else {
+            EditorOutcome::Redraw
+        }
+    }
+    pub fn picker_key(&mut self, key: winit::keyboard::KeyCode) -> Option<EditorOutcome> {
+        use volt_renderer::theme_editor::{hsv_to_rgb, rgb_to_hsv, EditorHit};
+        use winit::keyboard::KeyCode;
+        let focus = self.picker_focus?;
+        let direction = match key {
+            KeyCode::ArrowRight | KeyCode::ArrowUp => 1.,
+            KeyCode::ArrowLeft | KeyCode::ArrowDown => -1.,
+            _ => return None,
+        };
+        let c = slot(&self.working, self.field);
+        let [_, s, v] = rgb_to_hsv(c);
+        let next = match focus {
+            EditorHit::Hue => {
+                self.picker_hue = (self.picker_hue + direction).rem_euclid(360.);
+                hsv_to_rgb(self.picker_hue, s, v)
+            }
+            EditorHit::SaturationValue => {
+                if matches!(key, KeyCode::ArrowUp | KeyCode::ArrowDown) {
+                    hsv_to_rgb(self.picker_hue, s, v + direction * 0.01)
+                } else {
+                    hsv_to_rgb(self.picker_hue, s + direction * 0.01, v)
+                }
+            }
+            EditorHit::Channel(i) => {
+                let mut rgb = [c.r, c.g, c.b];
+                rgb[i] = (rgb[i] as f32 + direction).clamp(0., 255.) as u8;
+                Color::rgb(rgb[0], rgb[1], rgb[2])
+            }
+            _ => return None,
+        };
+        Some(self.pick_color(next))
+    }
+
     pub fn view(&self) -> ThemeEditorView {
         let dirty = self.working != self.original;
         let ansi_slot = if self.field >= BASE_FIELDS {
@@ -372,6 +530,14 @@ impl ThemeEditor {
             self.last_ansi
         };
         ThemeEditorView {
+            picked: slot(&self.working, self.field),
+            picker_hue: self.picker_hue,
+            picker_open: self.picker_open,
+            picked_label: if self.field < BASE_FIELDS {
+                BASE_LABELS[self.field].into()
+            } else {
+                ansi_label(self.field - BASE_FIELDS)
+            },
             subtitle: format!(
                 "{}{}",
                 self.base_name,
@@ -403,6 +569,50 @@ mod tests {
 
     fn editor() -> ThemeEditor {
         ThemeEditor::new("Nord", None, Theme::by_name("nord"))
+    }
+
+    #[test]
+    fn visual_picker_changes_only_selected_slot_and_cancel_remains_transactional() {
+        use volt_renderer::theme_editor::{EditorHit, ThemeEditorLayout};
+        let mut e = editor();
+        let original = e.original().clone();
+        let l = ThemeEditorLayout::new(1000., 800., 0., 1.).unwrap();
+        e.focus(BASE_FIELDS + 4);
+        assert_eq!(
+            e.picker_press(&l, EditorHit::Preset(0), 0., 0.),
+            EditorOutcome::ThemeChanged
+        );
+        assert_eq!(e.working().ansi[4], volt_renderer::theme_editor::PRESETS[0]);
+        assert_eq!(e.working().background, original.background);
+        let r = l.channel_rect(1);
+        e.picker_press(&l, EditorHit::Channel(1), r[0] + r[2] + 100., r[1]);
+        assert_eq!(e.working().ansi[4].g, 255);
+        e.picker_move(&l, r[0] - 100., r[1]);
+        assert_eq!(e.working().ansi[4].g, 0);
+        e.picker_release();
+        assert!(e.picker_move(&l, 0., 0.).is_none());
+        assert_eq!(e.original(), &original);
+        assert_eq!(e.revert(), EditorOutcome::ThemeChanged);
+        assert_eq!(e.working(), &original);
+    }
+    #[test]
+    fn hue_is_retained_for_black_and_compact_picker_can_return_to_fields() {
+        use volt_renderer::theme_editor::{EditorHit, ThemeEditorLayout};
+        let mut e = editor();
+        let mut l = ThemeEditorLayout::new(400., 800., 0., 1.).unwrap();
+        e.picker_press(&l, EditorHit::Field(0), 0., 0.);
+        assert!(e.view().picker_open);
+        l.picker_open = true;
+        e.pick_color(Color::rgb(0, 0, 0));
+        let h = l.hue_rect();
+        e.picker_press(&l, EditorHit::Hue, h[0] + h[2] / 3., h[1]);
+        e.picker_release();
+        assert!((e.view().picker_hue - 120.).abs() < 0.01);
+        let r = l.picker_rect();
+        e.picker_press(&l, EditorHit::SaturationValue, r[0] + r[2], r[1]);
+        assert_eq!(e.working().background, Color::rgb(0, 255, 0));
+        e.picker_press(&l, EditorHit::Back, 0., 0.);
+        assert!(!e.view().picker_open);
     }
 
     #[test]

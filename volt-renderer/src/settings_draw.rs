@@ -52,6 +52,11 @@ impl Renderer {
         theme: &Theme,
     ) {
         let Some(l) = self.settings_layout() else {
+            #[cfg(feature = "ui-gpu-prototype")]
+            {
+                self.settings_gpu.hide();
+                self.settings_cache = None;
+            }
             return;
         };
         if !self.settings_cache.as_ref().is_some_and(|c| {
@@ -371,6 +376,16 @@ impl Renderer {
                     );
                 }
             }
+            #[cfg(feature = "ui-gpu-prototype")]
+            self.settings_gpu.prepare(
+                &self.device,
+                &self.queue,
+                self.config.format,
+                [self.config.width, self.config.height],
+                &self.atlas,
+                &b,
+                &g,
+            );
             self.settings_cache = Some(SettingsGeometry {
                 view: view.clone(),
                 layout: l,
@@ -381,6 +396,10 @@ impl Renderer {
                 bg: b,
                 glyphs: g,
             });
+        }
+        #[cfg(feature = "ui-gpu-prototype")]
+        if self.settings_gpu.ready() {
+            return;
         }
         if let Some(c) = &self.settings_cache {
             bg.extend_from_slice(&c.bg);

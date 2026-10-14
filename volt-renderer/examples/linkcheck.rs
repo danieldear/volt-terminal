@@ -30,6 +30,7 @@ fn main() -> Result<()> {
                     &[],
                     None,
                     Some(PromptOverlay {
+                        task_review: None,
                         title: "Open link? Enter: open / Esc: cancel",
                         text,
                         read_only: true,

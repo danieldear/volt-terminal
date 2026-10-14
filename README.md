@@ -51,12 +51,12 @@ including the dynamic Services submenu, is genuine.
 
 ## Shared UI toolkit
 
-The v0.1.15 source includes the refreshed UI Kit 0.4.0 integration (Rust 1.89+),
-while retaining Volt’s wgpu 29 renderer, terminal compatibility batch and
-Unicode row-cache buffer reuse. The maintainer reports real-app results near
-23 seconds for the v0.1.14 Unicode fix; this integration has not had a new
-full-app benchmark. This is not an independent
-matched benchmark or a claim of universal speedup. See the
+The v0.1.16 source includes the refreshed UI Kit 0.4.0 integration (Rust 1.89+),
+semantic workspace cards, structured task review and a visual theme color picker,
+while retaining Volt’s wgpu 29 terminal renderer and Unicode row-cache reuse.
+The maintainer's two latest local TermMarkV2 runs were 22.2787s and 22.6466s.
+These are user-reported measurements, not an independent matched benchmark or
+a claim of universal speedup. See the
 [performance investigation](docs/unicode-rendering-performance.md).
 
 
@@ -300,8 +300,9 @@ confirm = true          # optional: show the command and ask before each run
   Its buttons show a shield: clicking one previews that command and its folder,
   Enter runs it **once**, and Escape cancels. That doesn't trust the file or
   its other tasks.
-- For one-click runs, review every command in the card and choose **Trust these
-  tasks**. Any change to the file invalidates trust and pending confirmations.
+- For one-click runs, choose **Review permissions** in the Tasks section.
+  Inspect every command in the scrollable dialog, then choose **Trust tasks**.
+  Trusting a file does not run anything; `confirm = true` still asks each time. Any change to the file invalidates trust and pending confirmations.
 - Tasks you add in Volt to a new or already trusted file are trusted
   automatically. Adding a task never trusts commands you haven't reviewed.
 - Each command must be a single line. Symlinked files or `.volt` folders,

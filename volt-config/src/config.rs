@@ -30,7 +30,7 @@ impl Default for FontConfig {
 pub struct ShellConfig {
     #[serde(default = "default_shell")]
     pub program: String,
-    #[serde(default)]
+    #[serde(default = "default_shell_args")]
     pub args: Vec<String>,
     #[serde(default)]
     pub integration: bool,
@@ -738,6 +738,19 @@ fn with_theme_line(text: &str, id: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn partial_shell_configuration_preserves_login_default() {
+        let shell: ShellConfig = toml::from_str("integration = true\nprompt = 'meow'").unwrap();
+        assert_eq!(shell.args, ShellConfig::default().args);
+        assert_eq!(shell.args, ["-l"]);
+    }
+
+    #[test]
+    fn explicit_non_login_shell_configuration_is_preserved() {
+        let shell: ShellConfig = toml::from_str("args = []\nintegration = true").unwrap();
+        assert!(shell.args.is_empty());
+    }
+
     use super::*;
 
     #[test]

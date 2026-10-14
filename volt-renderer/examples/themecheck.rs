@@ -43,6 +43,10 @@ fn view(theme: &Theme, naming: bool) -> ThemeEditorView {
     rows[1].text = "#a0b".into();
     rows[1].valid = false;
     ThemeEditorView {
+        picked: theme.foreground,
+        picker_hue: volt_renderer::theme_editor::rgb_to_hsv(theme.foreground)[0],
+        picker_open: false,
+        picked_label: "Foreground".into(),
         subtitle: "Nord · modified".into(),
         rows,
         ansi: theme.ansi,
@@ -74,62 +78,67 @@ fn main() -> Result<()> {
     let mut cases = 0;
     for scale in [1., 1.5, 2.] {
         for height in [1., 1.2, 1.8] {
-            let (w, h) = ((1050. * scale) as u32, (720. * scale) as u32);
-            let mut r =
-                pollster::block_on(Renderer::new_offscreen(w, h, 14., scale, "SF Mono", height))?;
-            let size = r.grid_size();
-            let empty = Grid::new(size.0, size.1);
-            let mut filled = Grid::new(size.0, size.1);
-            for y in 0..size.1 {
-                for x in 0..size.0 {
-                    let mut c = Cell::default();
-                    c.set_char('#');
-                    filled.put_char(x, y, c);
-                }
-            }
-            draw(&mut r, &filled, &edited);
-            let baseline = r.read_offscreen_rgba()?;
-
-            for naming in [false, true] {
-                r.theme_editor = Some(view(&edited, naming));
-                anyhow::ensure!(r.grid_size() == size, "editor resized terminal grid");
-                draw(&mut r, &empty, &edited);
-                let over_empty = r.read_offscreen_rgba()?;
-                draw(&mut r, &filled, &edited);
-                let over_filled = r.read_offscreen_rgba()?;
-                anyhow::ensure!(
-                    panel_pixels(&r, &over_empty, w) == panel_pixels(&r, &over_filled, w),
-                    "terminal text bleeds through the editor"
-                );
-                draw(&mut r, &filled, &edited);
-                anyhow::ensure!(
-                    over_filled == r.read_offscreen_rgba()?,
-                    "editor cache changes pixels"
-                );
-                // The panel uses fixed colors; only its swatches show the theme.
-                draw(&mut r, &filled, &other);
-                anyhow::ensure!(
-                    panel_pixels(&r, &over_filled, w)
-                        == panel_pixels(&r, &r.read_offscreen_rgba()?, w),
-                    "editor chrome depends on the window theme"
-                );
-                let f = std::fs::File::create(format!(
-                    "target/themecheck/editor-{scale}-{height}-{}.png",
-                    if naming { "naming" } else { "fields" }
+            for width in [1050., 400.] {
+                let (w, h) = ((width * scale) as u32, (720. * scale) as u32);
+                let mut r = pollster::block_on(Renderer::new_offscreen(
+                    w, h, 14., scale, "SF Mono", height,
                 ))?;
-                let mut png = png::Encoder::new(f, w, h);
-                png.set_color(png::ColorType::Rgba);
-                png.set_depth(png::BitDepth::Eight);
-                png.write_header()?.write_image_data(&over_filled)?;
-            }
+                let size = r.grid_size();
+                let empty = Grid::new(size.0, size.1);
+                let mut filled = Grid::new(size.0, size.1);
+                for y in 0..size.1 {
+                    for x in 0..size.0 {
+                        let mut c = Cell::default();
+                        c.set_char('#');
+                        filled.put_char(x, y, c);
+                    }
+                }
+                draw(&mut r, &filled, &edited);
+                let baseline = r.read_offscreen_rgba()?;
 
-            r.theme_editor = None;
-            draw(&mut r, &filled, &edited);
-            anyhow::ensure!(
-                r.read_offscreen_rgba()? == baseline,
-                "editor hide leaves stale pixels"
-            );
-            cases += 1;
+                for naming in [false, true] {
+                    let mut editor_view = view(&edited, naming);
+                    editor_view.picker_open = width < 600.;
+                    r.theme_editor = Some(editor_view);
+                    anyhow::ensure!(r.grid_size() == size, "editor resized terminal grid");
+                    draw(&mut r, &empty, &edited);
+                    let over_empty = r.read_offscreen_rgba()?;
+                    draw(&mut r, &filled, &edited);
+                    let over_filled = r.read_offscreen_rgba()?;
+                    anyhow::ensure!(
+                        panel_pixels(&r, &over_empty, w) == panel_pixels(&r, &over_filled, w),
+                        "terminal text bleeds through the editor"
+                    );
+                    draw(&mut r, &filled, &edited);
+                    anyhow::ensure!(
+                        over_filled == r.read_offscreen_rgba()?,
+                        "editor cache changes pixels"
+                    );
+                    // The panel uses fixed colors; only its swatches show the theme.
+                    draw(&mut r, &filled, &other);
+                    anyhow::ensure!(
+                        panel_pixels(&r, &over_filled, w)
+                            == panel_pixels(&r, &r.read_offscreen_rgba()?, w),
+                        "editor chrome depends on the window theme"
+                    );
+                    let f = std::fs::File::create(format!(
+                        "target/themecheck/editor-{width}-{scale}-{height}-{}.png",
+                        if naming { "naming" } else { "fields" }
+                    ))?;
+                    let mut png = png::Encoder::new(f, w, h);
+                    png.set_color(png::ColorType::Rgba);
+                    png.set_depth(png::BitDepth::Eight);
+                    png.write_header()?.write_image_data(&over_filled)?;
+                }
+
+                r.theme_editor = None;
+                draw(&mut r, &filled, &edited);
+                anyhow::ensure!(
+                    r.read_offscreen_rgba()? == baseline,
+                    "editor hide leaves stale pixels"
+                );
+                cases += 1;
+            }
         }
     }
     println!("PASS: {cases} theme editor GPU cases (opaque, theme-independent, cache, clean hide)");

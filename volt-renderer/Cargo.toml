@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Experimental UI-only rendering. Binary also requires VOLT_UI_GPU_SETTINGS=1.
+ui-gpu-prototype = ["volt-ui-kit/native-gpu"]
+
 [dependencies]
 volt-ui-kit = { version = "0.4.0", path = "../vendor/volt-ui-kit", default-features = false, features = ["rust-ui"] }
 anyhow = { workspace = true }
@@ -20,3 +24,12 @@ volt-config = { path = "../volt-config" }
 [dev-dependencies]
 vte = "0.15"
 png = "0.17"
+serde_json = "1"
+
+[[example]]
+name = "uigpucheck"
+required-features = ["ui-gpu-prototype"]
+
+[[example]]
+name = "settingsgpucheck"
+required-features = ["ui-gpu-prototype"]

@@ -118,8 +118,17 @@ fn main() -> Result<()> {
         anyhow::ensure!(r.grid_size() == size, "strip resized the grid");
         draw(&mut r, &filled, &theme);
         let with_strip = r.read_offscreen_rgba()?;
+        let review = volt_renderer::task_review::TaskReview {
+            mode: volt_renderer::task_review::ReviewMode::RunOnce,
+            name: "Build release".into(),
+            directory: "/Users/example/code/atlas".into(),
+            command: "(cd '/Users/example/code/atlas' && cargo build --release)".into(),
+            scroll: 0,
+            primary_focus: true,
+        };
         let prompt = || {
             Some(PromptOverlay {
+                task_review: Some(&review),
                 title: "Review task · Enter: run once / Esc: cancel",
                 text: "cargo build --release",
                 read_only: true,
@@ -148,6 +157,46 @@ fn main() -> Result<()> {
         anyhow::ensure!(
             prompt_over_strip == r.read_offscreen_rgba()?,
             "task strip obscures command confirmation"
+        );
+        draw_with_prompt(&mut r, &filled, &theme, prompt());
+        anyhow::ensure!(
+            prompt_over_strip == r.read_offscreen_rgba()?,
+            "cached task review changed"
+        );
+        for mode in [
+            volt_renderer::task_review::ReviewMode::Confirm,
+            volt_renderer::task_review::ReviewMode::TrustFile,
+        ] {
+            let mut long_review = review.clone();
+            long_review.mode = mode;
+            long_review.command = format!("echo {}SAFE_END", "long-command-日本 ".repeat(80));
+            long_review.scroll = usize::MAX;
+            draw_with_prompt(
+                &mut r,
+                &filled,
+                &theme,
+                Some(PromptOverlay {
+                    task_review: Some(&long_review),
+                    title: "Review",
+                    text: "",
+                    read_only: true,
+                    cursor: 0,
+                    match_count: 0,
+                    matches_truncated: false,
+                    current_match: 0,
+                }),
+            );
+            png(
+                &format!("target/taskcheck/review-{mode:?}-{scale}.png"),
+                w,
+                h,
+                &r.read_offscreen_rgba()?,
+            )?;
+        }
+        draw(&mut r, &filled, &theme);
+        anyhow::ensure!(
+            baseline == r.read_offscreen_rgba()?,
+            "task review left pixels behind after closing"
         );
         r.task_strip = Some(strip());
         draw(&mut r, &filled, &theme);
