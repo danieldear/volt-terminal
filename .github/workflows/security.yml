@@ -1,7 +1,7 @@
 name: Dependency audit
 on:
   push:
-    branches: [main, feature/workspace-theme-ui]
+    branches: [main]
   pull_request:
   schedule:
     - cron: '23 10 * * 1'

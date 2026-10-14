@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - feature/workspace-theme-ui
     tags:
       - 'v*'
   pull_request:
