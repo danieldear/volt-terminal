@@ -518,7 +518,7 @@ impl ClipVertex for GlyphVertex {
     }
 }
 fn clip_triangles<V: ClipVertex>(input: &[V], output: &mut Vec<V>, bounds: [f32; 4]) {
-    for triangle in input.chunks_exact(3) {
+    for triangle in input.as_chunks::<3>().0 {
         let mut poly = triangle.to_vec();
         for (axis, edge, lower) in [
             (0, bounds[0], true),

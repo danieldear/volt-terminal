@@ -76,8 +76,9 @@ still requests a non-login shell.
 ## Automated validation
 
 ```sh
-RUST_MIN_STACK=33554432 cargo test --locked --workspace --features volt/ui-gpu-prototype
-cargo clippy --locked --workspace --all-targets --features volt/ui-gpu-prototype -- -D warnings
+RUST_MIN_STACK=33554432 cargo test --locked --workspace
+RUST_MIN_STACK=33554432 cargo test --locked -p volt -p volt-ui -p volt-renderer --features volt/ui-gpu-prototype
+cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo run --locked --release -p volt-renderer --example cardcheck
 cargo run --locked --release -p volt-renderer --example themecheck
 ```
@@ -85,3 +86,10 @@ cargo run --locked --release -p volt-renderer --example themecheck
 The UI fixtures exercise cached pixels, clipping, real hit targets, clean hide,
 wide/compact color picking, and 1× / 1.5× / 2× backing scales. Native drag, click,
 keyboard and theme restoration checks are additional acceptance gates.
+
+The optional host suite deliberately tests Volt packages; toolkit-native
+font-alias/weight shaping is owned by upstream toolkit CI. Two such dependency
+tests fail on the macOS 26 hosted image. Volt's GPU Settings bridge transfers
+glyphs already shaped by Volt, so it does not use that native text path. The
+default workspace suite still validates the pinned toolkit's production feature
+set, and `settingsgpucheck` validates the real optional host compositor.
