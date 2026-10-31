@@ -32,7 +32,19 @@ pub enum VoltEvent {
     /// PTY reader thread produced output — request a redraw.
     PtyData,
     WorkspaceUpdated,
+    ClipboardReadResult {
+        window_id: WindowId,
+        operation: u64,
+        result: ClipboardReadResult,
+    },
+    ClipboardWriteResult {
+        window_id: WindowId,
+        operation: u64,
+        success: bool,
+    },
     PreferencesSaved,
+    #[cfg(target_os = "macos")]
+    ToggleQuickTerminal,
     SettingsAction {
         window_id: WindowId,
         action: crate::settings::Outcome,
@@ -53,6 +65,173 @@ pub enum VoltEvent {
     /// `muda::MenuId` string; resolved to a `menu::MenuAction` on receipt so
     /// this event type doesn't need to depend on `muda`'s types directly.
     Menu(String),
+}
+
+/// Redacted even if a user event is debug-printed; clones share one bounded payload.
+#[derive(Clone)]
+pub struct ClipboardReadResult(Arc<std::io::Result<Vec<u8>>>);
+impl std::fmt::Debug for ClipboardReadResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClipboardReadResult(<redacted>)")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClipboardIdentity {
+    tab: usize,
+    pane: usize,
+    pid: Option<u32>,
+    performer: usize,
+    cwd: Option<std::path::PathBuf>,
+    sensitive: bool,
+    read_only: bool,
+    // Every modal, not just the highest-priority surface, belongs to this snapshot.
+    surfaces: [bool; 7],
+    prompt: Option<crate::prompt::PromptKind>,
+    rename_target: Option<usize>,
+    settings_focus: Option<(usize, usize)>,
+    editor_focus: Option<(usize, bool)>,
+    form_focus: Option<usize>,
+    search_focus: Option<(usize, usize, bool)>,
+    prompt_cursor: Option<usize>,
+}
+struct ClipboardFlight {
+    operation: u64,
+    identity: ClipboardIdentity,
+    // Retain the allocation so a closed/replaced pane cannot reuse its identity.
+    _performer: Arc<std::sync::Mutex<volt_core::performer::Performer>>,
+    valid: bool,
+    read: bool,
+    selection: Option<Selection>,
+}
+impl ClipboardFlight {
+    fn accepts(&self, operation: u64, identity: &ClipboardIdentity, focused: bool) -> bool {
+        clipboard_result_applies(
+            self.valid,
+            self.operation,
+            operation,
+            &self.identity,
+            identity,
+            focused,
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClipboardPasteDisposition {
+    Direct,
+    Review,
+    Block,
+}
+
+/// Protected-input intent must be explicit and remain on the same sensitivity
+/// snapshot. Never preview secrets, even when unsafe-paste confirmation is off.
+fn clipboard_paste_disposition(
+    data: &[u8],
+    bracketed: bool,
+    sensitive: bool,
+    confirm_unsafe: bool,
+) -> ClipboardPasteDisposition {
+    let unsafe_data = crate::clipboard_safety::requires_review(data, bracketed);
+    if sensitive {
+        // Bracketed mode may make multiline commands safe in an ordinary TUI,
+        // but protected-input paste is strictly single-line and control-free.
+        let control_free =
+            std::str::from_utf8(data).is_ok_and(|text| !text.chars().any(char::is_control));
+        if unsafe_data || !control_free {
+            ClipboardPasteDisposition::Block
+        } else {
+            ClipboardPasteDisposition::Direct
+        }
+    } else if unsafe_data && confirm_unsafe {
+        ClipboardPasteDisposition::Review
+    } else {
+        ClipboardPasteDisposition::Direct
+    }
+}
+
+fn clipboard_host_accepts(
+    app_focused: bool,
+    window_focused: bool,
+    visible: Option<bool>,
+    quick_visible: bool,
+) -> bool {
+    app_focused && window_focused && visible != Some(false) && quick_visible
+}
+
+fn clipboard_result_applies(
+    valid: bool,
+    expected: u64,
+    received: u64,
+    origin: &ClipboardIdentity,
+    current: &ClipboardIdentity,
+    focused: bool,
+) -> bool {
+    valid && expected == received && focused && origin == current
+}
+
+/// Bounded extraction, including intermediate row storage. Oversize is refused,
+/// never returned as a truncated successful copy.
+fn bounded_clipboard_selection(selection: Selection, grid: &Grid, cap: usize) -> Option<String> {
+    let sel = selection.normalized();
+    let start = sel.start_row.checked_sub(grid.scrollback_origin())?;
+    let end = sel.end_row.checked_sub(grid.scrollback_origin())?;
+    let history = grid.scrollback_len();
+    if grid.cols == 0 || start >= history + grid.rows || end >= history + grid.rows {
+        return None;
+    }
+    let block = matches!(sel.mode, SelectionMode::Block);
+    let mut out = String::new();
+    for row in start..=end {
+        let first = if block || row == start {
+            sel.start_col
+        } else {
+            0
+        };
+        let last = if block || row == end {
+            sel.end_col.min(grid.cols - 1)
+        } else {
+            grid.cols - 1
+        };
+        let cells = if row < history {
+            grid.scrollback_row(row)
+        } else {
+            grid.row_cells(row - history)
+        };
+        let mut line = String::new();
+        if first <= last && first < grid.cols {
+            for cell in &cells[first..=last] {
+                if cell.is_continuation() || cell.is_wrap_spacer() {
+                    continue;
+                }
+                let bytes = grid
+                    .extended_text(cell)
+                    .map_or_else(|| cell.c().len_utf8(), str::len);
+                if bytes > cap.saturating_sub(out.len() + line.len()) {
+                    return None;
+                }
+                grid.push_cell_text(&mut line, cell);
+            }
+        }
+        let wrapped = if row < history {
+            grid.scrollback_row_soft_wrapped(row)
+        } else {
+            grid.row_soft_wrapped(row - history)
+        };
+        let line = if block || (wrapped && row != end) {
+            line.as_str()
+        } else {
+            line.trim_end_matches(' ')
+        };
+        out.push_str(line);
+        if row != end && (block || !wrapped) {
+            if out.len() == cap {
+                return None;
+            }
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -190,12 +369,14 @@ enum PaneFocusDirection {
 // ── main window state ────────────────────────────────────────────────────────
 
 struct MainState {
+    is_quick_terminal: bool,
     id: WindowId,
     window: Arc<Window>,
     #[cfg(target_os = "macos")]
     _native_text: crate::native_text::NativeTextInput,
     renderer: Renderer,
     render_snapshot: Option<Grid>,
+    inline_images: crate::inline_image::Host,
     synchronized_deadlines: HashMap<usize, Instant>,
     reported_keys: HashMap<PhysicalKey, (usize, bool, crate::keyboard_protocol::ProtocolKey)>,
     tabs: Vec<TerminalTab>,
@@ -210,6 +391,8 @@ struct MainState {
     right_super_down: bool,
     config: Config,
     keybindings: crate::keybindings::Bindings,
+    advanced_keyboard: crate::keybindings::KeyboardDispatcher,
+    ime_composing: bool,
     mouse_pos: (f32, f32),
     is_drag_selecting: bool,
     /// Armed only while a drag is held at the top/bottom of its originating pane.
@@ -271,6 +454,9 @@ struct MainState {
     tasks: crate::tasks::TaskLoader,
     /// One exact task/file/pane snapshot awaiting explicit confirmation.
     pending_task: Option<crate::tasks::PendingTask>,
+    pending_transfer: Option<crate::clipboard_safety::PendingTransfer>,
+    clipboard_flight: Option<ClipboardFlight>,
+    sensitive_input_requested: bool,
     /// A short note about the last task action ("Added …", or why it didn't
     /// run), shown with the tasks for a few seconds.
     task_message: Option<(String, Instant)>,
@@ -278,7 +464,202 @@ struct MainState {
     task_form: Option<crate::task_form::TaskForm>,
 }
 
+/// Strict, positively known echo only. Read-only panes are conservatively
+/// withheld as they can contain privileged/remote inspection output.
+#[cfg(target_os = "macos")]
+fn ax_render_sensitivity(
+    manual_secure: bool,
+    secure_active: bool,
+    read_only: bool,
+    echo_enabled: Option<bool>,
+) -> crate::native_text::accessibility::Sensitivity {
+    use crate::native_text::accessibility::Sensitivity;
+    if manual_secure {
+        Sensitivity::ManualSecure
+    } else if secure_active || echo_enabled == Some(false) {
+        Sensitivity::NoEcho
+    } else if read_only || echo_enabled.is_none() {
+        Sensitivity::Unknown
+    } else {
+        Sensitivity::KnownSafe
+    }
+}
+
+/// Serialize only the active pane rectangle in the displayed composite grid.
+/// Bounded while extracting, not merely after constructing an unbounded string.
+#[cfg(target_os = "macos")]
+fn ax_visible_pane_snapshot(
+    grid: &Grid,
+    rect: crate::pane_tree::PaneRect,
+    sensitivity: crate::native_text::accessibility::Sensitivity,
+    selection: Option<((usize, usize), (usize, usize))>,
+) -> crate::native_text::accessibility::AccessibilitySnapshot {
+    use crate::native_text::accessibility::{
+        AccessibilitySnapshot, Sensitivity, TextRange, MAX_ROWS, MAX_UTF16,
+    };
+    if sensitivity != Sensitivity::KnownSafe
+        || rect.cols == 0
+        || rect.rows == 0
+        || rect
+            .col
+            .checked_add(rect.cols)
+            .is_none_or(|end| end > grid.cols)
+        || rect
+            .row
+            .checked_add(rect.rows)
+            .is_none_or(|end| end > grid.rows)
+    {
+        return AccessibilitySnapshot::default();
+    }
+    let selection = selection.filter(|(start, end)| {
+        let inside = |&(col, row): &(usize, usize)| {
+            col >= rect.col
+                && col < rect.col + rect.cols
+                && row >= rect.row
+                && row < rect.row + rect.rows
+        };
+        inside(start) && inside(end) && (start.1, start.0) <= (end.1, end.0)
+    });
+    let mut text = String::with_capacity(MAX_UTF16);
+    let mut units = 0;
+    let mut selected_start = None;
+    let mut selected_end = None;
+    'rows: for row in rect.row..rect.row + rect.rows.min(MAX_ROWS) {
+        if row != rect.row {
+            if units == MAX_UTF16 {
+                break;
+            }
+            text.push('\n');
+            units += 1;
+        }
+        for col in rect.col..rect.col + rect.cols {
+            let cell = grid.cell(col, row);
+            if cell.is_continuation() || cell.is_wrap_spacer() {
+                continue;
+            }
+            if selection.is_some_and(|(start, _)| start == (col, row)) {
+                selected_start = Some(units);
+            }
+            if let Some(cluster) = grid.extended_text(cell) {
+                for ch in cluster.chars() {
+                    if units + ch.len_utf16() > MAX_UTF16 {
+                        break 'rows;
+                    }
+                    text.push(ch);
+                    units += ch.len_utf16();
+                }
+            } else {
+                let ch = cell.c();
+                if units + ch.len_utf16() > MAX_UTF16 {
+                    break 'rows;
+                }
+                text.push(ch);
+                units += ch.len_utf16();
+            }
+            if selection.is_some_and(|(_, end)| end == (col, row)) {
+                selected_end = Some(units);
+            }
+        }
+    }
+    let selected = selected_start.zip(selected_end).and_then(|(start, end)| {
+        end.checked_sub(start).map(|length| TextRange {
+            location: start,
+            length,
+        })
+    });
+    AccessibilitySnapshot::terminal_output(&text, sensitivity, selected)
+}
+
 impl MainState {
+    /// Snapshot anchor metadata only under PTY locks; no decoding/uploads there.
+    fn sync_inline_images(&mut self) {
+        // Ordinary terminal frames do not even inspect panes for image state.
+        if self.inline_images.empty() {
+            return;
+        }
+        if !self.config.inline_images.enabled {
+            self.inline_images.disable();
+            self.inline_images.poll(1, 1, false);
+            self.renderer.set_inline_images(Vec::new());
+            return;
+        }
+        let mut live = HashMap::new();
+        for tab in &mut self.tabs {
+            tab.tree.for_each_leaf_mut(&mut |_, pane| {
+                if let Ok(p) = pane.performer.lock() {
+                    let owner = Arc::as_ptr(&pane.performer) as usize;
+                    for alt in [false, true] {
+                        live.insert(
+                            (owner, alt, p.inline_image_epoch(alt)),
+                            p.inline_image_oldest_row(alt),
+                        );
+                    }
+                }
+            });
+        }
+        self.inline_images.reconcile(&live);
+        let cw = self.renderer.cell_width;
+        let ch = self.renderer.cell_height;
+        if self.inline_images.poll(
+            cw.ceil() as u32,
+            ch.ceil() as u32,
+            self.config.inline_images.enabled,
+        ) {
+            self.inline_images.reconcile(&live);
+            self.mark_full_redraw();
+            self.queue_redraw();
+        }
+        let mut images = Vec::new();
+        let pad = self.renderer.padding * self.renderer.scale_factor;
+        let top = self.current_content_top_offset() + pad;
+        let (cols, rows) = self.current_grid_size();
+        for rect in self.active_tab().tree.layout(cols, rows) {
+            let Some(pane) = self.active_tab().tree.find_leaf(rect.id) else {
+                continue;
+            };
+            let metadata = pane.performer.lock().ok().and_then(|p| {
+                let alt = p.alternate_screen_active();
+                let screen = self.inline_images.screen((
+                    Arc::as_ptr(&pane.performer) as usize,
+                    alt,
+                    p.inline_image_epoch(alt),
+                ))?;
+                let offset = pane.scroll_view_offset.min(p.grid.scrollback_len());
+                Some((screen, p.grid.viewport_absolute_row(offset, 0)? as u64))
+            });
+            let Some((screen, top_row)) = metadata else {
+                continue;
+            };
+            let left = pad + rect.col as f32 * cw;
+            let pane_top = top + rect.row as f32 * ch;
+            let viewport = crate::inline_image::Viewport {
+                screen,
+                top_row,
+                left_column: 0,
+                columns: rect.cols as u32,
+                rows: rect.rows as u32,
+            };
+            for visible in self.inline_images.store.visible(viewport) {
+                let stored = visible.stored;
+                let anchor = stored.anchor();
+                let extent = stored.extent();
+                images.push(volt_renderer::InlineImage {
+                    id: stored.id().0,
+                    pixels: stored.image().pixels(),
+                    width: stored.image().width(),
+                    height: stored.image().height(),
+                    rect: [
+                        left + anchor.column as f32 * cw,
+                        pane_top + (anchor.row as i128 - top_row as i128) as f32 * ch,
+                        extent.columns as f32 * cw,
+                        extent.rows as f32 * ch,
+                    ],
+                    clip: [left, pane_top, rect.cols as f32 * cw, rect.rows as f32 * ch],
+                });
+            }
+        }
+        self.renderer.set_inline_images(images);
+    }
     fn open_config(&mut self) {
         self.open_settings(false);
     }
@@ -290,6 +671,8 @@ impl MainState {
         self.task_form = None;
         self.renderer.task_form = None;
         self.pending_task = None;
+        self.pending_transfer = None;
+        self.advanced_keyboard.reset();
         self.active_prompt = None;
         self.workspace_search.close();
         self.renderer.search_palette = None;
@@ -1654,6 +2037,25 @@ impl MainState {
         )
     }
 
+    fn move_pane_in_direction(&mut self, direction: PaneFocusDirection) {
+        let source = self.active_tab().tree.active_id;
+        if !self.move_focus_in_direction(direction) {
+            return;
+        }
+        let target = self.active_tab().tree.active_id;
+        self.active_tab_mut().tree.active_id = source;
+        if self.active_tab_mut().swap_active_pane(target)
+            == crate::pane_tree::RearrangeResult::Changed
+        {
+            self.selection = None;
+            self.divider_drag = None;
+            self.reported_keys.clear();
+            self.advanced_keyboard.reset();
+            self.resize_all_tabs_to_current_grid();
+            self.begin_redraw();
+        }
+    }
+
     fn move_focus_in_direction(&mut self, direction: PaneFocusDirection) -> bool {
         let (total_cols, total_rows) = self.current_grid_size();
         let tab = self.active_tab();
@@ -1858,6 +2260,10 @@ impl MainState {
             A::MoveTabRight => {
                 self.move_active_tab(1);
             }
+            A::MovePaneLeft => self.move_pane_in_direction(PaneFocusDirection::Left),
+            A::MovePaneRight => self.move_pane_in_direction(PaneFocusDirection::Right),
+            A::MovePaneUp => self.move_pane_in_direction(PaneFocusDirection::Up),
+            A::MovePaneDown => self.move_pane_in_direction(PaneFocusDirection::Down),
             A::SelectCommandOutput => self.select_command_output(),
             A::PreviousPrompt => self.jump_prompt(true),
             A::NextPrompt => self.jump_prompt(false),
@@ -2127,6 +2533,95 @@ impl MainState {
         }
     }
 
+    /// AX work is demand-gated and uses the already displayed render grid, not
+    /// a Performer clone or a traversal of retained history. Native callbacks
+    /// never invoke this helper; publication/notification happens after locks.
+    #[cfg(target_os = "macos")]
+    fn publish_accessibility_for_render(&self, render_grid: &Grid) {
+        use crate::native_text::accessibility::{AccessibilitySnapshot, Sensitivity};
+        // Public names and constant summaries only: no editable values, command
+        // payloads, paths, search queries, or background terminal in modal scope.
+        let modal = if self.settings.is_some() {
+            Some((
+                "Settings",
+                "Settings dialog. Controls are not yet exposed through accessibility.",
+            ))
+        } else if self.theme_editor.is_some() {
+            Some((
+                "Theme editor",
+                "Theme editor dialog. Controls are not yet exposed through accessibility.",
+            ))
+        } else if self.task_form.is_some() {
+            Some((
+                "Add task",
+                "Task form dialog. Controls are not yet exposed through accessibility.",
+            ))
+        } else if let Some(prompt) = &self.active_prompt {
+            Some((
+                prompt.title(),
+                "Terminal dialog. Only this read-only summary is exposed.",
+            ))
+        } else if self.workspace_search.visible {
+            Some((
+                "Workspace search",
+                "Workspace search dialog. Search results and input are not exposed.",
+            ))
+        } else if self.workspace_panel.visible && self.workspace_panel.focused {
+            Some((
+                "Workspace",
+                "Workspace panel. Controls are not yet exposed through accessibility.",
+            ))
+        } else {
+            None
+        };
+        // Expired demand clears retained output, without a PTY syscall or text
+        // allocation. Renewed native queries return redacted until next render.
+        if !self._native_text.accessibility_requested() {
+            return;
+        }
+        if !self.window.has_focus() || self.window.is_visible() == Some(false) {
+            self._native_text.invalidate_accessibility();
+            return;
+        }
+        let tab = self.active_tab();
+        let pane = tab.active_pane();
+        // Strict ECHO state, including raw-mode no-echo, only on AX interest.
+        // Safe modal summaries do not inspect the obscured terminal at all.
+        let sensitivity = if modal.is_none() {
+            ax_render_sensitivity(
+                self.sensitive_input_requested,
+                self.renderer.secure_input_active,
+                pane.read_only,
+                pane.pty.echo_enabled(),
+            )
+        } else {
+            Sensitivity::Unknown
+        };
+        if modal.is_none() && sensitivity != Sensitivity::KnownSafe {
+            self._native_text.invalidate_accessibility();
+            return;
+        }
+        let snapshot = if let Some((name, summary)) = modal {
+            AccessibilitySnapshot::modal_summary(name, summary)
+        } else {
+            let rect = tab
+                .tree
+                .layout(render_grid.cols, render_grid.rows)
+                .into_iter()
+                .find(|rect| rect.id == tab.tree.active_id);
+            let Some(rect) = rect else {
+                self._native_text.invalidate_accessibility();
+                return;
+            };
+            let selection = self
+                .selection
+                .filter(|sel| sel.pane_id == rect.id && matches!(sel.mode, SelectionMode::Linear))
+                .and_then(|_| self.selection_tuple());
+            ax_visible_pane_snapshot(render_grid, rect, sensitivity, selection)
+        };
+        self._native_text.publish_accessibility(snapshot);
+    }
+
     fn build_render_grid_for_active_tab(&mut self) -> Option<(Grid, bool)> {
         let (total_cols, total_rows) = self.current_grid_size();
         let mut out = self
@@ -2177,6 +2672,18 @@ impl MainState {
     /// Apply settings other than the theme, which callers resolve through
     /// the theme registry (font-size changes must not reset it).
     fn apply_config(&mut self, config: &Config) {
+        // Quick-window isolation also applies to settings preview/cancel paths.
+        let quick_config;
+        let config = if self.is_quick_terminal {
+            quick_config = {
+                let mut copy = config.clone();
+                copy.appearance.native_tabs = false;
+                copy
+            };
+            &quick_config
+        } else {
+            config
+        };
         let metrics_changed = self.config.font.family != config.font.family
             || self.config.font.size != config.font.size
             || self.config.appearance.line_height != config.appearance.line_height;
@@ -2202,6 +2709,13 @@ impl MainState {
         }
         self.sync_workspace_card();
         self.keybindings = crate::keybindings::Bindings::compile(&config.keybindings);
+        if let Ok(bindings) =
+            crate::keybindings::AdvancedBindings::compile(&config.advanced_keybindings)
+        {
+            self.advanced_keyboard.replace_bindings(bindings);
+        } else {
+            self.advanced_keyboard.reset();
+        }
         self.window
             .set_transparent(config.appearance.transparent_enabled());
         self.window.set_blur(config.appearance.blur_enabled());
@@ -2271,6 +2785,8 @@ impl MainState {
     }
 
     fn begin_redraw(&mut self) {
+        #[cfg(target_os = "macos")]
+        self._native_text.invalidate_accessibility();
         self.mark_full_redraw();
         self.queue_redraw();
     }
@@ -2544,41 +3060,178 @@ impl MainState {
         sel.text(&performer.grid)
     }
 
+    fn clipboard_identity(&self) -> ClipboardIdentity {
+        let pane = self.active_tab().active_pane();
+        ClipboardIdentity {
+            tab: self.active_tab,
+            pane: self.active_tab().tree.active_id,
+            pid: pane.pty.child_pid(),
+            performer: Arc::as_ptr(&pane.performer) as usize,
+            cwd: pane.cwd.clone(),
+            sensitive: self.clipboard_is_sensitive(),
+            read_only: pane.read_only,
+            surfaces: [
+                self.settings.is_some(),
+                self.theme_editor.is_some(),
+                self.task_form.is_some(),
+                self.workspace_search.visible,
+                self.active_prompt.is_some(),
+                self.workspace_panel.visible,
+                self.workspace_panel.focused,
+            ],
+            prompt: self.active_prompt.as_ref().map(|p| p.kind),
+            rename_target: self.rename_tab_target,
+            settings_focus: self.settings.as_ref().map(|s| (s.section, s.focus)),
+            editor_focus: self.theme_editor.as_ref().map(|e| {
+                let view = e.view();
+                (view.focus, view.naming.is_some())
+            }),
+            form_focus: self.task_form.as_ref().map(|f| f.view().focus),
+            search_focus: self.workspace_search.visible.then_some((
+                self.workspace_search.scope.index(),
+                self.workspace_search.input.cursor,
+                self.workspace_search.query_selected,
+            )),
+            prompt_cursor: self.active_prompt.as_ref().map(|p| p.cursor),
+        }
+    }
+
+    /// Keep the slot occupied until completion: cancellation never allows a flood
+    /// of replacement workers. Input invalidation also catches away-and-back ABA.
+    fn invalidate_clipboard_read(&mut self) {
+        if let Some(flight) = self.clipboard_flight.as_mut() {
+            if flight.read {
+                flight.valid = false;
+            }
+        }
+    }
+
+    fn reserve_clipboard(&mut self, read: bool, selection: Option<Selection>) -> Option<u64> {
+        if self.clipboard_flight.is_some()
+            || !self.window.has_focus()
+            || self.window.is_visible() == Some(false)
+        {
+            return None;
+        }
+        // Process-wide IDs prevent a late result matching a newly created window
+        // if the native platform recycles a WindowId after close.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let operation = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .ok()?;
+        self.clipboard_flight = Some(ClipboardFlight {
+            operation,
+            identity: self.clipboard_identity(),
+            _performer: self.active_tab().active_pane().performer.clone(),
+            valid: true,
+            read,
+            selection,
+        });
+        Some(operation)
+    }
+
+    /// Only callers with an explicit copy/OSC52 origin reach this helper.
+    fn start_clipboard_write(&mut self, data: Vec<u8>, selection: Option<Selection>) -> bool {
+        if data.len() > crate::clipboard_safety::MAX_PASTE_BYTES {
+            self.renderer
+                .set_top_alert(Some("Copy unavailable: byte limit exceeded".into()));
+            self.begin_redraw();
+            return false;
+        }
+        let Some(operation) = self.reserve_clipboard(false, selection) else {
+            return false;
+        };
+        let proxy = self.proxy.clone();
+        let window_id = self.id;
+        let spawned = std::thread::Builder::new()
+            .name("volt-clipboard".into())
+            .spawn(move || {
+                let success =
+                    crate::clipboard::write(&data, crate::clipboard_safety::MAX_PASTE_BYTES)
+                        .is_ok();
+                let _ = proxy.send_event(VoltEvent::ClipboardWriteResult {
+                    window_id,
+                    operation,
+                    success,
+                });
+            });
+        if spawned.is_err() {
+            self.clipboard_flight = None;
+            self.renderer
+                .set_top_alert(Some("Copy unavailable: worker could not start".into()));
+            self.begin_redraw();
+            return false;
+        }
+        true
+    }
+
+    fn finish_clipboard_write(&mut self, operation: u64, success: bool) {
+        if !self
+            .clipboard_flight
+            .as_ref()
+            .is_some_and(|f| f.operation == operation && !f.read)
+        {
+            return;
+        }
+        let flight = self.clipboard_flight.take().unwrap();
+        if !success {
+            self.renderer
+                .set_top_alert(Some("Copy unavailable: clipboard backend failed".into()));
+        } else if flight.accepts(
+            operation,
+            &self.clipboard_identity(),
+            self.window.has_focus(),
+        ) && flight
+            .selection
+            .as_ref()
+            .zip(self.selection.as_ref())
+            .is_some_and(|(a, b)| {
+                a.pane_id == b.pane_id
+                    && a.alternate_screen == b.alternate_screen
+                    && std::mem::discriminant(&a.mode) == std::mem::discriminant(&b.mode)
+                    && (a.start_col, a.start_row, a.end_col, a.end_row)
+                        == (b.start_col, b.start_row, b.end_col, b.end_row)
+            })
+        {
+            self.selection = None;
+        }
+        self.begin_redraw();
+    }
+
     fn copy_selection(&mut self) -> bool {
+        // Reject before extracting or allocating a second payload.
+        if self.clipboard_flight.is_some()
+            || !self.window.has_focus()
+            || self.window.is_visible() == Some(false)
+        {
+            return false;
+        }
         let text = if let Some(s) = &self.settings {
             s.selected_text()
         } else {
-            self.selected_text()
+            let Some(sel) = self.selection else {
+                return false;
+            };
+            let Some(pane) = self.active_tab().tree.find_leaf(sel.pane_id) else {
+                return false;
+            };
+            let Ok(p) = pane.performer.lock() else {
+                return false;
+            };
+            if sel.alternate_screen != p.alternate_screen_active() {
+                return false;
+            }
+            bounded_clipboard_selection(sel, &p.grid, crate::clipboard_safety::MAX_PASTE_BYTES)
         };
         let Some(text) = text else {
             return false;
         };
-        #[cfg(target_os = "macos")]
-        {
-            use std::io::Write;
-            match std::process::Command::new("pbcopy")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-            {
-                Ok(mut child) => {
-                    if let Some(stdin) = child.stdin.as_mut() {
-                        if let Err(err) = stdin.write_all(text.as_bytes()) {
-                            eprintln!("volt-ui: failed to write clipboard data: {err}");
-                        }
-                    }
-                    if let Err(err) = child.wait() {
-                        eprintln!("volt-ui: failed waiting on pbcopy: {err}");
-                    }
-                }
-                Err(err) => eprintln!("volt-ui: failed to launch pbcopy: {err}"),
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = text;
-        if self.settings.is_none() {
-            self.selection = None;
-        }
-        true
+        let selection = if self.settings.is_none() {
+            self.selection
+        } else {
+            None
+        };
+        self.start_clipboard_write(text.into_bytes(), selection)
     }
 
     /// Write user input to the active pane's PTY, returning the view to live
@@ -2658,68 +3311,266 @@ impl MainState {
         }
     }
 
-    fn paste_clipboard(&mut self) {
-        #[cfg(target_os = "macos")]
+    fn clipboard_is_sensitive(&self) -> bool {
+        if self.sensitive_input_requested || self.active_tab().active_pane().read_only {
+            return true;
+        }
+        #[cfg(unix)]
         {
-            if self.settings.is_none()
-                && self.theme_editor.is_none()
-                && self.task_form.is_none()
-                && !self.workspace_search.visible
-                && self.workspace_panel.visible
-                && self.workspace_panel.focused
-            {
+            self.active_tab()
+                .active_pane()
+                .pty
+                .likely_password_prompt()
+                .unwrap_or(true)
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
+    fn review_transfer(&mut self, data: Vec<u8>, kind: crate::clipboard_safety::TransferKind) {
+        use crate::clipboard_safety::{PendingTransfer, TransferKind};
+        if self.active_prompt.is_some()
+            || self.settings.is_some()
+            || self.theme_editor.is_some()
+            || self.task_form.is_some()
+            || self.workspace_search.visible
+        {
+            return;
+        }
+        let pid = self.active_tab().active_pane().pty.child_pid();
+        if pid.is_none() || self.clipboard_is_sensitive() {
+            return;
+        }
+        let mode = if kind == TransferKind::Paste {
+            volt_renderer::task_review::ReviewMode::Paste
+        } else {
+            volt_renderer::task_review::ReviewMode::ClipboardWrite
+        };
+        let prompt_kind = if kind == TransferKind::Paste {
+            crate::prompt::PromptKind::ReviewPaste
+        } else {
+            crate::prompt::PromptKind::ReviewClipboardWrite
+        };
+        let mut prompt = crate::prompt::TextPrompt::new(prompt_kind, "");
+        prompt.task_review = Some(volt_renderer::task_review::TaskReview {
+            mode,
+            name: format!("{} bytes", data.len()),
+            directory: format!("Active terminal, PID {}", pid.unwrap()),
+            command: crate::clipboard_safety::preview(&data),
+            scroll: 0,
+            primary_focus: false,
+        });
+        self.pending_transfer = Some(PendingTransfer {
+            data,
+            pane_pid: pid,
+            kind,
+            created: Instant::now(),
+        });
+        self.workspace_panel.focused = false;
+        self.active_prompt = Some(prompt);
+        self.begin_redraw();
+    }
+
+    fn approve_transfer(&mut self) {
+        let Some(pending) = self.pending_transfer.take() else {
+            return;
+        };
+        if !pending.applies_to(
+            self.active_tab().active_pane().pty.child_pid(),
+            Instant::now(),
+        ) || self.clipboard_is_sensitive()
+        {
+            self.renderer.set_top_alert(Some(
+                "Clipboard approval expired or terminal context changed.".into(),
+            ));
+            return;
+        }
+        match pending.kind {
+            crate::clipboard_safety::TransferKind::Paste => self.paste_bytes(&pending.data),
+            crate::clipboard_safety::TransferKind::TerminalCopy => {
+                self.start_clipboard_write(pending.data, None);
+            }
+        }
+    }
+
+    fn terminal_clipboard_request(&mut self, pid: Option<u32>, data: Vec<u8>) {
+        if self.clipboard_flight.is_some()
+            || data.len() > crate::clipboard_safety::MAX_PASTE_BYTES
+            || pid.is_none()
+            || !self.window.has_focus()
+            || pid != self.active_tab().active_pane().pty.child_pid()
+            || self.clipboard_is_sensitive()
+            || self.active_prompt.is_some()
+            || self.settings.is_some()
+            || self.theme_editor.is_some()
+            || self.task_form.is_some()
+            || self.workspace_search.visible
+        {
+            return;
+        }
+        match self.config.clipboard.osc52_write {
+            volt_config::config::ClipboardWritePolicy::Deny => {}
+            volt_config::config::ClipboardWritePolicy::Ask => {
+                self.review_transfer(data, crate::clipboard_safety::TransferKind::TerminalCopy)
+            }
+            volt_config::config::ClipboardWritePolicy::Allow => {
+                self.start_clipboard_write(data, None);
+            }
+        }
+    }
+
+    fn paste_bytes(&mut self, data: &[u8]) {
+        let bracketed = self
+            .active_tab()
+            .active_pane()
+            .performer
+            .lock()
+            .ok()
+            .is_some_and(|p| p.bracketed_paste_mode());
+        if bracketed {
+            let data = strip_bracketed_paste_end(data);
+            let mut wrapped = Vec::with_capacity(data.len() + 12);
+            wrapped.extend_from_slice(b"\x1b[200~");
+            wrapped.extend_from_slice(&data);
+            wrapped.extend_from_slice(b"\x1b[201~");
+            self.send_pty_input(&wrapped);
+        } else {
+            self.send_pty_input(data);
+        }
+    }
+
+    fn paste_clipboard(&mut self) {
+        if self.clipboard_flight.is_some()
+            || !self.window.has_focus()
+            || self.window.is_visible() == Some(false)
+        {
+            return;
+        }
+        if self
+            .active_prompt
+            .as_ref()
+            .is_some_and(|p| p.kind.read_only())
+        {
+            return;
+        }
+        if self.settings.is_none()
+            && self.theme_editor.is_none()
+            && self.task_form.is_none()
+            && !self.workspace_search.visible
+            && self.workspace_panel.visible
+            && self.workspace_panel.focused
+        {
+            return;
+        }
+        // Explicit safe password paste is allowed. Snapshot sensitivity in the
+        // operation identity instead of prohibiting all protected-input reads.
+        if self.active_tab().active_pane().read_only
+            || self.active_tab().active_pane().pty.child_pid().is_none()
+        {
+            return;
+        }
+        let Some(operation) = self.reserve_clipboard(true, None) else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        let window_id = self.id;
+        if std::thread::Builder::new()
+            .name("volt-clipboard".into())
+            .spawn(move || {
+                let result = crate::clipboard::read(crate::clipboard_safety::MAX_PASTE_BYTES);
+                let _ = proxy.send_event(VoltEvent::ClipboardReadResult {
+                    window_id,
+                    operation,
+                    result: ClipboardReadResult(Arc::new(result)),
+                });
+            })
+            .is_err()
+        {
+            self.clipboard_flight = None;
+            self.renderer
+                .set_top_alert(Some("Paste unavailable: worker could not start".into()));
+            self.begin_redraw();
+        }
+    }
+
+    fn finish_clipboard_read(&mut self, operation: u64, result: ClipboardReadResult) {
+        if !self
+            .clipboard_flight
+            .as_ref()
+            .is_some_and(|f| f.operation == operation && f.read)
+        {
+            return;
+        }
+        let flight = self.clipboard_flight.take().unwrap();
+        if !flight.accepts(
+            operation,
+            &self.clipboard_identity(),
+            self.window.has_focus(),
+        ) {
+            return;
+        }
+        // A cloned event cannot duplicate delivery or force a second payload allocation.
+        let Ok(result) = Arc::try_unwrap(result.0) else {
+            return;
+        };
+        let data = match result {
+            Ok(data) if data.len() <= crate::clipboard_safety::MAX_PASTE_BYTES => data,
+            _ => {
+                self.renderer
+                    .set_top_alert(Some("Paste unavailable: clipboard backend failed".into()));
+                self.begin_redraw();
                 return;
             }
-            let data = match read_bounded_command_output(
-                &mut std::process::Command::new("/usr/bin/pbpaste"),
-                MAX_CLIPBOARD_BYTES,
-            ) {
-                Ok(data) => data,
-                Err(err) => {
-                    eprintln!("volt-ui: paste failed: {err}");
-                    self.renderer
-                        .set_top_alert(Some(format!("Paste unavailable: {err}")));
-                    self.begin_redraw();
-                    return;
-                }
-            };
-            if let Some(settings) = self.settings.as_mut() {
-                let outcome = settings.text(&String::from_utf8_lossy(&data));
-                self.settings_outcome(outcome);
-                return;
+        };
+        if let Some(settings) = self.settings.as_mut() {
+            let outcome = settings.text(&String::from_utf8_lossy(&data));
+            self.settings_outcome(outcome);
+            return;
+        }
+        if let Some(editor) = self.theme_editor.as_mut() {
+            let outcome = editor.paste(&String::from_utf8_lossy(&data));
+            self.apply_editor_outcome(outcome);
+            return;
+        }
+        if let Some(form) = self.task_form.as_mut() {
+            let outcome = form.type_text(&String::from_utf8_lossy(&data));
+            self.apply_form_outcome(outcome);
+            return;
+        }
+        if self.workspace_search.visible {
+            self.workspace_search.edit(&String::from_utf8_lossy(&data));
+            self.sync_search();
+            return;
+        }
+        if self.active_prompt.is_some() {
+            self.insert_committed_text(&String::from_utf8_lossy(&data));
+            self.begin_redraw();
+            return;
+        }
+        let bracketed = self
+            .active_tab()
+            .active_pane()
+            .performer
+            .lock()
+            .ok()
+            .is_some_and(|p| p.bracketed_paste_mode());
+        match clipboard_paste_disposition(
+            &data,
+            bracketed,
+            flight.identity.sensitive,
+            self.config.clipboard.confirm_unsafe_paste,
+        ) {
+            ClipboardPasteDisposition::Block => {
+                self.renderer
+                    .set_top_alert(Some("Unsafe paste blocked in protected input.".into()));
+                self.begin_redraw();
             }
-            if let Some(editor) = self.theme_editor.as_mut() {
-                let outcome = editor.paste(&String::from_utf8_lossy(&data));
-                self.apply_editor_outcome(outcome);
-                return;
+            ClipboardPasteDisposition::Review => {
+                self.review_transfer(data, crate::clipboard_safety::TransferKind::Paste)
             }
-            if let Some(form) = self.task_form.as_mut() {
-                let outcome = form.type_text(&String::from_utf8_lossy(&data));
-                self.apply_form_outcome(outcome);
-                return;
-            }
-            if self.workspace_search.visible {
-                self.workspace_search.edit(&String::from_utf8_lossy(&data));
-                self.sync_search();
-                return;
-            }
-            let bracketed = self
-                .tabs
-                .get(self.active_tab)
-                .and_then(|t| t.active_pane().performer.lock().ok())
-                .map(|p| p.bracketed_paste_mode())
-                .unwrap_or(false);
-            if bracketed {
-                // Never let pasted bytes terminate bracketed-paste mode early.
-                let data = strip_bracketed_paste_end(&data);
-                let mut wrapped = Vec::with_capacity(data.len() + 12);
-                wrapped.extend_from_slice(b"\x1b[200~");
-                wrapped.extend_from_slice(&data);
-                wrapped.extend_from_slice(b"\x1b[201~");
-                self.send_pty_input(&wrapped);
-            } else {
-                self.send_pty_input(&data);
-            }
+            ClipboardPasteDisposition::Direct => self.paste_bytes(&data),
         }
     }
 
@@ -2747,7 +3598,9 @@ impl MainState {
             | crate::prompt::PromptKind::OpenLink
             | crate::prompt::PromptKind::ConfirmTask
             | crate::prompt::PromptKind::ReviewTask
-            | crate::prompt::PromptKind::TrustTasks => None,
+            | crate::prompt::PromptKind::TrustTasks
+            | crate::prompt::PromptKind::ReviewPaste
+            | crate::prompt::PromptKind::ReviewClipboardWrite => None,
         };
         let initial = rename_initial_text(custom);
         self.active_prompt = Some(crate::prompt::TextPrompt::new(kind, &initial));
@@ -2761,6 +3614,8 @@ impl MainState {
         self.search_dirty = false;
         self.search_target = None;
         match prompt.kind {
+            crate::prompt::PromptKind::ReviewPaste
+            | crate::prompt::PromptKind::ReviewClipboardWrite => self.approve_transfer(),
             crate::prompt::PromptKind::OpenLink => {
                 if let Err(err) = crate::links::open(&prompt.text()) {
                     self.renderer
@@ -3196,11 +4051,34 @@ impl MainState {
     }
 }
 
+/// Detach only shortcut ownership; never remove/drop the live terminal state.
+fn take_quick_window_for_promotion<'a, K: Eq + std::hash::Hash, V>(
+    windows: &'a mut HashMap<K, V>,
+    quick_window: &mut Option<K>,
+) -> Option<&'a mut V> {
+    let id = quick_window.take()?;
+    windows.get_mut(&id)
+}
+
+fn persist_terminal_window(is_quick_terminal: bool) -> bool {
+    !is_quick_terminal
+}
+
+fn exit_without_quick_shortcut(windows_empty: bool, shortcut_registered: bool) -> bool {
+    windows_empty && !shortcut_registered
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
     config: Config,
     config_alert: Option<String>,
+    #[cfg(target_os = "macos")]
+    quick_hot_key: Option<crate::quick_terminal::GlobalHotKey>,
+    #[cfg(target_os = "macos")]
+    quick_window: Option<WindowId>,
+    #[cfg(target_os = "macos")]
+    quick_visible: bool,
     windows: HashMap<WindowId, MainState>,
     proxy: Option<EventLoopProxy<VoltEvent>>,
     pty_wake_pending: Arc<AtomicBool>,
@@ -3240,6 +4118,12 @@ impl App {
             config,
             config_alert,
             themes,
+            #[cfg(target_os = "macos")]
+            quick_hot_key: None,
+            #[cfg(target_os = "macos")]
+            quick_window: None,
+            #[cfg(target_os = "macos")]
+            quick_visible: false,
             windows: HashMap::new(),
             proxy: None,
             pty_wake_pending: Arc::new(AtomicBool::new(false)),
@@ -3258,6 +4142,127 @@ impl App {
         })
     }
 
+    fn should_exit(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        let registered = self.quick_hot_key.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let registered = false;
+        exit_without_quick_shortcut(self.windows.is_empty(), registered)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_quick_terminal_registration(&mut self) {
+        if !self.config.quick_terminal.enabled {
+            self.quick_hot_key.take();
+            if let Some(state) =
+                take_quick_window_for_promotion(&mut self.windows, &mut self.quick_window)
+            {
+                // Preserve the exact MainState, tabs, PTYs and running jobs.
+                // The formerly hidden window must remain reachable without a hotkey.
+                state.invalidate_clipboard_read();
+                state._native_text.invalidate_accessibility();
+                state.is_quick_terminal = false;
+                if let Err(err) = crate::quick_terminal::promote_window(&state.window) {
+                    eprintln!("volt-ui: quick window restoration setup failed: {err}");
+                }
+                state.window.set_minimized(false);
+                state.window.set_visible(true);
+                state.begin_redraw();
+            }
+            self.quick_visible = false;
+            return;
+        }
+        if self.quick_hot_key.is_some() {
+            return;
+        }
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        match crate::quick_terminal::GlobalHotKey::register(proxy) {
+            Ok(guard) => self.quick_hot_key = Some(guard),
+            Err(err) => self.quick_terminal_error(format!("Global shortcut unavailable: {err}")),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn quick_terminal_error(&mut self, message: String) {
+        eprintln!("volt-ui: {message}");
+        let alert = match self.config_alert.as_ref() {
+            Some(existing) => format!("{existing}\n{message}"),
+            None => message,
+        };
+        self.config_alert = Some(alert.clone());
+        for state in self.windows.values_mut() {
+            state.renderer.set_top_alert(Some(alert.clone()));
+            state.begin_redraw();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn hide_quick_terminal(&mut self) {
+        if let Some(id) = self.quick_window {
+            if let Some(state) = self.windows.get_mut(&id) {
+                // Do not depend on a later Focused(false) event: an async result
+                // can arrive first, or the hidden window may not have had focus.
+                state.invalidate_clipboard_read();
+                state._native_text.invalidate_accessibility();
+                state.window.set_visible(false);
+                state.is_drag_selecting = false;
+                state.selection_scroll_deadline = None;
+                state.modifiers = ModifiersState::default();
+                state.advanced_keyboard.reset();
+                state.left_shift_down = false;
+                state.right_shift_down = false;
+                state.left_control_down = false;
+                state.right_control_down = false;
+                state.left_super_down = false;
+                state.right_super_down = false;
+                state.renderer.secure_input_active = false;
+            }
+            if self.focused_window == Some(id) {
+                self.focused_window = None;
+                self.secure_input.set(false);
+            }
+        }
+        self.quick_visible = false;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn toggle_quick_terminal(&mut self, event_loop: &ActiveEventLoop) {
+        // Ignore stale queued events after disabling or a failed registration.
+        if !self.config.quick_terminal.enabled || self.quick_hot_key.is_none() {
+            return;
+        }
+        if self
+            .quick_window
+            .is_some_and(|id| !self.windows.contains_key(&id))
+        {
+            self.quick_window = None;
+            self.quick_visible = false;
+        }
+        if self.quick_visible {
+            self.hide_quick_terminal();
+            return;
+        }
+        if self.quick_window.is_none() {
+            match self.create_terminal_window(event_loop, None, true) {
+                Ok(id) => self.quick_window = Some(id),
+                Err(err) => {
+                    self.quick_terminal_error(format!("Quick terminal creation failed: {err}"));
+                    return;
+                }
+            }
+        }
+        if let Some(state) = self.quick_window.and_then(|id| self.windows.get_mut(&id)) {
+            state.window.set_minimized(false);
+            state.window.set_visible(true);
+            crate::quick_terminal::activate_app();
+            state.window.focus_window();
+            state.begin_redraw();
+            self.quick_visible = true;
+        }
+    }
+
     fn save_layout(&self) {
         if !self.config.session.restore
             || self.config.appearance.native_tabs
@@ -3268,6 +4273,7 @@ impl App {
         let windows = self
             .windows
             .values()
+            .filter(|state| persist_terminal_window(state.is_quick_terminal))
             .take(8)
             .map(|state| {
                 let size = state
@@ -3295,7 +4301,10 @@ impl App {
                         .collect(),
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if windows.is_empty() {
+            return; // A transient quick window must never overwrite the saved layout.
+        }
         if let Some(path) = crate::session::path() {
             if let Err(e) = crate::session::save(
                 &path,
@@ -3381,19 +4390,36 @@ impl App {
     pub fn run(mut self) -> anyhow::Result<()> {
         let event_loop = EventLoop::<VoltEvent>::with_user_event().build()?;
         self.proxy = Some(event_loop.create_proxy());
-        event_loop.run_app(&mut self)?;
+        let result = event_loop.run_app(&mut self);
+        // Also clean up on run_app errors before its EventLoop is destroyed.
+        #[cfg(target_os = "macos")]
+        self.quick_hot_key.take();
+        result?;
         Ok(())
     }
 
     fn create_main_window(
         &mut self,
         event_loop: &ActiveEventLoop,
+        tabbing_identifier: Option<String>,
+    ) -> anyhow::Result<WindowId> {
+        self.create_terminal_window(event_loop, tabbing_identifier, false)
+    }
+
+    fn create_terminal_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
         #[allow(unused_variables)] tabbing_identifier: Option<String>,
+        is_quick_terminal: bool,
     ) -> anyhow::Result<WindowId> {
         let Some(proxy) = self.proxy.as_ref().cloned() else {
             anyhow::bail!("missing event loop proxy");
         };
 
+        let mut config = self.config.clone();
+        if is_quick_terminal {
+            config.appearance.native_tabs = false;
+        }
         let mut window_attrs = Window::default_attributes()
             .with_title("Volt")
             .with_inner_size(winit::dpi::PhysicalSize::new(1400u32, 900u32));
@@ -3401,8 +4427,10 @@ impl App {
         #[cfg(target_os = "macos")]
         {
             use winit::platform::macos::WindowAttributesExtMacOS;
-            let use_native = self.config.appearance.native_tabs;
-            event_loop.set_allows_automatic_window_tabbing(use_native);
+            let use_native = config.appearance.native_tabs;
+            if !is_quick_terminal {
+                event_loop.set_allows_automatic_window_tabbing(use_native);
+            }
             if use_native {
                 // Native mode: keep the system title bar visible so traffic lights and
                 // tab-strip chrome are rendered by macOS as a distinct title area.
@@ -3418,17 +4446,28 @@ impl App {
             }
         }
         window_attrs = window_attrs
-            .with_transparent(self.config.appearance.transparent_enabled())
-            .with_blur(self.config.appearance.blur_enabled());
+            .with_transparent(config.appearance.transparent_enabled())
+            .with_blur(config.appearance.blur_enabled());
 
+        if is_quick_terminal {
+            window_attrs = window_attrs
+                .with_title("Volt Quick Terminal")
+                .with_inner_size(winit::dpi::LogicalSize::new(1000u32, 500u32))
+                .with_window_level(winit::window::WindowLevel::AlwaysOnTop)
+                .with_visible(false);
+        }
         let window = Arc::new(event_loop.create_window(window_attrs)?);
+        #[cfg(target_os = "macos")]
+        if is_quick_terminal {
+            crate::quick_terminal::configure_window(&window)?;
+        }
         window.set_ime_allowed(true);
         // Capture native picker text without changing normal keyboard/IME handling.
         #[cfg(target_os = "macos")]
         let native_text = crate::native_text::NativeTextInput::install(
             window.clone(),
             proxy.clone(),
-            !self.config.appearance.native_tabs,
+            !config.appearance.native_tabs,
         )?;
         #[cfg(target_os = "macos")]
         let native_tab_count = window.num_tabs().max(1);
@@ -3437,16 +4476,16 @@ impl App {
         let scale_factor = window.scale_factor() as f32;
         let mut renderer = self.rt.block_on(Renderer::new(
             window.clone(),
-            self.config.font.size,
+            config.font.size,
             scale_factor,
-            &self.config.font.family,
-            self.config.appearance.padding as f32,
-            self.config.appearance.line_height,
-            self.config.appearance.effective_opacity(),
-            self.config.appearance.cursor_style,
+            &config.font.family,
+            config.appearance.padding as f32,
+            config.appearance.line_height,
+            config.appearance.effective_opacity(),
+            config.appearance.cursor_style,
         ))?;
         renderer.set_top_alert(self.config_alert.clone());
-        if cfg!(target_os = "macos") && self.config.appearance.native_tabs {
+        if cfg!(target_os = "macos") && config.appearance.native_tabs {
             renderer.custom_tab_bar = false;
         }
         #[cfg(target_os = "macos")]
@@ -3458,14 +4497,14 @@ impl App {
             .and_then(|id| self.windows.get(&id))
             .and_then(|state| state.active_tab().active_pane().local_cwd());
         let first_tab = TerminalTab::spawn_in(
-            &self.config,
+            &config,
             cols as u16,
             rows as u16,
             proxy.clone(),
             Arc::clone(&self.pty_wake_pending),
             cwd.as_deref(),
         )?;
-        let theme = self.themes.resolve(&self.config.theme);
+        let theme = self.themes.resolve(&config.theme);
         let id = window.id();
         #[cfg(target_os = "macos")]
         let display_link = match DisplayLinkScheduler::new(proxy.clone()) {
@@ -3478,12 +4517,14 @@ impl App {
 
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut state = MainState {
+            is_quick_terminal,
             id,
             window,
             #[cfg(target_os = "macos")]
             _native_text: native_text,
             renderer,
             render_snapshot: None,
+            inline_images: crate::inline_image::Host::default(),
             synchronized_deadlines: HashMap::new(),
             reported_keys: HashMap::new(),
             tabs: vec![first_tab],
@@ -3496,8 +4537,13 @@ impl App {
             right_control_down: false,
             left_super_down: false,
             right_super_down: false,
-            keybindings: crate::keybindings::Bindings::compile(&self.config.keybindings),
-            config: self.config.clone(),
+            keybindings: crate::keybindings::Bindings::compile(&config.keybindings),
+            advanced_keyboard: crate::keybindings::KeyboardDispatcher::new(
+                crate::keybindings::AdvancedBindings::compile(&config.advanced_keybindings)
+                    .map_err(anyhow::Error::msg)?,
+            ),
+            ime_composing: false,
+            config: config.clone(),
             mouse_pos: (0.0, 0.0),
             is_drag_selecting: false,
             selection_scroll_deadline: None,
@@ -3522,7 +4568,7 @@ impl App {
             divider_hover_id: None,
             workspace_panel: {
                 let mut panel = WorkspacePanel::default();
-                panel.visible = self.config.workspace.enabled;
+                panel.visible = config.workspace.enabled;
                 panel
             },
             workspace_search: crate::workspace_search::SearchPalette::default(),
@@ -3542,17 +4588,21 @@ impl App {
             settings: None,
             tasks: crate::tasks::TaskLoader::default(),
             pending_task: None,
+            pending_transfer: None,
+            clipboard_flight: None,
+            sensitive_input_requested: false,
             task_message: None,
             task_form: None,
         };
         state
             .window
-            .set_transparent(self.config.appearance.transparent_enabled());
-        state.window.set_blur(self.config.appearance.blur_enabled());
+            .set_transparent(config.appearance.transparent_enabled());
+        state.window.set_blur(config.appearance.blur_enabled());
         #[cfg(target_os = "macos")]
         state.sync_native_window_title();
-        if self.windows.is_empty()
-            && !self.config.setup.completed
+        if !is_quick_terminal
+            && self.windows.is_empty()
+            && !config.setup.completed
             && config_path_to_edit().is_some_and(|p| !p.exists())
         {
             state.open_settings(true);
@@ -3585,8 +4635,14 @@ impl App {
                 continue;
             }
             state.theme = theme.clone();
-            state.apply_config(&new_cfg);
+            let mut window_config = new_cfg.clone();
+            if state.is_quick_terminal {
+                window_config.appearance.native_tabs = false;
+            }
+            state.apply_config(&window_config);
         }
+        #[cfg(target_os = "macos")]
+        self.sync_quick_terminal_registration();
         self.refresh_theme_menu();
     }
 
@@ -3766,6 +4822,10 @@ impl App {
             .set(focused.is_some() && (self.manual_secure_input || likely_password));
         let enabled = self.secure_input.enabled();
         for (id, state) in &mut self.windows {
+            if state.sensitive_input_requested != self.manual_secure_input {
+                state._native_text.invalidate_accessibility();
+            }
+            state.sensitive_input_requested = self.manual_secure_input;
             let visible = Some(*id) == focused && enabled;
             if state.renderer.secure_input_active != visible {
                 state.renderer.secure_input_active = visible;
@@ -3887,9 +4947,13 @@ impl App {
                 return;
             }
             A::CloseWindow => {
+                if self.quick_window == Some(window_id) {
+                    self.hide_quick_terminal();
+                    return;
+                }
                 self.save_layout();
                 self.windows.remove(&window_id);
-                if self.windows.is_empty() {
+                if self.should_exit() {
                     event_loop.exit();
                 }
                 return;
@@ -3917,7 +4981,7 @@ impl App {
                     let _ = state;
                     self.save_layout();
                     self.windows.remove(&window_id);
-                    if self.windows.is_empty() {
+                    if self.should_exit() {
                         event_loop.exit();
                     }
                 }
@@ -4192,10 +5256,18 @@ fn committed_text_target(
 
 impl ApplicationHandler<VoltEvent> for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        {
+            self.quick_hot_key.take();
+        }
         self.save_layout();
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        if self.quick_hot_key.is_some() {
+            return; // Already initialized, including opt-in zero-normal-window mode.
+        }
         if !self.windows.is_empty() {
             return;
         }
@@ -4226,6 +5298,9 @@ impl ApplicationHandler<VoltEvent> for App {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        self.sync_quick_terminal_registration();
+
         if self.restore_layout(event_loop) {
             return;
         }
@@ -4236,7 +5311,58 @@ impl ApplicationHandler<VoltEvent> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: VoltEvent) {
+        // Native menu/settings actions can change ownership without window input.
+        let invalidates = matches!(
+            event,
+            VoltEvent::PreferencesSaved | VoltEvent::SettingsAction { .. }
+        );
+        #[cfg(target_os = "macos")]
+        let invalidates = invalidates
+            || matches!(
+                event,
+                VoltEvent::Menu(_) | VoltEvent::NativeText { .. } | VoltEvent::ToggleQuickTerminal
+            );
+        if invalidates {
+            for state in self.windows.values_mut() {
+                state.invalidate_clipboard_read();
+                #[cfg(target_os = "macos")]
+                state._native_text.invalidate_accessibility();
+            }
+        }
         match event {
+            VoltEvent::ClipboardReadResult {
+                window_id,
+                operation,
+                result,
+            } => {
+                let app_focused = self.focused_window == Some(window_id);
+                #[cfg(target_os = "macos")]
+                let visible = self.quick_window != Some(window_id) || self.quick_visible;
+                #[cfg(not(target_os = "macos"))]
+                let visible = true;
+                if let Some(state) = self.windows.get_mut(&window_id) {
+                    if !clipboard_host_accepts(
+                        app_focused,
+                        state.window.has_focus(),
+                        state.window.is_visible(),
+                        visible,
+                    ) {
+                        state.invalidate_clipboard_read();
+                    }
+                    state.finish_clipboard_read(operation, result);
+                }
+            }
+            VoltEvent::ClipboardWriteResult {
+                window_id,
+                operation,
+                success,
+            } => {
+                if let Some(state) = self.windows.get_mut(&window_id) {
+                    state.finish_clipboard_write(operation, success);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            VoltEvent::ToggleQuickTerminal => self.toggle_quick_terminal(_event_loop),
             VoltEvent::WorkspaceUpdated => {}
             VoltEvent::PreferencesSaved => self.reload_config(),
             VoltEvent::SettingsAction {
@@ -4271,6 +5397,8 @@ impl ApplicationHandler<VoltEvent> for App {
             VoltEvent::PtyData => {
                 self.pty_wake_pending.store(false, Ordering::Release);
                 for state in self.windows.values_mut() {
+                    #[cfg(target_os = "macos")]
+                    state._native_text.invalidate_accessibility();
                     state.queue_redraw();
                 }
             }
@@ -4305,10 +5433,51 @@ impl ApplicationHandler<VoltEvent> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        #[cfg(target_os = "macos")]
+        if !matches!(
+            event,
+            WindowEvent::RedrawRequested
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::ModifiersChanged(_)
+                | WindowEvent::CursorEntered { .. }
+                | WindowEvent::CursorLeft { .. }
+        ) {
+            if let Some(state) = self.windows.get(&window_id) {
+                state._native_text.invalidate_accessibility();
+            }
+        }
+        if matches!(
+            event,
+            WindowEvent::CloseRequested
+                | WindowEvent::Focused(false)
+                | WindowEvent::KeyboardInput {
+                    event: KeyEvent {
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                    ..
+                }
+                | WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    ..
+                }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::Touch(_)
+                | WindowEvent::Ime(_)
+        ) {
+            if let Some(state) = self.windows.get_mut(&window_id) {
+                state.invalidate_clipboard_read();
+            }
+        }
         if matches!(event, WindowEvent::CloseRequested) {
+            #[cfg(target_os = "macos")]
+            if self.quick_window == Some(window_id) {
+                self.hide_quick_terminal();
+                return;
+            }
             self.save_layout();
             self.windows.remove(&window_id);
-            if self.windows.is_empty() {
+            if self.should_exit() {
                 event_loop.exit();
             }
             return;
@@ -4319,7 +5488,9 @@ impl ApplicationHandler<VoltEvent> for App {
         let mut close_window_after_event = false;
 
         match event {
-            WindowEvent::Ime(Ime::Preedit(_, _)) => {
+            WindowEvent::Ime(Ime::Preedit(ref preedit, _)) => {
+                state.ime_composing = !preedit.is_empty();
+                state.advanced_keyboard.reset();
                 let pane = state.active_tab().active_pane();
                 if let Ok(performer) = pane.performer.lock() {
                     let id = state.active_tab().tree.active_id;
@@ -4350,6 +5521,8 @@ impl ApplicationHandler<VoltEvent> for App {
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
+                state.ime_composing = false;
+                state.advanced_keyboard.reset();
                 // Commit is final UTF-8 input, not paste or a command key.
                 // Winit suppresses the composing key event to avoid duplicates.
                 state.insert_committed_text(&text);
@@ -4408,6 +5581,8 @@ impl ApplicationHandler<VoltEvent> for App {
             }
 
             WindowEvent::Focused(false) => {
+                state.advanced_keyboard.reset();
+                state.ime_composing = false;
                 if let Some(e) = state.theme_editor.as_mut() {
                     e.picker_release();
                 }
@@ -4726,6 +5901,7 @@ impl ApplicationHandler<VoltEvent> for App {
                                     state.search_mouse_capture = Some(button);
                                     state.active_prompt = None;
                                     state.pending_task = None;
+                                    state.pending_transfer = None;
                                     state.begin_redraw();
                                 }
                                 _ => {}
@@ -5480,20 +6656,76 @@ impl ApplicationHandler<VoltEvent> for App {
                     }
                 }
                 // Local text fields and inspector navigation own their keys.
-                let custom = if crate::keybindings::terminal_owns_keys(
-                    state.active_prompt.is_some()
-                        || state.theme_editor.is_some()
-                        || state.task_form.is_some(),
-                    state.workspace_search.visible,
-                    state.workspace_panel.visible,
-                    state.workspace_panel.focused,
-                ) {
-                    state
-                        .keybindings
-                        .lookup(physical_key, ctrl, alt, shift, super_key)
+                let pane = state.active_tab().active_pane();
+                let epoch = (Arc::as_ptr(&pane.performer) as usize as u64).wrapping_mul(2)
+                    ^ u64::from(
+                        pane.performer
+                            .lock()
+                            .ok()
+                            .is_some_and(|p| p.alternate_screen_active()),
+                    );
+                let eligible = state.window.has_focus()
+                    && !state.ime_composing
+                    && state.settings.is_none()
+                    && state.theme_editor.is_none()
+                    && state.task_form.is_none()
+                    && crate::keybindings::terminal_owns_keys(
+                        state.active_prompt.is_some(),
+                        state.workspace_search.visible,
+                        state.workspace_panel.visible,
+                        state.workspace_panel.focused,
+                    );
+                let modifier_only = matches!(
+                    physical_key,
+                    PhysicalKey::Code(
+                        KeyCode::ShiftLeft
+                            | KeyCode::ShiftRight
+                            | KeyCode::ControlLeft
+                            | KeyCode::ControlRight
+                            | KeyCode::AltLeft
+                            | KeyCode::AltRight
+                            | KeyCode::SuperLeft
+                            | KeyCode::SuperRight
+                    )
+                );
+                let dispatch = if modifier_only {
+                    crate::keybindings::DispatchResult::PassThrough
                 } else {
-                    None
+                    state.advanced_keyboard.dispatch(
+                        physical_key,
+                        u8::from(ctrl)
+                            | (u8::from(alt) << 1)
+                            | (u8::from(shift) << 2)
+                            | (u8::from(super_key) << 3),
+                        repeat,
+                        Instant::now(),
+                        crate::keybindings::DispatchContext {
+                            focus_epoch: epoch,
+                            eligible,
+                        },
+                    )
                 };
+                let advanced_action = match dispatch {
+                    crate::keybindings::DispatchResult::Action(action) => Some(action),
+                    crate::keybindings::DispatchResult::PassThrough => None,
+                    _ => return,
+                };
+                let custom = advanced_action.or_else(|| {
+                    if crate::keybindings::terminal_owns_keys(
+                        state.active_prompt.is_some()
+                            || state.theme_editor.is_some()
+                            || state.task_form.is_some(),
+                        state.workspace_search.visible,
+                        state.workspace_panel.visible,
+                        state.workspace_panel.focused,
+                    ) {
+                        state
+                            .keybindings
+                            .lookup(physical_key, ctrl, alt, shift, super_key)
+                    } else {
+                        None
+                    }
+                });
                 let defaults = custom != Some(volt_config::keybindings::Action::Unbind);
                 if let Some(action) =
                     custom.filter(|a| *a != volt_config::keybindings::Action::Unbind)
@@ -5514,7 +6746,7 @@ impl ApplicationHandler<VoltEvent> for App {
                                 let _ = state;
                                 self.save_layout();
                                 self.windows.remove(&window_id);
-                                if self.windows.is_empty() {
+                                if self.should_exit() {
                                     event_loop.exit();
                                 }
                             }
@@ -5726,6 +6958,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         PhysicalKey::Code(KeyCode::Escape) => {
                             state.active_prompt = None;
                             state.pending_task = None;
+                            state.pending_transfer = None;
                             state.begin_redraw();
                         }
                         PhysicalKey::Code(KeyCode::Tab) => {
@@ -5752,6 +6985,7 @@ impl ApplicationHandler<VoltEvent> for App {
                                 } else {
                                     state.active_prompt = None;
                                     state.pending_task = None;
+                                    state.pending_transfer = None;
                                     state.begin_redraw();
                                 }
                             }
@@ -5784,6 +7018,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         PhysicalKey::Code(KeyCode::Escape) => {
                             state.active_prompt = None;
                             state.pending_task = None;
+                            state.pending_transfer = None;
                             state.search_dirty = false;
                             state.search_target = None;
                             state.begin_redraw();
@@ -5997,7 +7232,7 @@ impl ApplicationHandler<VoltEvent> for App {
                                 let _ = state;
                                 self.save_layout();
                                 self.windows.remove(&window_id);
-                                if self.windows.is_empty() {
+                                if self.should_exit() {
                                     event_loop.exit();
                                 }
                             }
@@ -6234,12 +7469,38 @@ impl ApplicationHandler<VoltEvent> for App {
                 let mut active_grid_changed = false;
                 // (tab_idx, pane_id)
                 let mut closed_panes: Vec<(usize, usize)> = Vec::new();
+                let mut clipboard_requests = Vec::new();
+                let mut inline_request = None;
 
                 for (i, tab) in state.tabs.iter_mut().enumerate() {
                     let mut pty_errors: Vec<String> = Vec::new();
                     tab.tree.for_each_leaf_mut(&mut |pane_id, pane| {
                         while let Ok(ev) = pane.event_rx.try_recv() {
                             match ev {
+                                CoreEvent::InlineImageRequested {
+                                    parameters,
+                                    alternate_screen,
+                                    epoch,
+                                    row,
+                                    column,
+                                } => {
+                                    if state.config.inline_images.enabled
+                                        && state.inline_images.idle()
+                                        && inline_request.is_none()
+                                    {
+                                        inline_request = Some((
+                                            Arc::clone(&pane.performer),
+                                            alternate_screen,
+                                            epoch,
+                                            row,
+                                            column,
+                                            parameters,
+                                        ));
+                                    }
+                                }
+                                CoreEvent::ClipboardWriteRequested(data) => {
+                                    clipboard_requests.push((pane.pty.child_pid(), data))
+                                }
                                 CoreEvent::SynchronizedOutput { deadline } => {
                                     let owner = Arc::as_ptr(&pane.performer) as usize;
                                     if let Some(deadline) = deadline {
@@ -6298,7 +7559,28 @@ impl ApplicationHandler<VoltEvent> for App {
                     }
                 }
 
+                if let Some((owner, alt, epoch, row, column, parameters)) = inline_request {
+                    let proxy = state.proxy.clone();
+                    state.inline_images.request(
+                        owner,
+                        alt,
+                        epoch,
+                        row,
+                        column,
+                        parameters,
+                        move || {
+                            let _ = proxy.send_event(VoltEvent::PtyData);
+                        },
+                    );
+                }
+                state.sync_inline_images();
+
+                for (pid, data) in clipboard_requests {
+                    state.terminal_clipboard_request(pid, data);
+                }
                 if active_grid_changed {
+                    #[cfg(target_os = "macos")]
+                    state._native_text.invalidate_accessibility();
                     state.invalidate_search_after_output();
                 }
                 state.invalidate_search_if_target_changed();
@@ -6358,6 +7640,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         state.set_window_title_cached(active_title);
                     }
 
+                    state.sync_inline_images();
                     let snapshot_start = state.renderer.snapshot_timer();
                     let Some((render_grid, render_cursor_visible)) =
                         state.build_render_grid_for_active_tab()
@@ -6430,6 +7713,8 @@ impl ApplicationHandler<VoltEvent> for App {
                         inspector_info,
                         active_read_only,
                     );
+                    #[cfg(target_os = "macos")]
+                    state.publish_accessibility_for_render(&render_grid);
                     state.render_snapshot = Some(render_grid);
                     if state.post_resize_redraws > 0 {
                         state.post_resize_redraws -= 1;
@@ -6445,7 +7730,7 @@ impl ApplicationHandler<VoltEvent> for App {
         if close_window_after_event {
             self.save_layout();
             self.windows.remove(&window_id);
-            if self.windows.is_empty() {
+            if self.should_exit() {
                 event_loop.exit();
             }
         }
@@ -6460,7 +7745,7 @@ impl ApplicationHandler<VoltEvent> for App {
         // Drain any PTY events that arrived between redraws.
         // The EventLoopProxy already triggers user_event → request_redraw,
         // so this is just a safety drain for events that slipped through.
-        if self.windows.is_empty() {
+        if self.should_exit() {
             event_loop.exit();
             return;
         }
@@ -6469,6 +7754,14 @@ impl ApplicationHandler<VoltEvent> for App {
         let mut windows_to_close = Vec::new();
 
         for (window_id, state) in self.windows.iter_mut() {
+            #[cfg(target_os = "macos")]
+            let _ = state._native_text.accessibility_requested(); // silent TTL expiry
+            state.advanced_keyboard.expire(Instant::now());
+            if let Some(deadline) = state.advanced_keyboard.deadline() {
+                next_blink_deadline =
+                    Some(next_blink_deadline.map_or(deadline, |d| d.min(deadline)));
+            }
+
             if let Some(deadline) = state.tick_task_notices() {
                 next_blink_deadline =
                     Some(next_blink_deadline.map_or(deadline, |d| d.min(deadline)));
@@ -6585,6 +7878,8 @@ impl ApplicationHandler<VoltEvent> for App {
             let mut pending_partial_damage: Option<(usize, usize)> = None;
             let mut active_grid_changed = false;
             let mut closed_panes: Vec<(usize, usize)> = Vec::new();
+            let mut clipboard_requests = Vec::new();
+            let mut inline_request = None;
 
             if !state.redraw_pending {
                 for (i, tab) in state.tabs.iter_mut().enumerate() {
@@ -6592,6 +7887,30 @@ impl ApplicationHandler<VoltEvent> for App {
                     tab.tree.for_each_leaf_mut(&mut |pane_id, pane| {
                         while let Ok(ev) = pane.event_rx.try_recv() {
                             match ev {
+                                CoreEvent::InlineImageRequested {
+                                    parameters,
+                                    alternate_screen,
+                                    epoch,
+                                    row,
+                                    column,
+                                } => {
+                                    if state.config.inline_images.enabled
+                                        && state.inline_images.idle()
+                                        && inline_request.is_none()
+                                    {
+                                        inline_request = Some((
+                                            Arc::clone(&pane.performer),
+                                            alternate_screen,
+                                            epoch,
+                                            row,
+                                            column,
+                                            parameters,
+                                        ));
+                                    }
+                                }
+                                CoreEvent::ClipboardWriteRequested(data) => {
+                                    clipboard_requests.push((pane.pty.child_pid(), data))
+                                }
                                 CoreEvent::SynchronizedOutput { deadline } => {
                                     let owner = Arc::as_ptr(&pane.performer) as usize;
                                     if let Some(deadline) = deadline {
@@ -6665,7 +7984,28 @@ impl ApplicationHandler<VoltEvent> for App {
                 }
             }
 
+            if let Some((owner, alt, epoch, row, column, parameters)) = inline_request {
+                let proxy = state.proxy.clone();
+                state.inline_images.request(
+                    owner,
+                    alt,
+                    epoch,
+                    row,
+                    column,
+                    parameters,
+                    move || {
+                        let _ = proxy.send_event(VoltEvent::PtyData);
+                    },
+                );
+            }
+            state.sync_inline_images();
+
+            for (pid, data) in clipboard_requests {
+                state.terminal_clipboard_request(pid, data);
+            }
             if active_grid_changed {
+                #[cfg(target_os = "macos")]
+                state._native_text.invalidate_accessibility();
                 state.invalidate_search_after_output();
             }
             state.invalidate_search_if_target_changed();
@@ -6771,7 +8111,7 @@ impl ApplicationHandler<VoltEvent> for App {
                 self.save_layout();
                 self.windows.remove(&window_id);
             }
-            if self.windows.is_empty() {
+            if self.should_exit() {
                 event_loop.exit();
                 return;
             }
@@ -6824,11 +8164,11 @@ fn char_select_class(c: char) -> u8 {
 
 /// Upper bound for a single user-initiated paste into the terminal or editor.
 #[cfg(target_os = "macos")]
-const MAX_CLIPBOARD_BYTES: usize = 8 * 1024 * 1024;
 
 /// Read at most one byte beyond the cap. On overflow, kill and reap the child
 /// before returning, so a large clipboard never grows memory without bound.
 #[cfg(target_os = "macos")]
+#[cfg(test)]
 fn read_bounded_command_output(
     command: &mut std::process::Command,
     max_bytes: usize,
@@ -7148,6 +8488,47 @@ fn set_app_icon() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disabling_quick_shortcut_preserves_live_window_and_jobs() {
+        struct LiveJobs(std::rc::Rc<std::cell::Cell<usize>>);
+        impl Drop for LiveJobs {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut windows = std::collections::HashMap::new();
+        windows.insert(42, (true, LiveJobs(drops.clone())));
+        let mut quick_window = Some(42);
+        let state =
+            super::take_quick_window_for_promotion(&mut windows, &mut quick_window).unwrap();
+        let jobs = std::rc::Rc::as_ptr(&state.1 .0);
+        state.0 = false;
+        assert!(super::persist_terminal_window(state.0));
+        assert!(quick_window.is_none());
+        assert_eq!(drops.get(), 0);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(std::rc::Rc::as_ptr(&windows[&42].1 .0), jobs);
+        assert!(!super::exit_without_quick_shortcut(
+            windows.is_empty(),
+            false
+        ));
+        assert!(super::take_quick_window_for_promotion(&mut windows, &mut quick_window).is_none());
+        assert_eq!(drops.get(), 0);
+        drop(windows);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn quick_window_is_transient_and_registered_shortcut_keeps_app_alive() {
+        assert!(super::persist_terminal_window(false));
+        assert!(!super::persist_terminal_window(true));
+        assert!(super::exit_without_quick_shortcut(true, false));
+        assert!(!super::exit_without_quick_shortcut(true, true));
+        assert!(!super::exit_without_quick_shortcut(false, false));
+        assert!(!super::exit_without_quick_shortcut(false, true));
+    }
+
     use super::create_sample_config_if_missing;
     #[cfg(target_os = "macos")]
     use super::{read_bounded_command_output, strip_bracketed_paste_end};
@@ -7349,6 +8730,115 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ax_render_privacy_requires_strict_echo_knowledge() {
+        use super::ax_render_sensitivity;
+        use crate::native_text::accessibility::Sensitivity;
+        assert_eq!(
+            ax_render_sensitivity(false, false, false, None),
+            Sensitivity::Unknown
+        );
+        // Includes raw noncanonical no-echo: do NOT use likely_password_prompt.
+        assert_eq!(
+            ax_render_sensitivity(false, false, false, Some(false)),
+            Sensitivity::NoEcho
+        );
+        assert_eq!(
+            ax_render_sensitivity(true, false, false, Some(true)),
+            Sensitivity::ManualSecure
+        );
+        assert_eq!(
+            ax_render_sensitivity(false, true, false, Some(true)),
+            Sensitivity::NoEcho
+        );
+        assert_eq!(
+            ax_render_sensitivity(false, false, true, Some(true)),
+            Sensitivity::Unknown
+        );
+        assert_eq!(
+            ax_render_sensitivity(false, false, false, Some(true)),
+            Sensitivity::KnownSafe
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ax_visible_pane_excludes_neighbors_and_uses_utf16_selection() {
+        use super::ax_visible_pane_snapshot;
+        use crate::native_text::accessibility::{Sensitivity, TextRange};
+        let mut grid = Grid::new(6, 3);
+        for row in 0..3 {
+            for col in 0..6 {
+                grid.cell_mut(col, row).set_char('X');
+            }
+        }
+        grid.cell_mut(2, 1).set_char('😀');
+        grid.cell_mut(3, 1).set_char('z');
+        grid.cell_mut(2, 2).set_char('a');
+        grid.cell_mut(3, 2).set_char('b');
+        let rect = crate::pane_tree::PaneRect {
+            id: 7,
+            col: 2,
+            row: 1,
+            cols: 2,
+            rows: 2,
+        };
+        let snapshot =
+            ax_visible_pane_snapshot(&grid, rect, Sensitivity::KnownSafe, Some(((2, 1), (3, 1))));
+        assert_eq!(snapshot.text(), "😀z\nab");
+        assert_eq!(snapshot.selected_text(), Some("😀z"));
+        assert_eq!(
+            snapshot.selected_range(),
+            Some(TextRange {
+                location: 0,
+                length: 3
+            })
+        );
+        assert!(!snapshot.text().contains('X'));
+        for privacy in [
+            Sensitivity::Unknown,
+            Sensitivity::NoEcho,
+            Sensitivity::ManualSecure,
+        ] {
+            assert_eq!(
+                ax_visible_pane_snapshot(&grid, rect, privacy, None).text(),
+                ""
+            );
+        }
+        assert_eq!(
+            ax_visible_pane_snapshot(&grid, rect, Sensitivity::KnownSafe, Some(((0, 0), (3, 1))))
+                .selected_range(),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ax_visible_extraction_is_bounded_before_snapshot_construction() {
+        use super::ax_visible_pane_snapshot;
+        use crate::native_text::accessibility::{Sensitivity, MAX_ROWS, MAX_UTF16};
+        let grid = Grid::new(256, 300);
+        let rect = crate::pane_tree::PaneRect {
+            id: 0,
+            col: 0,
+            row: 0,
+            cols: 256,
+            rows: 300,
+        };
+        let snapshot = ax_visible_pane_snapshot(&grid, rect, Sensitivity::KnownSafe, None);
+        assert!(snapshot.number_of_characters() <= MAX_UTF16);
+        assert!(snapshot.text().matches('\n').count() < MAX_ROWS);
+        let invalid = crate::pane_tree::PaneRect {
+            col: usize::MAX,
+            ..rect
+        };
+        assert_eq!(
+            ax_visible_pane_snapshot(&grid, invalid, Sensitivity::KnownSafe, None).text(),
+            ""
+        );
+    }
+
     #[test]
     fn native_text_respects_modal_input_and_read_only_panes() {
         use super::{committed_text_target as target, CommittedTextTarget::*};
@@ -7513,5 +9003,195 @@ mod tests {
             "render-grid blit: {cells} cells in {elapsed:?} ({:.1} M cells/s)",
             cells as f64 / elapsed.as_secs_f64() / 1_000_000.0
         );
+    }
+}
+
+#[cfg(test)]
+mod asynchronous_clipboard_tests {
+    use super::*;
+    fn identity() -> ClipboardIdentity {
+        ClipboardIdentity {
+            tab: 0,
+            pane: 7,
+            pid: Some(123),
+            performer: 42,
+            cwd: None,
+            sensitive: false,
+            read_only: false,
+            surfaces: [false; 7],
+            prompt: None,
+            rename_target: None,
+            settings_focus: None,
+            editor_focus: None,
+            form_focus: None,
+            search_focus: None,
+            prompt_cursor: None,
+        }
+    }
+    #[test]
+    fn stale_clipboard_identity_is_refused() {
+        let origin = identity();
+        assert!(clipboard_result_applies(true, 1, 1, &origin, &origin, true));
+        for current in [
+            ClipboardIdentity {
+                tab: 1,
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                pane: 8,
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                pid: Some(124),
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                performer: 43,
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                cwd: Some("/different".into()),
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                surfaces: [true; 7],
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                prompt: Some(crate::prompt::PromptKind::Find),
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                settings_focus: Some((0, 1)),
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                editor_focus: Some((1, false)),
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                form_focus: Some(1),
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                search_focus: Some((1, 0, false)),
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                prompt_cursor: Some(1),
+                ..origin.clone()
+            },
+            ClipboardIdentity {
+                rename_target: Some(1),
+                ..origin.clone()
+            },
+        ] {
+            assert!(!clipboard_result_applies(
+                true, 1, 1, &origin, &current, true
+            ));
+        }
+        assert!(!clipboard_result_applies(
+            true, 1, 2, &origin, &origin, true
+        ));
+        assert!(!clipboard_result_applies(
+            true, 1, 1, &origin, &origin, false
+        ));
+        // A switch away and back leaves the same fingerprint, but invalidates forever.
+        assert!(!clipboard_result_applies(
+            false, 1, 1, &origin, &origin, true
+        ));
+    }
+    #[test]
+    fn sensitivity_toggle_invalidates_read_in_both_directions() {
+        let normal = identity();
+        let protected = ClipboardIdentity {
+            sensitive: true,
+            ..normal.clone()
+        };
+        assert!(clipboard_result_applies(
+            true, 1, 1, &protected, &protected, true
+        ));
+        assert!(!clipboard_result_applies(
+            true, 1, 1, &normal, &protected, true
+        ));
+        assert!(!clipboard_result_applies(
+            true, 1, 1, &protected, &normal, true
+        ));
+        let read_only = ClipboardIdentity {
+            read_only: true,
+            ..protected.clone()
+        };
+        assert!(!clipboard_result_applies(
+            true, 1, 1, &protected, &read_only, true
+        ));
+    }
+    #[test]
+    fn explicit_password_paste_is_safe_only_without_controls_or_preview() {
+        use ClipboardPasteDisposition::*;
+        for bracketed in [false, true] {
+            for confirm in [false, true] {
+                assert_eq!(
+                    clipboard_paste_disposition("pässword🔑".as_bytes(), bracketed, true, confirm),
+                    Direct
+                );
+                for bytes in [
+                    b"two\nlines".as_slice(),
+                    b"tab\tvalue",
+                    b"return\r",
+                    b"\x1b[201~",
+                    b"\0",
+                    &[0xff],
+                    "bidi\u{202e}".as_bytes(),
+                    "control\u{0085}".as_bytes(),
+                ] {
+                    assert_eq!(
+                        clipboard_paste_disposition(bytes, bracketed, true, confirm),
+                        Block
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            clipboard_paste_disposition(b"one\ntwo", false, false, true),
+            Review
+        );
+        assert_eq!(
+            clipboard_paste_disposition(b"one\ntwo", true, false, true),
+            Direct
+        );
+        assert_eq!(
+            clipboard_paste_disposition(b"one\ntwo", false, false, false),
+            Direct
+        );
+    }
+    #[test]
+    fn quick_hide_rejects_before_native_focus_event() {
+        assert!(clipboard_host_accepts(true, true, Some(true), true));
+        assert!(!clipboard_host_accepts(false, true, Some(true), true));
+        assert!(!clipboard_host_accepts(true, true, Some(true), false));
+        assert!(!clipboard_host_accepts(true, true, Some(false), true));
+    }
+    #[test]
+    fn clipboard_event_debug_never_exposes_bytes() {
+        let result = ClipboardReadResult(Arc::new(Ok(b"secret-payload".to_vec())));
+        assert!(!format!("{result:?}").contains("secret"));
+    }
+    #[test]
+    fn selection_copy_has_an_extraction_cap() {
+        let grid = Grid::new(4, 2);
+        let selection = Selection {
+            pane_id: 0,
+            alternate_screen: false,
+            mode: SelectionMode::Block,
+            start_col: 0,
+            start_row: 0,
+            end_col: 3,
+            end_row: 1,
+        };
+        assert_eq!(
+            bounded_clipboard_selection(selection, &grid, 9).as_deref(),
+            Some("    \n    ")
+        );
+        assert!(bounded_clipboard_selection(selection, &grid, 8).is_none());
     }
 }

@@ -16,6 +16,150 @@ use volt_core::grid::Grid;
 
 use crate::tab_color::TabColor;
 
+/// Immutable, tightly packed straight-alpha RGBA image. IDs must identify the
+/// same pixel allocation and dimensions for their entire visible lifetime.
+/// `rect` and `clip` are physical-pixel [x, y, width, height]; `clip` must be
+/// the owning pane's content bounds. Both are intersected with the surface.
+#[derive(Clone, Debug)]
+pub struct InlineImage {
+    pub id: u64,
+    pub pixels: Arc<[u8]>,
+    pub width: u32,
+    pub height: u32,
+    pub rect: [f32; 4],
+    pub clip: [f32; 4],
+}
+
+const MAX_INLINE_IMAGES: usize = 32;
+const MAX_INLINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INLINE_PIXELS: usize = 1_000_000;
+
+fn valid_image_rect(r: [f32; 4]) -> bool {
+    r.iter().all(|v| v.is_finite())
+        && r[2] > 0.0
+        && r[3] > 0.0
+        && (r[0] + r[2]).is_finite()
+        && (r[1] + r[3]).is_finite()
+}
+
+fn valid_inline_image(image: &InlineImage) -> bool {
+    let count = (image.width as usize).checked_mul(image.height as usize);
+    matches!(count, Some(n) if n > 0 && n <= MAX_INLINE_PIXELS
+        && n.checked_mul(4) == Some(image.pixels.len()))
+        && valid_image_rect(image.rect)
+        && valid_image_rect(image.clip)
+}
+
+#[derive(Default)]
+struct InlineImages {
+    images: Vec<InlineImage>,
+    // None is a negative cache entry: do not retry exhaustion every frame.
+    cache: HashMap<u64, Option<crate::atlas::AtlasRegion>>,
+    atlas_misses: usize,
+}
+
+impl InlineImages {
+    fn set(&mut self, images: Vec<InlineImage>) {
+        let mut bytes = 0;
+        let mut accepted = Vec::new();
+        for image in images.into_iter().take(MAX_INLINE_IMAGES) {
+            if !valid_inline_image(&image)
+                || bytes + image.pixels.len() > MAX_INLINE_BYTES
+                || accepted.iter().any(|i: &InlineImage| i.id == image.id)
+            {
+                continue;
+            }
+            // Reject ID collisions without hashing or scanning RGBA.
+            if let Some(old) = self.images.iter().find(|i| i.id == image.id) {
+                if old.width != image.width
+                    || old.height != image.height
+                    || !Arc::ptr_eq(&old.pixels, &image.pixels)
+                {
+                    continue;
+                }
+            }
+            bytes += image.pixels.len();
+            accepted.push(image);
+        }
+        self.cache
+            .retain(|id, _| accepted.iter().any(|i| i.id == *id));
+        self.images = accepted;
+    }
+
+    fn append(&mut self, atlas: &mut CpuAtlas, out: &mut Vec<GlyphVertex>, sw: f32, sh: f32) {
+        self.atlas_misses = 0;
+        for image in &self.images {
+            let Some((rect, fractions)) = clipped_inline_rect(image.rect, image.clip, sw, sh)
+            else {
+                continue;
+            };
+            let region = *self
+                .cache
+                .entry(image.id)
+                .or_insert_with(|| atlas.insert_rgba(image.width, image.height, &image.pixels));
+            let Some(region) = region else {
+                self.atlas_misses += 1;
+                continue;
+            };
+            let [x, y, w, h] = rect;
+            let [a, b, c, d] = fractions;
+            let u0 = region.u0 + a * (region.u1 - region.u0);
+            let v0 = region.v0 + b * (region.v1 - region.v0);
+            let u1 = region.u0 + c * (region.u1 - region.u0);
+            let v1 = region.v0 + d * (region.v1 - region.v0);
+            let positions = [
+                [x, y],
+                [x + w, y],
+                [x, y + h],
+                [x + w, y],
+                [x + w, y + h],
+                [x, y + h],
+            ];
+            let uvs = [[u0, v0], [u1, v0], [u0, v1], [u1, v0], [u1, v1], [u0, v1]];
+            for (p, uv) in positions.into_iter().zip(uvs) {
+                out.push(GlyphVertex {
+                    pos: [p[0] / sw * 2.0 - 1.0, 1.0 - p[1] / sh * 2.0],
+                    uv,
+                    color: [1.0; 4],
+                });
+            }
+        }
+    }
+}
+
+fn clipped_inline_rect(
+    rect: [f32; 4],
+    clip: [f32; 4],
+    sw: f32,
+    sh: f32,
+) -> Option<([f32; 4], [f32; 4])> {
+    if !valid_image_rect(rect)
+        || !valid_image_rect(clip)
+        || !sw.is_finite()
+        || !sh.is_finite()
+        || sw <= 0.0
+        || sh <= 0.0
+    {
+        return None;
+    }
+    let x = rect[0].max(clip[0]).max(0.0);
+    let y = rect[1].max(clip[1]).max(0.0);
+    let right = (rect[0] + rect[2]).min(clip[0] + clip[2]).min(sw);
+    let bottom = (rect[1] + rect[3]).min(clip[1] + clip[3]).min(sh);
+    if right <= x || bottom <= y {
+        return None;
+    }
+    Some((
+        [x, y, right - x, bottom - y],
+        [
+            (x - rect[0]) / rect[2],
+            (y - rect[1]) / rect[3],
+            (right - rect[0]) / rect[2],
+            (bottom - rect[1]) / rect[3],
+        ],
+    ))
+}
+
 const ATLAS_SIZE: u32 = 2048;
 const INITIAL_BG_VERT_CAPACITY: usize = 16_384;
 const INITIAL_GLYPH_VERT_CAPACITY: usize = 32_768;
@@ -451,6 +595,7 @@ pub struct Renderer {
     atlas_texture: wgpu::Texture,
     atlas_bind_group: wgpu::BindGroup,
     atlas: CpuAtlas,
+    inline_images: InlineImages,
     font_system: FontSystem,
     swash_cache: SwashCache,
     pub cell_width: f32,
@@ -830,6 +975,7 @@ impl Renderer {
             atlas_texture,
             atlas_bind_group,
             atlas: CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE),
+            inline_images: InlineImages::default(),
             font_system,
             swash_cache,
             cell_width,
@@ -961,6 +1107,19 @@ impl Renderer {
         Ok(pixels)
     }
 
+    /// Replace the visible image list. Only the first 32 inputs are considered;
+    /// invalid/duplicate/colliding entries are omitted, total RGBA <= 16 MiB.
+    /// Placement changes using the same immutable Arc and ID reuse the upload.
+    pub fn set_inline_images(&mut self, images: Vec<InlineImage>) {
+        self.inline_images.set(images);
+    }
+
+    /// Visible images omitted by atlas exhaustion on the last frame. Failed
+    /// allocations are cached until the atlas resets or that ID is removed.
+    pub fn inline_image_atlas_misses(&self) -> usize {
+        self.inline_images.atlas_misses
+    }
+
     pub fn set_row_cache_enabled(&mut self, enabled: bool) {
         self.row_cache_enabled = enabled;
         self.row_cache.clear();
@@ -1041,6 +1200,7 @@ impl Renderer {
         self.cell_height = self.font_size_phys * self.line_height;
         self.tab_bar_height = (38.0 * scale_factor).round();
         self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
+        self.inline_images.cache.clear();
         self.workspace_card_cache = None;
         self.search_palette_cache = None;
         self.theme_editor_cache = None;
@@ -1739,6 +1899,7 @@ impl Renderer {
         }
         if self.atlas.full {
             self.atlas = CpuAtlas::new(ATLAS_SIZE, ATLAS_SIZE);
+            self.inline_images.cache.clear();
             self.workspace_card_cache = None;
             self.search_palette_cache = None;
             self.theme_editor_cache = None;
@@ -2484,6 +2645,9 @@ impl Renderer {
             self.draw_rect(&mut bg_verts, d.x, d.y, d.width, d.height, d.color);
         }
 
+        // Same RGBA atlas/pipeline; terminal text first, all overlays afterwards.
+        self.inline_images
+            .append(&mut self.atlas, &mut glyph_verts, sw, sh);
         let hud_start = (bg_verts.len(), glyph_verts.len());
         // ── overlays: read-only badge, inspector, Find/rename prompt ─────────
         // Drawn last so they sit on top of the terminal content and dividers.
@@ -2805,7 +2969,7 @@ mod placement_tests {
     #[test]
     fn row_source_reuses_unchanged_grapheme_buffers_during_ascii_churn() {
         let mut p = volt_core::performer::Performer::new(32, 2);
-        let mut parser = vte::Parser::new();
+        let mut parser = volt_core::parser::Parser::new();
         parser.advance(&mut p, "000000 é ẍ 👩‍💻 👍🏽".as_bytes());
         let mut cached = super::CachedRow::default();
         let key = super::RowKey::default();
@@ -2837,7 +3001,7 @@ mod placement_tests {
     #[test]
     fn row_source_updates_moved_and_changed_clusters_without_stale_entries() {
         let mut p = volt_core::performer::Performer::new(32, 2);
-        let mut parser = vte::Parser::new();
+        let mut parser = volt_core::parser::Parser::new();
         let key = super::RowKey::default();
         let mut cached = super::CachedRow::default();
         for text in ["👩‍💻 👍🏽", "---👨‍💻", "👩🏽‍💻 x", "plain", "👍🏽 👩‍💻"]
@@ -2862,7 +3026,7 @@ mod placement_tests {
     fn benchmark_row_source_capture() {
         use std::{hint::black_box, time::Instant};
         let mut p = volt_core::performer::Performer::new(200, 2);
-        vte::Parser::new().advance(
+        volt_core::parser::Parser::new().advance(
             &mut p,
             format!("000000 {}", "👩‍💻 👍🏽 é ẍ 日本 ".repeat(12)).as_bytes(),
         );
@@ -2916,8 +3080,8 @@ mod placement_tests {
     fn row_source_compares_grid_local_ids_by_text_and_prunes_removed_clusters() {
         let mut a = volt_core::performer::Performer::new(16, 2);
         let mut b = volt_core::performer::Performer::new(16, 2);
-        vte::Parser::new().advance(&mut a, "👩‍💻".as_bytes());
-        vte::Parser::new().advance(&mut b, "👨‍💻".as_bytes());
+        volt_core::parser::Parser::new().advance(&mut a, "👩‍💻".as_bytes());
+        volt_core::parser::Parser::new().advance(&mut b, "👨‍💻".as_bytes());
         // Both grids assign their first cluster the same local ID.
         assert_eq!(a.grid.row_cells(0), b.grid.row_cells(0));
         let key = super::RowKey::default();
@@ -2927,7 +3091,7 @@ mod placement_tests {
         cached.capture_source(&b.grid, 0, key);
         assert!(cached.matches(&b.grid, 0, key));
         assert!(!cached.matches(&a.grid, 0, key));
-        vte::Parser::new().advance(&mut b, b"\x1b[1;1H\x1b[2Kplain");
+        volt_core::parser::Parser::new().advance(&mut b, b"\x1b[1;1H\x1b[2Kplain");
         cached.capture_source(&b.grid, 0, key);
         assert!(cached.extended.is_empty());
         assert!(cached.matches(&b.grid, 0, key));
@@ -3116,5 +3280,113 @@ impl volt_ui_kit::Painter for Renderer {
         color_at: &dyn Fn(usize) -> [f32; 4],
     ) {
         Renderer::draw_text_colored(self, out, text, x, y, size, line_height, color_at);
+    }
+}
+
+#[cfg(test)]
+mod inline_image_tests {
+    use super::*;
+    fn image(id: u64) -> InlineImage {
+        InlineImage {
+            id,
+            pixels: Arc::from([255, 32, 0, 128].repeat(4)),
+            width: 2,
+            height: 2,
+            rect: [0., 0., 8., 8.],
+            clip: [0., 0., 8., 8.],
+        }
+    }
+    #[test]
+    fn clipping_preserves_source_fractions_and_rejects_nonfinite() {
+        assert_eq!(
+            clipped_inline_rect([-10., -20., 40., 80.], [0., 0., 20., 40.], 100., 100.),
+            Some(([0., 0., 20., 40.], [0.25, 0.25, 0.75, 0.75]))
+        );
+        assert!(clipped_inline_rect([0., 0., 10., 10.], [20., 0., 10., 10.], 100., 100.).is_none());
+        assert_eq!(
+            clipped_inline_rect([0., 0., 40., 40.], [0., 0., 100., 100.], 20., 10.),
+            Some(([0., 0., 20., 10.], [0., 0., 0.5, 0.25]))
+        );
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for i in 0..4 {
+                let mut a = image(1);
+                a.rect[i] = value;
+                assert!(!valid_inline_image(&a));
+                let mut a = image(1);
+                a.clip[i] = value;
+                assert!(!valid_inline_image(&a));
+            }
+        }
+        assert!(!valid_image_rect([f32::MAX, 0., f32::MAX, 1.]));
+    }
+    #[test]
+    fn limits_and_collisions_are_bounded() {
+        let mut state = InlineImages::default();
+        state.set((0..40).map(image).collect());
+        assert_eq!(state.images.len(), 32);
+        let old = state.images[0].clone();
+        state.set(vec![old.clone(), old]);
+        assert_eq!(state.images.len(), 1);
+        state.set(vec![image(0)]);
+        assert!(state.images.is_empty());
+        let mut invalid = image(1);
+        invalid.width = u32::MAX;
+        assert!(!valid_inline_image(&invalid));
+        invalid.width = 0;
+        assert!(!valid_inline_image(&invalid));
+        invalid.width = 3;
+        assert!(!valid_inline_image(&invalid));
+        let mut huge = image(2);
+        huge.width = 1000;
+        huge.height = 1001;
+        assert!(!valid_inline_image(&huge));
+        huge.height = 1000;
+        huge.pixels = Arc::from(vec![0; 4_000_000]);
+        state.set(
+            (0..5)
+                .map(|id| InlineImage { id, ..huge.clone() })
+                .collect(),
+        );
+        assert_eq!(state.images.len(), 4);
+    }
+    #[test]
+    fn upload_cache_reuses_placement_and_clears_on_reset() {
+        let mut state = InlineImages::default();
+        let mut atlas = CpuAtlas::new(16, 16);
+        let mut vertices = Vec::new();
+        let a = image(1);
+        state.set(vec![a.clone()]);
+        state.append(&mut atlas, &mut vertices, 8., 8.);
+        assert_eq!(atlas.take_dirty_rect(), Some((0, 0, 2, 2)));
+        assert_eq!(vertices.len(), 6);
+        let mut moved = a;
+        moved.rect = [-4., 0., 8., 8.];
+        state.set(vec![moved]);
+        vertices.clear();
+        state.append(&mut atlas, &mut vertices, 8., 8.);
+        assert_eq!(atlas.take_dirty_rect(), None);
+        assert_eq!(vertices[0].uv, [1. / 16., 0.]);
+        state.cache.clear();
+        atlas = CpuAtlas::new(16, 16);
+        state.append(&mut atlas, &mut vertices, 8., 8.);
+        assert_eq!(atlas.take_dirty_rect(), Some((0, 0, 2, 2)));
+        state.set(Vec::new());
+        assert!(state.cache.is_empty());
+    }
+    #[test]
+    fn exhausted_images_do_not_reset_or_retry_the_atlas() {
+        let mut state = InlineImages::default();
+        let mut atlas = CpuAtlas::new(2, 2);
+        let mut vertices = Vec::new();
+        state.set(vec![image(1), image(2)]);
+        state.append(&mut atlas, &mut vertices, 8., 8.);
+        assert_eq!(state.atlas_misses, 1);
+        assert!(!atlas.full);
+        atlas.take_dirty_rect();
+        vertices.clear();
+        state.append(&mut atlas, &mut vertices, 8., 8.);
+        assert_eq!(atlas.take_dirty_rect(), None);
+        assert_eq!(vertices.len(), 6);
+        assert_eq!(state.atlas_misses, 1);
     }
 }

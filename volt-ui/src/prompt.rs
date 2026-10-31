@@ -32,6 +32,8 @@ pub enum PromptKind {
     /// Explicit permission for just this command, not trust for its whole file.
     ReviewTask,
     TrustTasks,
+    ReviewPaste,
+    ReviewClipboardWrite,
 }
 
 impl PromptKind {
@@ -39,7 +41,12 @@ impl PromptKind {
     pub fn read_only(self) -> bool {
         matches!(
             self,
-            Self::OpenLink | Self::ConfirmTask | Self::ReviewTask | Self::TrustTasks
+            Self::OpenLink
+                | Self::ConfirmTask
+                | Self::ReviewTask
+                | Self::TrustTasks
+                | Self::ReviewPaste
+                | Self::ReviewClipboardWrite
         )
     }
 }
@@ -82,6 +89,8 @@ impl TextPrompt {
             PromptKind::ConfirmTask => "Run task? Enter: run / Esc: cancel",
             PromptKind::ReviewTask => "Review task · Enter: run once / Esc: cancel",
             PromptKind::TrustTasks => "Review task permissions",
+            PromptKind::ReviewPaste => "Review paste",
+            PromptKind::ReviewClipboardWrite => "Terminal clipboard request",
             PromptKind::RenameTab => "Change Tab Title",
             PromptKind::RenameTerminal => "Change Terminal Title",
         }

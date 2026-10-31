@@ -2,7 +2,7 @@ use volt_config::Color;
 use volt_core::{cell::CellColor, performer::Performer};
 
 fn feed(p: &mut Performer, bytes: &[u8]) {
-    vte::Parser::new().advance(p, bytes);
+    volt_core::parser::Parser::new().advance(p, bytes);
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn split_bytes_produce_same_screen_modes_and_replies() {
     feed(&mut reference, bytes);
     for size in 1..=bytes.len() {
         let mut p = Performer::new(20, 6);
-        let mut parser = vte::Parser::new();
+        let mut parser = volt_core::parser::Parser::new();
         for chunk in bytes.chunks(size) {
             parser.advance(&mut p, chunk);
         }

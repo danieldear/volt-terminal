@@ -36,4 +36,11 @@ mod shell_startup;
 
 mod keyboard_protocol;
 
+mod clipboard;
+mod clipboard_safety;
 mod session;
+
+pub mod inline_image;
+
+#[cfg(target_os = "macos")]
+mod quick_terminal;

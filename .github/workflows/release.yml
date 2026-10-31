@@ -97,6 +97,9 @@ jobs:
           mkdir -p "dist" "staging/${package_dir}"
           cp target/release/volt "staging/${package_dir}/volt"
           cp README.md LICENSE "staging/${package_dir}/"
+          mkdir -p "staging/${package_dir}/assets" "staging/${package_dir}/scripts/linux"
+          cp assets/volt.desktop assets/icon-256.png "staging/${package_dir}/assets/"
+          cp scripts/linux/install_desktop.py "staging/${package_dir}/scripts/linux/"
           tar -C staging -czf "dist/${package_dir}.tar.gz" "${package_dir}"
 
       - name: Build macOS app bundle

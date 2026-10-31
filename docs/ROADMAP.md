@@ -1,7 +1,7 @@
 # Volt roadmap
 
-Volt is an early public preview (source version: **0.1.15**). This page lists
-what works today and what comes next. Status reconciled on **2026-10-12** against
+Volt is an early public preview (released version: **0.1.16**). This page lists
+what works today and what comes next. Status reconciled on **2026-10-14** against
 the current source, release metadata and hosted signing validation. Order within a stage is a rough priority,
 not a promise or a date. Settings and shortcuts may change before 1.0.
 
@@ -31,7 +31,7 @@ publicly released are separate milestones; a pending check is not missing code.
 
 | Area | Completed evidence | What remains |
 | --- | --- | --- |
-| macOS signing and notarization | Developer ID signing, hardened runtime, timestamp, Apple acceptance, stapling and extracted-ZIP verification passed locally and in [hosted validation](https://github.com/danieldear/volt-terminal/actions/runs/37572203978). Repository mode is `notarized` for future releases. | Public v0.1.12 is notarized and the user reports cross-system testing passed. v0.1.13 remains a testing draft. v0.1.14 adds the Unicode fix with maintainer-reported performance accepted for release; artifact verification remains required. Older v0.1.10 stays ad-hoc; **do not redo credential setup.** |
+| macOS signing and notarization | Developer ID signing, hardened runtime, timestamp, Apple acceptance, stapling and extracted-ZIP verification passed locally and in [hosted validation](https://github.com/danieldear/volt-terminal/actions/runs/37572203978). Repository mode is `notarized` for future releases. | Public v0.1.16 has macOS and Linux archives, checksums and signing-status metadata. Older ad-hoc releases are not retroactively notarized. **Do not redo credential setup.** |
 | Rendering optimizations | Merged ASCII/extended shape caches and task-strip geometry reuse passed targeted CPU/GPU checks. | Caches are merged. Perform matched visible-window benchmarks before claiming a whole-app speedup. See [measurement evidence](performance-intelligent-rendering.md). |
 | Project tasks and tab status | Current-pane execution, task import/form, trust review and shell completion handling exist. | Verify directory changes, status transitions and all card/strip routes across supported shells; fix demonstrated regressions rather than rebuild the feature. |
 
@@ -123,14 +123,14 @@ not instructions to reimplement them.
 | P1 | Extended keyboard reporting | Unambiguous modifiers and negotiated press/repeat/release events. | Important for modern editors/TUIs. | Included in v0.1.14 source; opt-in negotiation preserves legacy defaults, IME and application shortcuts. |
 | P1 | Prompt/output navigation | Select a command's output and retain prompt anchors after reflow. | Useful shell-integration completion. | v0.1.14 source: command-output selection and sparse anchor reflow implemented; shell markers required. Native selection acceptance pending. |
 | P2 | Session/layout restoration | Reopen windows, pane arrangement and local directories, not processes. | Useful everyday convenience. | v0.1.14 source: opt-in private atomic/versioned state, windows/tabs/splits/ratios/active pane/colors/local CWD only. Native custom-tab lifecycle acceptance pending. |
-| P2 | Key sequences and key tables | Context-specific and multi-key shortcuts beyond a single chord. | Useful for configurable workflows. | Single-chord overrides exist; sequences/tables remain. |
-| P2 | Linux usability | Clipboard integration and appropriate desktop behavior. | Needed before claiming platform parity. | Deferred by user until a Linux test system is available; do not claim clipboard/desktop parity. |
+| P2 | Key sequences and key tables | Context-specific and multi-key shortcuts beyond a single chord. | Useful for configurable workflows. | Validated sequences and one-shot tables are implemented in the current source batch; native acceptance and publication remain. |
+| P2 | Linux usability | Clipboard integration and appropriate desktop behavior. | Needed before claiming platform parity. | Clipboard backend and desktop installer are implemented in source; real Wayland/X11 acceptance remains unavailable. Do not claim platform parity. |
 | P2 | Link hover | Make the target and full clickable span clear before opening a URL. | Useful interaction polish. | Safe click handling exists; whole-link hover grouping remains. |
-| P2, security-gated | OSC 52 clipboard | Allow terminal applications to request clipboard operations. | Optional and sensitive. | Not implemented. Future policy must bound requests, attribute panes and deny reads by default. |
+| P2, security-gated | OSC 52 clipboard | Allow terminal applications to request clipboard operations. | Optional and sensitive. | Source implements bounded focused-pane writes with Ask/Deny/Allow; all read queries are denied. Native acceptance and publication remain. |
 | P3 | Programming ligatures | Combined programming-font shapes without changing underlying text. | Optional polish. | Shaped-run support missing; keep cell/cursor/selection alignment and disableable behavior. |
-| P3 | Inline images | Show image previews and plots requested by terminal applications. | Optional specialized capability. | Not implemented. Resource limits, safe decoding and path restrictions come first. |
+| P3 | Inline images | Show image previews and plots requested by terminal applications. | Optional specialized capability. | Source implements opt-in bounded OSC 1337 PNG images and GPU clipping. Kitty/sixel, full protocol compatibility and native acceptance remain. |
 | P3 | Automation | Programmatic control of windows, tabs, panes and input. | Optional integration surface. | No general terminal-control API. Design attribution and permissions before exposing access. |
-| P3 | Quick terminal | Bring up a small terminal with a global shortcut. | Optional convenience. | Not implemented; must handle focus, shortcuts and multiple displays. |
+| P3 | Quick terminal | Bring up a small terminal with a global shortcut. | Optional convenience. | Source implements opt-in macOS persistent global-shortcut window. Monitor/Space/conflict acceptance and Linux global shortcuts remain. |
 | P3 | AI providers and tooling | Actual model sessions, attachments, context and permissioned tool execution. | Optional strategic direction. | Configuration/rules discovery exists; real agent/session transport is not implemented. |
 
 ## Potential ideas — discovery backlog, not delivery commitments
@@ -180,3 +180,12 @@ Missing something, or want a feature moved up?
 [Open an issue on GitHub](https://github.com/danieldear/volt-terminal/issues).
 
 Current unreleased evidence and remaining native acceptance: [terminal compatibility](terminal-compatibility.md).
+
+## Current source batch (not yet released)
+
+The 2026-10-14 [product-readiness batch](product-readiness.md) adds safe-paste
+review, permission-controlled clipboard writes, keyboard sequences/tables, pane
+movement, Linux clipboard/desktop integration, bounded inline PNGs, a macOS
+quick terminal and a conservative read-only accessibility bridge. Do not move
+these to “Available today” until a release passes acceptance. Full actionable
+accessibility controls remain open, along with native/platform validation.

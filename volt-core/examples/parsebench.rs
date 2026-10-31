@@ -32,7 +32,7 @@ fn main() {
     let data = std::fs::read(path).expect("failed to read capture file");
 
     if noop {
-        let mut parser = vte::Parser::new();
+        let mut parser = volt_core::parser::Parser::new();
         let mut sink = Noop;
         let start = Instant::now();
         parser.advance(&mut sink, &data);
@@ -48,7 +48,7 @@ fn main() {
     }
     let mut performer = Performer::new(200, 60);
     performer.set_scrollback_limit(10_000);
-    let mut parser = vte::Parser::new();
+    let mut parser = volt_core::parser::Parser::new();
 
     let start = Instant::now();
     for chunk in data.chunks(4096) {

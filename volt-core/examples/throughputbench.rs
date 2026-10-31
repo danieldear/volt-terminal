@@ -26,7 +26,7 @@ fn main() {
         for seeded_wide in [false, true] {
             let mut p = Performer::new(cols, rows);
             p.set_scrollback_limit(10_000);
-            let mut parser = vte::Parser::new();
+            let mut parser = volt_core::parser::Parser::new();
             if seeded_wide {
                 parser.advance(&mut p, "界\r\n".as_bytes());
             }

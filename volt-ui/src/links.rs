@@ -177,8 +177,8 @@ pub fn open(url: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use volt_core::parser::Parser;
     use volt_core::performer::Performer;
-    use vte::Parser;
     fn terminal(text: &str, cols: usize, rows: usize) -> Grid {
         let mut p = Performer::new(cols, rows);
         Parser::new().advance(&mut p, text.as_bytes());

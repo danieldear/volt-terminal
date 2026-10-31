@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-vte = "0.15"
+vte = { version = "0.15", default-features = false }
 portable-pty = "0.9"
 tokio = { workspace = true, features = ["rt", "sync", "io-util"] }
 anyhow = { workspace = true }

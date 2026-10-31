@@ -440,6 +440,23 @@ impl TerminalTab {
         })
     }
 
+    /// Rearrange the focused process without changing tab metadata or focus.
+    pub fn swap_active_pane(&mut self, target_id: usize) -> crate::pane_tree::RearrangeResult {
+        self.tree.swap_active_pane(target_id)
+    }
+
+    /// Place the focused process left/above (`insert_before`) or right/below
+    /// the destination. Caller recomputes layout and applies normal PTY resize.
+    pub fn move_active_pane(
+        &mut self,
+        target_id: usize,
+        direction: PaneSplitDirection,
+        insert_before: bool,
+    ) -> crate::pane_tree::RearrangeResult {
+        self.tree
+            .move_active_pane(target_id, direction, insert_before)
+    }
+
     pub fn pane_count(&self) -> usize {
         self.tree.pane_count()
     }

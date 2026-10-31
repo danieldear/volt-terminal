@@ -83,6 +83,39 @@ impl CpuAtlas {
             .map(|(x, y, r, b)| (x, y, r - x, b - y))
     }
 
+    /// Insert tightly packed, straight-alpha RGBA. Invalid input never advances
+    /// the shelf. Image exhaustion does not request a glyph-atlas reset: this
+    /// avoids resetting and reuploading a permanently oversized image each frame.
+    pub fn insert_rgba(&mut self, width: u32, height: u32, pixels: &[u8]) -> Option<AtlasRegion> {
+        let len = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
+        if width == 0 || height == 0 || pixels.len() != len {
+            return None;
+        }
+        let was_full = self.full;
+        let allocation = self.allocate(width, height);
+        self.full = was_full;
+        let (x, y) = allocation?;
+        let stride = width as usize * 4;
+        for row in 0..height as usize {
+            let dst = ((y as usize + row) * self.width as usize + x as usize) * 4;
+            self.data[dst..dst + stride].copy_from_slice(&pixels[row * stride..(row + 1) * stride]);
+        }
+        self.mark_dirty(x, y, width, height);
+        Some(AtlasRegion {
+            u0: x as f32 / self.width as f32,
+            v0: y as f32 / self.height as f32,
+            u1: (x + width) as f32 / self.width as f32,
+            v1: (y + height) as f32 / self.height as f32,
+            width,
+            height,
+            offset_x: 0,
+            offset_y: 0,
+            is_color: true,
+        })
+    }
+
     pub fn get_cell_symbol(&mut self, c: char, width: u32, height: u32) -> Option<AtlasRegion> {
         if let Some(&region) = self.symbol_cache.get(&(c, width, height)) {
             return Some(region);
@@ -271,5 +304,29 @@ mod tests {
                 assert_eq!(first.is_some(), second.is_some());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rgba_tests {
+    use super::*;
+    #[test]
+    fn rgba_bounds_and_dirty_region_are_transactional() {
+        let mut a = CpuAtlas::new(4, 4);
+        assert!(a.insert_rgba(5, 1, &[0; 20]).is_none());
+        assert!(a.insert_rgba(2, 2, &[0; 15]).is_none());
+        assert!(a.insert_rgba(u32::MAX, u32::MAX, &[]).is_none());
+        assert!(a.insert_rgba(0, 1, &[]).is_none());
+        assert_eq!(a.take_dirty_rect(), None);
+        let pixels = [1, 2, 3, 4, 5, 6, 7, 8];
+        let r = a.insert_rgba(2, 1, &pixels).unwrap();
+        assert!(r.is_color);
+        assert_eq!(&a.data[..8], &pixels);
+        assert_eq!(a.take_dirty_rect(), Some((0, 0, 2, 1)));
+        assert!(a.insert_rgba(4, 4, &[9; 64]).is_none());
+        assert_eq!(&a.data[..8], &pixels);
+        assert!(!a.full);
+        let r = a.insert_rgba(1, 1, &[9; 4]).unwrap();
+        assert_eq!(r.u0, 0.75);
     }
 }

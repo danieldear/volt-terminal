@@ -1,5 +1,5 @@
+use volt_core::parser::Parser;
 use volt_core::{grid::Grid, hyperlink::Hyperlink, performer::Performer};
-use vte::Parser;
 
 fn feed(p: &mut Performer, text: &str) {
     Parser::new().advance(p, text.as_bytes());

@@ -9,3 +9,6 @@ pub mod pty;
 mod shell;
 
 pub mod keyboard;
+pub mod osc52;
+
+pub mod parser;

@@ -27,28 +27,36 @@ pub enum RemoveResult {
     NotFound,
 }
 
-pub enum PaneNode {
+/// Outcome of a topology-only operation. Invalid IDs never mutate the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RearrangeResult {
+    Changed,
+    Unchanged,
+    NotFound { pane_id: usize },
+}
+
+pub enum PaneNode<P = TerminalPane> {
     Leaf {
-        pane: TerminalPane,
+        pane: P,
         id: usize,
     },
     Split {
         direction: PaneSplitDirection,
         ratio: f32,
-        children: Box<[PaneNode; 2]>,
+        children: Box<[PaneNode<P>; 2]>,
         divider_id: usize,
     },
 }
 
-pub struct PaneTree {
-    // Invariant: always `Some` after construction; `None` only transiently inside `remove`.
-    root: Option<PaneNode>,
+pub struct PaneTree<P = TerminalPane> {
+    // Invariant: always `Some` after construction; `None` only transiently inside consuming topology edits.
+    root: Option<PaneNode<P>>,
     pub active_id: usize,
     next_id: usize,
 }
 
-impl PaneTree {
-    pub fn new(pane: TerminalPane) -> Self {
+impl<P> PaneTree<P> {
+    pub fn new(pane: P) -> Self {
         Self {
             root: Some(PaneNode::Leaf { pane, id: 0 }),
             active_id: 0,
@@ -56,6 +64,104 @@ impl PaneTree {
         }
     }
 
+    /// Exchange complete leaves, including their stable IDs. Focus stays with
+    /// the same process; split directions, ratios and divider IDs do not change.
+    pub fn swap_panes(&mut self, first_id: usize, second_id: usize) -> RearrangeResult {
+        rearrange_root(&mut self.root, first_id, second_id, None)
+    }
+
+    pub fn swap_active_pane(&mut self, target_id: usize) -> RearrangeResult {
+        self.swap_panes(self.active_id, target_id)
+    }
+
+    /// Detach an existing leaf and place it beside another existing leaf.
+    /// The old parent collapses; its divider ID is reused at the destination
+    /// with a 50/50 ratio. Other splits retain their IDs and ratios. No pane
+    /// is created, closed, resized or focused by this operation.
+    pub fn move_pane(
+        &mut self,
+        source_id: usize,
+        target_id: usize,
+        direction: PaneSplitDirection,
+        insert_before: bool,
+    ) -> RearrangeResult {
+        rearrange_root(
+            &mut self.root,
+            source_id,
+            target_id,
+            Some((direction, insert_before)),
+        )
+    }
+
+    pub fn move_active_pane(
+        &mut self,
+        target_id: usize,
+        direction: PaneSplitDirection,
+        insert_before: bool,
+    ) -> RearrangeResult {
+        self.move_pane(self.active_id, target_id, direction, insert_before)
+    }
+
+    pub fn remove(&mut self, target_id: usize) -> RemoveResult {
+        match self.root.as_ref() {
+            None => RemoveResult::NotFound,
+            Some(PaneNode::Leaf { id, .. }) if *id == target_id => RemoveResult::RemovedLastLeaf,
+            Some(PaneNode::Leaf { .. }) => RemoveResult::NotFound,
+            Some(PaneNode::Split { .. }) => {
+                let old_root = self.root.take().expect("root is Some");
+                let (new_root, found) = remove_node_bv(old_root, target_id, &mut self.active_id);
+                self.root = Some(new_root);
+                if found {
+                    RemoveResult::Removed
+                } else {
+                    RemoveResult::NotFound
+                }
+            }
+        }
+    }
+
+    pub fn layout(&self, cols: usize, rows: usize) -> Vec<PaneRect> {
+        let mut out = Vec::new();
+        if let Some(root) = &self.root {
+            let (minimum_cols, minimum_rows) = minimum_size_node(root);
+            if cols < minimum_cols || rows < minimum_rows {
+                // The tree cannot fit without overlapping panes. Keep the
+                // focused pane usable until the window is large enough again.
+                out.push(PaneRect {
+                    id: self.active_id,
+                    col: 0,
+                    row: 0,
+                    cols: cols.max(1),
+                    rows: rows.max(1),
+                });
+            } else {
+                layout_node(root, 0, 0, cols, rows, &mut out);
+            }
+        }
+        out
+    }
+
+    pub fn leaf_ids(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        if let Some(root) = &self.root {
+            collect_leaf_ids(root, &mut out);
+        }
+        out
+    }
+
+    pub fn focus_next(&mut self) {
+        let ids = self.leaf_ids();
+        if let Some(pos) = ids.iter().position(|&id| id == self.active_id) {
+            self.active_id = ids[(pos + 1) % ids.len()];
+        }
+    }
+
+    pub fn pane_count(&self) -> usize {
+        self.leaf_ids().len()
+    }
+}
+
+impl PaneTree {
     pub(crate) fn saved_layout(&self) -> crate::session::Node {
         fn node(n: &PaneNode) -> crate::session::Node {
             match n {
@@ -162,45 +268,6 @@ impl PaneTree {
         }
     }
 
-    pub fn remove(&mut self, target_id: usize) -> RemoveResult {
-        match self.root.as_ref() {
-            None => RemoveResult::NotFound,
-            Some(PaneNode::Leaf { id, .. }) if *id == target_id => RemoveResult::RemovedLastLeaf,
-            Some(PaneNode::Leaf { .. }) => RemoveResult::NotFound,
-            Some(PaneNode::Split { .. }) => {
-                let old_root = self.root.take().expect("root is Some");
-                let (new_root, found) = remove_node_bv(old_root, target_id, &mut self.active_id);
-                self.root = Some(new_root);
-                if found {
-                    RemoveResult::Removed
-                } else {
-                    RemoveResult::NotFound
-                }
-            }
-        }
-    }
-
-    pub fn layout(&self, cols: usize, rows: usize) -> Vec<PaneRect> {
-        let mut out = Vec::new();
-        if let Some(root) = &self.root {
-            let (minimum_cols, minimum_rows) = minimum_size_node(root);
-            if cols < minimum_cols || rows < minimum_rows {
-                // The tree cannot fit without overlapping panes. Keep the
-                // focused pane usable until the window is large enough again.
-                out.push(PaneRect {
-                    id: self.active_id,
-                    col: 0,
-                    row: 0,
-                    cols: cols.max(1),
-                    rows: rows.max(1),
-                });
-            } else {
-                layout_node(root, 0, 0, cols, rows, &mut out);
-            }
-        }
-        out
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn dividers_with_ids(
         &self,
@@ -253,14 +320,6 @@ impl PaneTree {
         self.root.as_mut().and_then(|r| find_leaf_mut_node(r, id))
     }
 
-    pub fn leaf_ids(&self) -> Vec<usize> {
-        let mut out = Vec::new();
-        if let Some(root) = &self.root {
-            collect_leaf_ids(root, &mut out);
-        }
-        out
-    }
-
     pub fn get_ratio(&self, divider_id: usize) -> Option<f32> {
         self.root
             .as_ref()
@@ -308,20 +367,169 @@ impl PaneTree {
     pub fn active_pane_mut(&mut self) -> Option<&mut TerminalPane> {
         self.find_leaf_mut(self.active_id)
     }
-
-    pub fn focus_next(&mut self) {
-        let ids = self.leaf_ids();
-        if let Some(pos) = ids.iter().position(|&id| id == self.active_id) {
-            self.active_id = ids[(pos + 1) % ids.len()];
-        }
-    }
-
-    pub fn pane_count(&self) -> usize {
-        self.leaf_ids().len()
-    }
 }
 
 // ── recursive helpers ─────────────────────────────────────────────────────────
+
+// Generic leaf payloads let tests exercise the exact production topology code
+// with owned, non-Clone sentinels instead of spawning shells.
+fn leaf_path<P>(node: &PaneNode<P>, id: usize, path: &mut Vec<usize>) -> bool {
+    match node {
+        PaneNode::Leaf { id: leaf_id, .. } => *leaf_id == id,
+        PaneNode::Split { children, .. } => {
+            for index in 0..2 {
+                path.push(index);
+                if leaf_path(&children[index], id, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+    }
+}
+
+fn node_at_path_mut<'a, P>(mut node: &'a mut PaneNode<P>, path: &[usize]) -> &'a mut PaneNode<P> {
+    for &index in path {
+        let PaneNode::Split { children, .. } = node else {
+            unreachable!("validated leaf path")
+        };
+        node = &mut children[index];
+    }
+    node
+}
+
+fn rearrange_root<P>(
+    root: &mut Option<PaneNode<P>>,
+    source: usize,
+    target: usize,
+    placement: Option<(PaneSplitDirection, bool)>,
+) -> RearrangeResult {
+    let mut source_path = Vec::new();
+    let mut target_path = Vec::new();
+    for (id, path) in [(source, &mut source_path), (target, &mut target_path)] {
+        if !root.as_ref().is_some_and(|node| leaf_path(node, id, path)) {
+            return RearrangeResult::NotFound { pane_id: id };
+        }
+    }
+    if source == target {
+        return RearrangeResult::Unchanged;
+    }
+    if let Some((direction, before)) = placement {
+        let (remaining, leaf, divider_id) =
+            detach_leaf(root.take().expect("validated root"), &source_path);
+        *root = Some(insert_leaf(
+            remaining, target, leaf, divider_id, direction, before,
+        ));
+    } else {
+        let common = source_path
+            .iter()
+            .zip(&target_path)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let ancestor = node_at_path_mut(
+            root.as_mut().expect("validated root"),
+            &source_path[..common],
+        );
+        let PaneNode::Split { children, .. } = ancestor else {
+            unreachable!("distinct leaves")
+        };
+        let [left, right] = children.as_mut();
+        let (source_branch, target_branch) = if source_path[common] == 0 {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        std::mem::swap(
+            node_at_path_mut(source_branch, &source_path[common + 1..]),
+            node_at_path_mut(target_branch, &target_path[common + 1..]),
+        );
+    }
+    RearrangeResult::Changed
+}
+
+/// Return the surviving tree, detached leaf and collapsed parent's divider.
+fn detach_leaf<P>(node: PaneNode<P>, path: &[usize]) -> (PaneNode<P>, PaneNode<P>, usize) {
+    let PaneNode::Split {
+        direction,
+        ratio,
+        children,
+        divider_id,
+    } = node
+    else {
+        unreachable!("distinct validated leaves require a parent")
+    };
+    let [left, right] = *children;
+    let (branch, sibling) = if path[0] == 0 {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if path.len() == 1 {
+        return (sibling, branch, divider_id);
+    }
+    let (remaining, leaf, collapsed_divider) = detach_leaf(branch, &path[1..]);
+    let children = if path[0] == 0 {
+        [remaining, sibling]
+    } else {
+        [sibling, remaining]
+    };
+    (
+        PaneNode::Split {
+            direction,
+            ratio,
+            children: Box::new(children),
+            divider_id,
+        },
+        leaf,
+        collapsed_divider,
+    )
+}
+
+fn insert_leaf<P>(
+    node: PaneNode<P>,
+    target: usize,
+    leaf: PaneNode<P>,
+    divider_id: usize,
+    direction: PaneSplitDirection,
+    before: bool,
+) -> PaneNode<P> {
+    match node {
+        PaneNode::Leaf { id, .. } if id == target => PaneNode::Split {
+            direction,
+            ratio: 0.5,
+            divider_id,
+            children: Box::new(ordered_children(node, leaf, before)),
+        },
+        PaneNode::Split {
+            direction: old_direction,
+            ratio,
+            children,
+            divider_id: old_divider,
+        } => {
+            let [left, right] = *children;
+            let mut path = Vec::new();
+            let children = if leaf_path(&left, target, &mut path) {
+                [
+                    insert_leaf(left, target, leaf, divider_id, direction, before),
+                    right,
+                ]
+            } else {
+                [
+                    left,
+                    insert_leaf(right, target, leaf, divider_id, direction, before),
+                ]
+            };
+            PaneNode::Split {
+                direction: old_direction,
+                ratio,
+                children: Box::new(children),
+                divider_id: old_divider,
+            }
+        }
+        PaneNode::Leaf { .. } => unreachable!("validated destination survives detach"),
+    }
+}
 
 fn minimum_size_for_split(
     direction: PaneSplitDirection,
@@ -340,7 +548,7 @@ fn minimum_size_for_split(
     }
 }
 
-fn minimum_size_node(node: &PaneNode) -> (usize, usize) {
+fn minimum_size_node<P>(node: &PaneNode<P>) -> (usize, usize) {
     match node {
         PaneNode::Leaf { .. } => (1, 1),
         PaneNode::Split {
@@ -355,8 +563,8 @@ fn minimum_size_node(node: &PaneNode) -> (usize, usize) {
     }
 }
 
-fn layout_node(
-    node: &PaneNode,
+fn layout_node<P>(
+    node: &PaneNode<P>,
     col: usize,
     row: usize,
     cols: usize,
@@ -380,7 +588,7 @@ fn layout_node(
             ..
         } => match direction {
             PaneSplitDirection::Vertical => {
-                let left_cols = left_cols_from_ratio(*ratio, cols);
+                let left_cols = first_extent(children, PaneSplitDirection::Vertical, *ratio, cols);
                 let right_cols = cols.saturating_sub(left_cols + 1).max(1);
                 layout_node(&children[0], col, row, left_cols, rows, out);
                 layout_node(
@@ -393,7 +601,7 @@ fn layout_node(
                 );
             }
             PaneSplitDirection::Horizontal => {
-                let top_rows = top_rows_from_ratio(*ratio, rows);
+                let top_rows = first_extent(children, PaneSplitDirection::Horizontal, *ratio, rows);
                 let bot_rows = rows.saturating_sub(top_rows + 1).max(1);
                 layout_node(&children[0], col, row, cols, top_rows, out);
                 layout_node(&children[1], col, row + top_rows + 1, cols, bot_rows, out);
@@ -442,7 +650,8 @@ fn dividers_node(
             };
             match direction {
                 PaneSplitDirection::Vertical => {
-                    let left_cols = left_cols_from_ratio(*ratio, cols);
+                    let left_cols =
+                        first_extent(children, PaneSplitDirection::Vertical, *ratio, cols);
                     let div_x = phys_pad + (base_col + left_cols) as f32 * cell_w;
                     let div_y = content_top + base_row as f32 * cell_h;
                     // Extend to phys_bottom to fill sub-cell remainder at the bottom edge.
@@ -498,7 +707,8 @@ fn dividers_node(
                     );
                 }
                 PaneSplitDirection::Horizontal => {
-                    let top_rows = top_rows_from_ratio(*ratio, rows);
+                    let top_rows =
+                        first_extent(children, PaneSplitDirection::Horizontal, *ratio, rows);
                     let div_x = phys_pad + base_col as f32 * cell_w;
                     let div_y = content_top + (base_row + top_rows) as f32 * cell_h;
                     // Extend to phys_right to fill sub-cell remainder at the right edge.
@@ -589,7 +799,7 @@ fn find_leaf_mut_node(node: &mut PaneNode, id: usize) -> Option<&mut TerminalPan
     }
 }
 
-fn collect_leaf_ids(node: &PaneNode, out: &mut Vec<usize>) {
+fn collect_leaf_ids<P>(node: &PaneNode<P>, out: &mut Vec<usize>) {
     match node {
         PaneNode::Leaf { id, .. } => out.push(*id),
         PaneNode::Split { children, .. } => {
@@ -660,7 +870,11 @@ fn split_node(
 
 /// Removes `target_id` from the tree by consuming the node and reconstructing
 /// the tree without any placeholders.  Returns `(new_node, was_found)`.
-fn remove_node_bv(node: PaneNode, target_id: usize, active_id: &mut usize) -> (PaneNode, bool) {
+fn remove_node_bv<P>(
+    node: PaneNode<P>,
+    target_id: usize,
+    active_id: &mut usize,
+) -> (PaneNode<P>, bool) {
     match node {
         // A bare Leaf at this call level means the public API's guard missed it — treat as NotFound.
         PaneNode::Leaf { .. } => (node, false),
@@ -791,11 +1005,11 @@ fn set_ratio_from_drag_node(
             }
             let (lc, lr, rc, rr) = match direction {
                 PaneSplitDirection::Vertical => {
-                    let lc = left_cols_from_ratio(*ratio, cols);
+                    let lc = first_extent(children, PaneSplitDirection::Vertical, *ratio, cols);
                     (lc, rows, cols.saturating_sub(lc + 1).max(1), rows)
                 }
                 PaneSplitDirection::Horizontal => {
-                    let tr = top_rows_from_ratio(*ratio, rows);
+                    let tr = first_extent(children, PaneSplitDirection::Horizontal, *ratio, rows);
                     (cols, tr, cols, rows.saturating_sub(tr + 1).max(1))
                 }
             };
@@ -850,6 +1064,28 @@ fn ordered_children<T>(old: T, new: T, insert_before: bool) -> [T; 2] {
 
 // ── layout arithmetic helpers ─────────────────────────────────────────────────
 
+/// Clamp against complete subtree minima, not just one cell per child.
+/// Rearrangement can turn a leaf child into a multi-split subtree.
+fn first_extent<P>(
+    children: &[PaneNode<P>; 2],
+    direction: PaneSplitDirection,
+    ratio: f32,
+    total: usize,
+) -> usize {
+    let first = minimum_size_node(&children[0]);
+    let second = minimum_size_node(&children[1]);
+    let (minimum, other_minimum, desired) = match direction {
+        PaneSplitDirection::Vertical => (first.0, second.0, left_cols_from_ratio(ratio, total)),
+        PaneSplitDirection::Horizontal => (first.1, second.1, top_rows_from_ratio(ratio, total)),
+    };
+    let maximum = total.saturating_sub(1).saturating_sub(other_minimum);
+    if maximum < minimum {
+        desired
+    } else {
+        desired.clamp(minimum, maximum)
+    }
+}
+
 fn left_cols_from_ratio(ratio: f32, cols: usize) -> usize {
     let usable = cols.saturating_sub(1);
     if usable < 2 {
@@ -875,6 +1111,424 @@ fn top_rows_from_ratio(ratio: f32, rows: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct Payload {
+        title: String,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    type TestNode = PaneNode<Box<Payload>>;
+    type TestTree = PaneTree<Box<Payload>>;
+
+    fn leaf(id: usize, drops: &Arc<AtomicUsize>) -> TestNode {
+        PaneNode::Leaf {
+            id,
+            pane: Box::new(Payload {
+                title: format!("shell-{id}"),
+                drops: drops.clone(),
+            }),
+        }
+    }
+    fn branch(
+        id: usize,
+        direction: PaneSplitDirection,
+        ratio: f32,
+        a: TestNode,
+        b: TestNode,
+    ) -> TestNode {
+        PaneNode::Split {
+            divider_id: id,
+            direction,
+            ratio,
+            children: Box::new([a, b]),
+        }
+    }
+    fn fixture() -> (TestTree, Arc<AtomicUsize>) {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let root = branch(
+            10,
+            PaneSplitDirection::Vertical,
+            0.4,
+            branch(
+                11,
+                PaneSplitDirection::Horizontal,
+                0.3,
+                leaf(0, &drops),
+                leaf(1, &drops),
+            ),
+            branch(
+                12,
+                PaneSplitDirection::Horizontal,
+                0.6,
+                leaf(2, &drops),
+                leaf(3, &drops),
+            ),
+        );
+        (
+            PaneTree {
+                root: Some(root),
+                active_id: 1,
+                next_id: 13,
+            },
+            drops,
+        )
+    }
+    fn signature<P>(node: &PaneNode<P>) -> String {
+        match node {
+            PaneNode::Leaf { id, .. } => id.to_string(),
+            PaneNode::Split {
+                divider_id,
+                direction,
+                ratio,
+                children,
+            } => format!(
+                "{divider_id}:{direction:?}:{ratio}({},{})",
+                signature(&children[0]),
+                signature(&children[1])
+            ),
+        }
+    }
+    fn payloads(node: &TestNode, out: &mut Vec<(usize, usize, String)>) {
+        match node {
+            PaneNode::Leaf { id, pane } => {
+                out.push((*id, &**pane as *const Payload as usize, pane.title.clone()))
+            }
+            PaneNode::Split { children, .. } => {
+                payloads(&children[0], out);
+                payloads(&children[1], out);
+            }
+        }
+        out.sort_by_key(|entry| entry.0);
+    }
+    fn assert_layout(tree: &TestTree) {
+        let rects = tree.layout(121, 81);
+        assert_eq!(rects.len(), tree.pane_count());
+        for (i, a) in rects.iter().enumerate() {
+            assert!(a.cols > 0 && a.rows > 0);
+            assert!(a.col + a.cols <= 121 && a.row + a.rows <= 81);
+            for b in &rects[i + 1..] {
+                assert!(
+                    a.col + a.cols <= b.col
+                        || b.col + b.cols <= a.col
+                        || a.row + a.rows <= b.row
+                        || b.row + b.rows <= a.row
+                );
+            }
+        }
+        // Tiny windows keep the same focused process visible.
+        let tiny = tree.layout(1, 1);
+        assert_eq!(tiny.len(), 1);
+        assert_eq!(tiny[0].id, tree.active_id);
+    }
+
+    #[test]
+    fn rearrangement_rejects_invalid_divider_and_same_ids_without_mutation() {
+        for placement in [
+            None,
+            Some((PaneSplitDirection::Vertical, true)),
+            Some((PaneSplitDirection::Horizontal, false)),
+        ] {
+            for (source, target, expected) in [
+                (99, 1, RearrangeResult::NotFound { pane_id: 99 }),
+                (1, 99, RearrangeResult::NotFound { pane_id: 99 }),
+                (10, 1, RearrangeResult::NotFound { pane_id: 10 }),
+                (1, 12, RearrangeResult::NotFound { pane_id: 12 }),
+                (99, 99, RearrangeResult::NotFound { pane_id: 99 }),
+                (1, 1, RearrangeResult::Unchanged),
+            ] {
+                let (mut tree, drops) = fixture();
+                let before = signature(tree.root.as_ref().unwrap());
+                assert_eq!(
+                    rearrange_root(&mut tree.root, source, target, placement),
+                    expected
+                );
+                assert_eq!(signature(tree.root.as_ref().unwrap()), before);
+                assert_eq!((tree.active_id, tree.next_id), (1, 13));
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn all_swaps_exchange_rectangles_and_preserve_owned_payloads() {
+        for source in 0..4 {
+            for target in 0..4 {
+                let (mut tree, drops) = fixture();
+                let mut before = Vec::new();
+                payloads(tree.root.as_ref().unwrap(), &mut before);
+                let old = tree.layout(121, 81);
+                let topology = signature(tree.root.as_ref().unwrap());
+                tree.active_id = source;
+                assert_eq!(
+                    tree.swap_active_pane(target),
+                    if source == target {
+                        RearrangeResult::Unchanged
+                    } else {
+                        RearrangeResult::Changed
+                    }
+                );
+                assert_eq!(tree.active_id, source);
+                assert_eq!(tree.next_id, 13);
+                let mut after = Vec::new();
+                payloads(tree.root.as_ref().unwrap(), &mut after);
+                assert_eq!(before, after);
+                for (a, b) in old.iter().zip(tree.layout(121, 81)) {
+                    assert_eq!(
+                        (a.col, a.row, a.cols, a.rows),
+                        (b.col, b.row, b.cols, b.rows)
+                    );
+                    assert_eq!(
+                        b.id,
+                        if a.id == source {
+                            target
+                        } else if a.id == target {
+                            source
+                        } else {
+                            a.id
+                        }
+                    );
+                }
+                assert_layout(&tree);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                tree.swap_panes(source, target);
+                assert_eq!(signature(tree.root.as_ref().unwrap()), topology);
+            }
+        }
+    }
+
+    #[test]
+    fn all_moves_preserve_process_identity_focus_ids_and_close_semantics() {
+        for source in 0..4 {
+            for target in 0..4 {
+                if source == target {
+                    continue;
+                }
+                for direction in [PaneSplitDirection::Vertical, PaneSplitDirection::Horizontal] {
+                    for before in [false, true] {
+                        let (mut tree, drops) = fixture();
+                        let mut original = Vec::new();
+                        payloads(tree.root.as_ref().unwrap(), &mut original);
+                        tree.active_id = source;
+                        assert_eq!(
+                            tree.move_active_pane(target, direction, before),
+                            RearrangeResult::Changed
+                        );
+                        assert_eq!(
+                            (tree.active_id, tree.next_id, tree.pane_count()),
+                            (source, 13, 4)
+                        );
+                        let mut moved = Vec::new();
+                        payloads(tree.root.as_ref().unwrap(), &mut moved);
+                        assert_eq!(original, moved);
+                        assert_eq!(drops.load(Ordering::SeqCst), 0);
+                        let mut path = Vec::new();
+                        assert!(leaf_path(tree.root.as_ref().unwrap(), target, &mut path));
+                        let parent =
+                            node_at_path_mut(tree.root.as_mut().unwrap(), &path[..path.len() - 1]);
+                        let PaneNode::Split {
+                            direction: actual,
+                            ratio,
+                            divider_id,
+                            ..
+                        } = parent
+                        else {
+                            panic!("destination parent")
+                        };
+                        assert_eq!((*actual, *ratio), (direction, 0.5));
+                        assert_eq!(*divider_id, if source < 2 { 11 } else { 12 });
+                        let mut ids = Vec::new();
+                        collect_leaf_ids(parent, &mut ids);
+                        assert_eq!(
+                            ids,
+                            if before {
+                                vec![source, target]
+                            } else {
+                                vec![target, source]
+                            }
+                        );
+                        assert_layout(&tree);
+                        assert_eq!(tree.remove(source), RemoveResult::Removed);
+                        assert_ne!(tree.active_id, source);
+                        assert!(tree.leaf_ids().contains(&tree.active_id));
+                        assert_eq!(drops.load(Ordering::SeqCst), 1);
+                        assert_eq!(tree.remove(source), RemoveResult::NotFound);
+                        for id in tree.leaf_ids().into_iter().take(2) {
+                            assert_eq!(tree.remove(id), RemoveResult::Removed);
+                        }
+                        assert_eq!(
+                            tree.remove(tree.leaf_ids()[0]),
+                            RemoveResult::RemovedLastLeaf
+                        );
+                        assert_eq!(tree.pane_count(), 1);
+                        drop(tree);
+                        assert_eq!(drops.load(Ordering::SeqCst), 4);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moving_across_root_preserves_unrelated_split_and_non_source_focus() {
+        let (mut tree, _) = fixture();
+        tree.active_id = 3;
+        assert_eq!(
+            tree.move_pane(0, 2, PaneSplitDirection::Vertical, true),
+            RearrangeResult::Changed
+        );
+        assert_eq!(tree.active_id, 3);
+        assert_eq!(
+            signature(tree.root.as_ref().unwrap()),
+            "10:Vertical:0.4(1,12:Horizontal:0.6(11:Vertical:0.5(0,2),3))"
+        );
+        tree.focus_next();
+        assert_eq!(tree.active_id, 1);
+    }
+
+    #[test]
+    fn moves_layout_safely_at_every_small_window_size() {
+        for direction in [PaneSplitDirection::Vertical, PaneSplitDirection::Horizontal] {
+            for source in 0..4 {
+                for target in 0..4 {
+                    let (mut tree, _) = fixture();
+                    tree.move_pane(source, target, direction, false);
+                    for cols in 0..14 {
+                        for rows in 0..14 {
+                            let rects = tree.layout(cols, rows);
+                            for (index, a) in rects.iter().enumerate() {
+                                assert!(a.cols > 0 && a.rows > 0);
+                                assert!(
+                                    a.col + a.cols <= cols.max(1),
+                                    "col overflow {cols}x{rows}"
+                                );
+                                assert!(
+                                    a.row + a.rows <= rows.max(1),
+                                    "row overflow {cols}x{rows}"
+                                );
+                                for b in &rects[index + 1..] {
+                                    assert!(
+                                        a.col + a.cols <= b.col
+                                            || b.col + b.cols <= a.col
+                                            || a.row + a.rows <= b.row
+                                            || b.row + b.rows <= a.row
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_selection_and_titles_travel_with_stable_id() {
+        use crate::tab::{Selection, SelectionMode};
+        use volt_core::grid::Grid;
+        struct State {
+            grid: Grid,
+            selection: Selection,
+            title: String,
+            scroll: usize,
+        }
+        let make = |id| {
+            let mut grid = Grid::new(4, 3);
+            let mut cell = volt_core::cell::Cell::default();
+            cell.set_char('x');
+            grid.put_char(0, 0, cell);
+            let selection =
+                Selection::at_viewport(id, false, SelectionMode::Linear, &grid, 0, 0, 0).unwrap();
+            Box::new(State {
+                grid,
+                selection,
+                title: format!("custom-{id}"),
+                scroll: 0,
+            })
+        };
+        let mut tree = PaneTree {
+            root: Some(PaneNode::Split {
+                direction: PaneSplitDirection::Vertical,
+                ratio: 0.7,
+                divider_id: 10,
+                children: Box::new([
+                    PaneNode::Leaf {
+                        id: 7,
+                        pane: make(7),
+                    },
+                    PaneNode::Leaf {
+                        id: 9,
+                        pane: make(9),
+                    },
+                ]),
+            }),
+            active_id: 7,
+            next_id: 11,
+        };
+        for swap in [true, false, true, false] {
+            let result = if swap {
+                tree.swap_active_pane(9)
+            } else {
+                tree.move_active_pane(9, PaneSplitDirection::Horizontal, true)
+            };
+            assert_eq!(result, RearrangeResult::Changed);
+            let mut path = Vec::new();
+            assert!(leaf_path(tree.root.as_ref().unwrap(), 7, &mut path));
+            let PaneNode::Leaf { pane, id } = node_at_path_mut(tree.root.as_mut().unwrap(), &path)
+            else {
+                panic!("leaf")
+            };
+            assert_eq!((*id, pane.selection.pane_id), (7, 7));
+            assert_eq!(pane.selection.text(&pane.grid).as_deref(), Some("x"));
+            assert_eq!(pane.title, "custom-7");
+            assert_eq!((pane.grid.cols, pane.grid.rows, pane.scroll), (4, 3, 0));
+            assert_eq!(tree.active_id, 7);
+        }
+    }
+
+    #[test]
+    fn two_leaf_and_single_leaf_trees_have_safe_rearrangement() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut tree = PaneTree::new(Box::new(Payload {
+            title: "only".into(),
+            drops: drops.clone(),
+        }));
+        assert_eq!(tree.swap_active_pane(0), RearrangeResult::Unchanged);
+        assert_eq!(
+            tree.move_active_pane(0, PaneSplitDirection::Horizontal, true),
+            RearrangeResult::Unchanged
+        );
+        assert_eq!(
+            tree.move_active_pane(1, PaneSplitDirection::Horizontal, true),
+            RearrangeResult::NotFound { pane_id: 1 }
+        );
+        tree.root = Some(branch(
+            7,
+            PaneSplitDirection::Vertical,
+            0.8,
+            leaf(0, &drops),
+            leaf(1, &drops),
+        ));
+        tree.next_id = 8;
+        assert_eq!(
+            tree.move_active_pane(1, PaneSplitDirection::Horizontal, false),
+            RearrangeResult::Changed
+        );
+        assert_eq!(
+            signature(tree.root.as_ref().unwrap()),
+            "7:Horizontal:0.5(1,0)"
+        );
+        assert_eq!(tree.next_id, 8); // rearrangement never allocates a new ID
+        assert_layout(&tree);
+    }
 
     #[test]
     fn ordered_children_after_is_old_then_new() {

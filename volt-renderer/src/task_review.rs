@@ -7,6 +7,8 @@ pub enum ReviewMode {
     RunOnce,
     Confirm,
     TrustFile,
+    Paste,
+    ClipboardWrite,
 }
 impl ReviewMode {
     pub fn title(self) -> &'static str {
@@ -14,6 +16,8 @@ impl ReviewMode {
             Self::RunOnce => "Review task",
             Self::Confirm => "Run task?",
             Self::TrustFile => "Review task permissions",
+            Self::Paste => "Review paste",
+            Self::ClipboardWrite => "Terminal clipboard request",
         }
     }
     pub fn action(self) -> &'static str {
@@ -21,6 +25,8 @@ impl ReviewMode {
             Self::RunOnce => "Run once",
             Self::Confirm => "Run task",
             Self::TrustFile => "Trust tasks",
+            Self::Paste => "Paste once",
+            Self::ClipboardWrite => "Copy once",
         }
     }
     pub fn reason(self) -> &'static str {
@@ -28,6 +34,12 @@ impl ReviewMode {
             Self::RunOnce => "This file is not trusted. Approval applies to this run only.",
             Self::Confirm => "This task has “Ask before running” enabled.",
             Self::TrustFile => "Trust this exact file. Edits require review. No task runs.",
+            Self::Paste => {
+                "This paste contains newlines or control characters. It may execute commands."
+            }
+            Self::ClipboardWrite => {
+                "This terminal program wants to replace your clipboard. Approval applies once."
+            }
         }
     }
 }
@@ -71,9 +83,24 @@ impl ReviewLayout {
             return None;
         }
         let cols = ((w - 64. * scale) / (13. * scale * 0.72)).floor().max(1.) as usize;
-        let mut lines = wrap(&format!("Directory: {}", view.directory), cols);
+        let clipboard = matches!(view.mode, ReviewMode::Paste | ReviewMode::ClipboardWrite);
+        let mut lines = wrap(
+            &format!(
+                "{}: {}",
+                if clipboard { "Source" } else { "Directory" },
+                view.directory
+            ),
+            cols,
+        );
         lines.push(String::new());
-        lines.push("Command".into());
+        lines.push(
+            if clipboard {
+                "Clipboard contents (read-only)"
+            } else {
+                "Command"
+            }
+            .into(),
+        );
         lines.extend(wrap(&view.command, cols));
         // Short commands get a compact dialog; long ones scroll instead of
         // consuming the entire window. No command bytes are discarded.

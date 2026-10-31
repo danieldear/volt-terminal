@@ -1,3 +1,4 @@
+use crate::parser::Parser;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{ErrorKind, Read};
 #[cfg(unix)]
@@ -8,7 +9,6 @@ use std::os::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use vte::Parser;
 
 use crate::diagnostics::{Counter, PerfStats, Stage};
 use crate::events::CoreEvent;
@@ -143,12 +143,25 @@ impl Pty {
         (foreground > 0 && shell_group > 0).then_some(foreground != shell_group)
     }
 
+    /// Strict echo knowledge for privacy boundaries. Unknown must be treated
+    /// as sensitive; unlike password heuristics, raw-mode no-echo is included.
+    #[cfg(unix)]
+    pub fn echo_enabled(&self) -> Option<bool> {
+        let fd = self.master.as_raw_fd()?;
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let termios = unsafe { termios.assume_init() };
+        Some(termios.c_lflag & libc::ECHO != 0)
+    }
+
     /// A password-style prompt usually keeps canonical input on while
     /// disabling terminal echo. Full-screen TUIs often disable both; treating
     /// every raw-mode program as a password prompt would hold macOS Secure
     /// Event Input for the entire editor session. This is only a heuristic:
     /// callers must also offer a manual override for other prompt styles.
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     pub fn likely_password_prompt(&self) -> Option<bool> {
         let fd = self.master.as_raw_fd()?;
         let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();

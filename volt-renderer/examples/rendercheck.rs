@@ -23,7 +23,7 @@ fn draw(renderer: &mut Renderer, p: &Performer, selected: bool) {
     );
 }
 fn feed(p: &mut Performer, text: &str) {
-    vte::Parser::new().advance(p, text.as_bytes());
+    volt_core::parser::Parser::new().advance(p, text.as_bytes());
 }
 fn fixture(p: &mut Performer) {
     let lines = [

@@ -3619,6 +3619,7 @@ dependencies = [
  "libc",
  "muda 0.17.2",
  "objc",
+ "png 0.17.16",
  "pollster 0.3.0",
  "raw-window-handle",
  "serde",

@@ -48,6 +48,7 @@ struct SavedCursor {
 pub struct Performer {
     pub grid: Grid,
     use_alt_screen: bool,
+    inline_image_epochs: [u64; 2],
     alt_grid: Grid,
     saved_cursors: [SavedCursor; 2],
     main_return: SavedCursor,
@@ -421,6 +422,7 @@ impl Performer {
                 if row < self.grid.scroll_top || row > bottom {
                     return;
                 }
+                self.inline_image_scroll(row, bottom, false);
                 self.grid.scroll_down(row, bottom, n);
                 self.mark_dirty_range(row, bottom);
             }
@@ -432,6 +434,7 @@ impl Performer {
                 if row < self.grid.scroll_top || row > bottom {
                     return;
                 }
+                self.inline_image_scroll(row, bottom, false);
                 self.grid.delete_lines(row, bottom, n);
                 self.mark_dirty_range(row, bottom);
             }
@@ -485,6 +488,7 @@ impl Performer {
                 let n = Self::param(params, 0).max(1) as usize;
                 let top = self.grid.scroll_top;
                 let bot = self.grid.scroll_bottom;
+                self.inline_image_scroll(top, bot, true);
                 self.grid.scroll_up(top, bot, n);
                 self.mark_dirty_range(top, bot);
             }
@@ -493,6 +497,7 @@ impl Performer {
                 let n = Self::param(params, 0).max(1) as usize;
                 let top = self.grid.scroll_top;
                 let bot = self.grid.scroll_bottom;
+                self.inline_image_scroll(top, bot, false);
                 self.grid.scroll_down(top, bot, n);
                 self.mark_dirty_range(top, bot);
             }
@@ -598,6 +603,7 @@ impl Performer {
         Self {
             grid: Grid::new(cols, rows),
             use_alt_screen: false,
+            inline_image_epochs: [1; 2],
             alt_grid: Grid::new_alt(cols, rows),
             saved_cursors: [SavedCursor::default(); 2],
             main_return: SavedCursor::default(),
@@ -625,8 +631,41 @@ impl Performer {
         }
     }
 
+    /// Image anchors are invalidated on reset, resize/reflow and alt-screen reuse.
+    pub fn inline_image_epoch(&self, alternate_screen: bool) -> u64 {
+        self.inline_image_epochs[alternate_screen as usize]
+    }
+
+    /// Only full-screen main-buffer upward scrolling retains absolute rows.
+    /// Other row rotations invalidate overlays rather than recycling anchors.
+    fn inline_image_scroll(&mut self, top: usize, bottom: usize, upward: bool) {
+        if !(upward
+            && !self.use_alt_screen
+            && top == 0
+            && bottom + 1 == self.grid.rows
+            && self.grid.scrollback_limit > 0)
+        {
+            let epoch = &mut self.inline_image_epochs[self.use_alt_screen as usize];
+            *epoch = epoch.saturating_add(1);
+        }
+    }
+
+    pub fn inline_image_oldest_row(&self, alternate_screen: bool) -> u64 {
+        let grid = if alternate_screen == self.use_alt_screen {
+            &self.grid
+        } else {
+            &self.alt_grid
+        };
+        grid.scrollback_origin() as u64
+    }
+
     /// Resize both the main and alt screen grids.
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        if self.grid.cols != cols || self.grid.rows != rows {
+            for epoch in &mut self.inline_image_epochs {
+                *epoch = epoch.saturating_add(1);
+            }
+        }
         // A resized surface cannot present an old-sized transaction.
         self.end_synchronized_output();
         self.grid.resize(cols, rows);
@@ -721,6 +760,9 @@ impl Performer {
             self.grid.set_row_soft_wrapped(row, true);
             self.grid.cursor_col = 0;
             self.grid.pending_wrap = false;
+            if self.grid.cursor_row == self.grid.scroll_bottom {
+                self.inline_image_scroll(self.grid.scroll_top, self.grid.scroll_bottom, true);
+            }
             self.grid.newline();
             target_col = 0;
             target_row = self.grid.cursor_row;
@@ -845,6 +887,9 @@ impl Performer {
     /// cursor keys). `scrollback_limit` is a config value, not terminal
     /// state, so it's preserved across the reset.
     pub fn reset(&mut self) {
+        for epoch in &mut self.inline_image_epochs {
+            *epoch = epoch.saturating_add(1);
+        }
         self.end_synchronized_output();
         self.keyboard = Default::default();
         self.use_alt_screen = false;
@@ -974,6 +1019,7 @@ impl Performer {
 
     fn enter_alt_screen(&mut self) {
         if !self.use_alt_screen {
+            self.inline_image_epochs[1] = self.inline_image_epochs[1].saturating_add(1);
             self.active_link = None;
             self.main_return = self.cursor_snapshot();
             let cols = self.grid.cols;
@@ -1099,6 +1145,9 @@ impl Perform for Performer {
             self.grid.set_row_soft_wrapped(self.grid.cursor_row, true);
             self.grid.cursor_col = 0;
             let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
+            if self.grid.cursor_row == self.grid.scroll_bottom {
+                self.inline_image_scroll(self.grid.scroll_top, self.grid.scroll_bottom, true);
+            }
             self.grid.newline();
             if will_scroll {
                 self.mark_dirty_range(self.grid.scroll_top, self.grid.scroll_bottom);
@@ -1112,6 +1161,9 @@ impl Perform for Performer {
             self.grid.set_row_soft_wrapped(self.grid.cursor_row, true);
             self.grid.cursor_col = 0;
             let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
+            if self.grid.cursor_row == self.grid.scroll_bottom {
+                self.inline_image_scroll(self.grid.scroll_top, self.grid.scroll_bottom, true);
+            }
             self.grid.newline();
             if will_scroll {
                 self.mark_dirty_range(self.grid.scroll_top, self.grid.scroll_bottom);
@@ -1171,6 +1223,9 @@ impl Perform for Performer {
                 // LF/VT/FF
                 self.grid.set_row_soft_wrapped(self.grid.cursor_row, false);
                 let will_scroll = self.grid.cursor_row == self.grid.scroll_bottom;
+                if will_scroll {
+                    self.inline_image_scroll(self.grid.scroll_top, self.grid.scroll_bottom, true);
+                }
                 self.grid.newline();
                 if will_scroll {
                     self.mark_dirty_range(self.grid.scroll_top, self.grid.scroll_bottom);
@@ -1208,7 +1263,69 @@ impl Perform for Performer {
     fn unhook(&mut self) {}
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        // VTE's fixed buffer truncates at capacity. Reject the complete event
+        // rather than accepting a valid-looking truncated clipboard/image prefix.
+        if params.len() >= crate::parser::MAX_OSC_PARAMETERS
+            || params.iter().map(|p| p.len()).sum::<usize>() >= crate::parser::OSC_CAPACITY
+        {
+            return;
+        }
         if params.is_empty() {
+            return;
+        }
+
+        if params[0] == b"1337" {
+            // At most one request per parse batch; never decode under the PTY lock.
+            if params.len() < 2
+                || self
+                    .pending_events
+                    .iter()
+                    .any(|e| matches!(e, CoreEvent::InlineImageRequested { .. }))
+            {
+                return;
+            }
+            let length = params[1..]
+                .iter()
+                .try_fold(0usize, |n, p| n.checked_add(p.len()))
+                .and_then(|n| n.checked_add(params.len() - 2));
+            if length.is_none_or(|n| n > 64 * 1024) {
+                return;
+            }
+            let mut parameters = Vec::with_capacity(length.unwrap());
+            for (i, part) in params[1..].iter().enumerate() {
+                if i != 0 {
+                    parameters.push(b';');
+                }
+                parameters.extend_from_slice(part);
+            }
+            if !parameters.starts_with(b"File=") {
+                return;
+            }
+            if let Some(row) = self.grid.viewport_absolute_row(0, self.grid.cursor_row) {
+                self.pending_events.push(CoreEvent::InlineImageRequested {
+                    parameters,
+                    alternate_screen: self.use_alt_screen,
+                    epoch: self.inline_image_epoch(self.use_alt_screen),
+                    row: row as u64,
+                    column: self.grid.cursor_col as u32,
+                });
+            }
+            return;
+        }
+
+        if params[0] == b"52" {
+            // Bound pending clipboard data even when a producer floods one
+            // parse batch. No clipboard access or decoding on ordinary text.
+            if !self
+                .pending_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ClipboardWriteRequested(_)))
+            {
+                if let Some(data) = crate::osc52::decode_write(params) {
+                    self.pending_events
+                        .push(CoreEvent::ClipboardWriteRequested(data));
+                }
+            }
             return;
         }
 
@@ -1263,6 +1380,7 @@ impl Perform for Performer {
                 if self.grid.cursor_row == self.grid.scroll_top {
                     let top = self.grid.scroll_top;
                     let bottom = self.grid.scroll_bottom;
+                    self.inline_image_scroll(top, bottom, false);
                     self.grid.scroll_down(top, bottom, 1);
                     self.mark_dirty_range(top, bottom);
                 } else if self.grid.cursor_row > 0 {
@@ -1284,7 +1402,7 @@ mod tests {
     use super::*;
 
     fn feed(p: &mut Performer, bytes: &[u8]) {
-        let mut parser = vte::Parser::new();
+        let mut parser = crate::parser::Parser::new();
         parser.advance(p, bytes);
     }
 
@@ -1369,7 +1487,7 @@ mod tests {
     #[test]
     fn current_style_survives_alt_screen_and_bytewise_sgr() {
         let mut p = Performer::new(12, 3);
-        let mut parser = vte::Parser::new();
+        let mut parser = crate::parser::Parser::new();
         let input = b"\x1b[1;3;4;7;31;44mA\x1b[?1049h\x1b[0mZ\x1b[?1049lB";
         for byte in input {
             parser.advance(&mut p, std::slice::from_ref(byte));
@@ -1396,7 +1514,7 @@ mod tests {
     #[test]
     fn extended_graphemes_survive_chunks_scroll_and_blit() {
         let mut p = Performer::new(8, 2);
-        let mut parser = vte::Parser::new();
+        let mut parser = crate::parser::Parser::new();
         for byte in "x\u{0301}\u{0308} 👩\u{200d}💻".as_bytes() {
             parser.advance(&mut p, &[*byte]);
         }
@@ -2147,7 +2265,7 @@ mod tests {
 mod synchronized_tests {
     use super::*;
     fn feed(p: &mut Performer, bytes: &[u8]) {
-        let mut parser = vte::Parser::new();
+        let mut parser = crate::parser::Parser::new();
         parser.advance(p, bytes);
     }
     #[test]
@@ -2185,7 +2303,7 @@ mod synchronized_tests {
     fn chunked_parser_and_alt_screen_are_atomic() {
         let mut p = Performer::new(20, 3);
         feed(&mut p, b"main");
-        let mut parser = vte::Parser::new();
+        let mut parser = crate::parser::Parser::new();
         for &byte in b"\x1b[?2026h\x1b[?1049hALT\x1b[?1049lEND" {
             parser.advance(&mut p, &[byte]);
         }
@@ -2201,7 +2319,7 @@ mod keyboard_tests {
     #[test]
     fn negotiated_modes_are_separate_from_ansi_cursor_and_screens() {
         let mut p = Performer::new(20, 3);
-        let mut parser = vte::Parser::new();
+        let mut parser = crate::parser::Parser::new();
         parser.advance(&mut p, b"\x1b[>3u\x1b[?u");
         assert_eq!(p.keyboard_flags(), 3);
         assert_eq!(p.pending_writes.pop(), Some(b"\x1b[?3u".to_vec()));
@@ -2224,7 +2342,7 @@ mod synchronized_memory_tests {
     #[test]
     fn frozen_frame_does_not_duplicate_history_and_preserves_visible_unicode() {
         let mut p = Performer::new(20, 3);
-        let mut parser = vte::Parser::new();
+        let mut parser = crate::parser::Parser::new();
         for _ in 0..200 {
             parser.advance(&mut p, b"history\r\n");
         }

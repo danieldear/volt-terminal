@@ -42,7 +42,7 @@ fn main() -> Result<()> {
             }
         });
         let mut p = Performer::new(200, 60);
-        let mut parser = vte::Parser::new();
+        let mut parser = volt_core::parser::Parser::new();
         let text = if workload.starts_with("unicode") {
             "é ẍ 👩‍💻 👍🏽 日本 \x1b[1mé ẍ\x1b[0m \x1b[3mé ẍ\x1b[0m \x1b[1;3mé ẍ\x1b[0m ".repeat(6)
         } else {
