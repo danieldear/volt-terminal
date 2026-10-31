@@ -7419,9 +7419,10 @@ impl ApplicationHandler<VoltEvent> for App {
                     }
                 }
                 // ── terminal input ────────────────────────────────────────────
+                // Keys encode by position (volt-core), so Control-C works on any layout.
                 let special = match physical_key {
-                    PhysicalKey::Code(code) => terminal_special_sequence(
-                        code,
+                    PhysicalKey::Code(code) => volt_core::keyboard::special_sequence(
+                        volt_core::keyboard::Key::from_code(&format!("{code:?}")),
                         shift,
                         alt,
                         ctrl,
@@ -7439,7 +7440,9 @@ impl ApplicationHandler<VoltEvent> for App {
 
                 if ctrl {
                     if let PhysicalKey::Code(code) = physical_key {
-                        if let Some(b) = ctrl_code(code) {
+                        if let Some(b) = volt_core::keyboard::ctrl_code(
+                            volt_core::keyboard::Key::from_code(&format!("{code:?}")),
+                        ) {
                             let mut bytes = Vec::with_capacity(2);
                             if alt {
                                 bytes.push(0x1b);
@@ -8252,196 +8255,6 @@ fn percent_encode_query(input: &str) -> String {
         }
     }
     out
-}
-
-fn xterm_modifier_param(shift: bool, alt: bool, ctrl: bool) -> Option<u8> {
-    let mut value = 1u8;
-    if shift {
-        value = value.saturating_add(1);
-    }
-    if alt {
-        value = value.saturating_add(2);
-    }
-    if ctrl {
-        value = value.saturating_add(4);
-    }
-    (value > 1).then_some(value)
-}
-
-fn ss3_function_sequence(letter: char, modifier: Option<u8>) -> Vec<u8> {
-    match modifier {
-        Some(m) => format!("\x1b[1;{}{}", m, letter).into_bytes(),
-        None => format!("\x1bO{}", letter).into_bytes(),
-    }
-}
-
-fn csi_tilde_sequence(code: u16, modifier: Option<u8>) -> Vec<u8> {
-    match modifier {
-        Some(m) => format!("\x1b[{};{}~", code, m).into_bytes(),
-        None => format!("\x1b[{}~", code).into_bytes(),
-    }
-}
-
-fn terminal_special_sequence(
-    code: KeyCode,
-    shift: bool,
-    alt: bool,
-    ctrl: bool,
-    application_cursor_keys_mode: bool,
-) -> Option<Vec<u8>> {
-    let modifier = xterm_modifier_param(shift, alt, ctrl);
-
-    match code {
-        KeyCode::Enter | KeyCode::NumpadEnter => {
-            let mut bytes = Vec::with_capacity(2);
-            if alt {
-                bytes.push(0x1b);
-            }
-            bytes.push(b'\r');
-            Some(bytes)
-        }
-        KeyCode::Backspace | KeyCode::NumpadBackspace => {
-            let mut bytes = Vec::with_capacity(2);
-            if alt {
-                bytes.push(0x1b);
-            }
-            bytes.push(0x7f);
-            Some(bytes)
-        }
-        KeyCode::Tab => match modifier {
-            Some(2) => Some(b"\x1b[Z".to_vec()),
-            Some(m) => Some(format!("\x1b[1;{}Z", m).into_bytes()),
-            None => Some(b"\t".to_vec()),
-        },
-        KeyCode::Escape => {
-            let mut bytes = Vec::with_capacity(2);
-            bytes.push(0x1b);
-            if alt {
-                bytes.push(0x1b);
-            }
-            Some(bytes)
-        }
-        KeyCode::ArrowUp => {
-            if let Some(m) = modifier {
-                Some(format!("\x1b[1;{}A", m).into_bytes())
-            } else if application_cursor_keys_mode {
-                Some(b"\x1bOA".to_vec())
-            } else {
-                Some(b"\x1b[A".to_vec())
-            }
-        }
-        KeyCode::ArrowDown => {
-            if let Some(m) = modifier {
-                Some(format!("\x1b[1;{}B", m).into_bytes())
-            } else if application_cursor_keys_mode {
-                Some(b"\x1bOB".to_vec())
-            } else {
-                Some(b"\x1b[B".to_vec())
-            }
-        }
-        KeyCode::ArrowRight => {
-            if let Some(m) = modifier {
-                Some(format!("\x1b[1;{}C", m).into_bytes())
-            } else if application_cursor_keys_mode {
-                Some(b"\x1bOC".to_vec())
-            } else {
-                Some(b"\x1b[C".to_vec())
-            }
-        }
-        KeyCode::ArrowLeft => {
-            if let Some(m) = modifier {
-                Some(format!("\x1b[1;{}D", m).into_bytes())
-            } else if application_cursor_keys_mode {
-                Some(b"\x1bOD".to_vec())
-            } else {
-                Some(b"\x1b[D".to_vec())
-            }
-        }
-        KeyCode::Home => {
-            if let Some(m) = modifier {
-                Some(format!("\x1b[1;{}H", m).into_bytes())
-            } else {
-                Some(b"\x1b[H".to_vec())
-            }
-        }
-        KeyCode::End => {
-            if let Some(m) = modifier {
-                Some(format!("\x1b[1;{}F", m).into_bytes())
-            } else {
-                Some(b"\x1b[F".to_vec())
-            }
-        }
-        KeyCode::Insert => Some(csi_tilde_sequence(2, modifier)),
-        KeyCode::Delete => Some(csi_tilde_sequence(3, modifier)),
-        KeyCode::PageUp => Some(csi_tilde_sequence(5, modifier)),
-        KeyCode::PageDown => Some(csi_tilde_sequence(6, modifier)),
-
-        KeyCode::F1 => Some(ss3_function_sequence('P', modifier)),
-        KeyCode::F2 => Some(ss3_function_sequence('Q', modifier)),
-        KeyCode::F3 => Some(ss3_function_sequence('R', modifier)),
-        KeyCode::F4 => Some(ss3_function_sequence('S', modifier)),
-        KeyCode::F5 => Some(csi_tilde_sequence(15, modifier)),
-        KeyCode::F6 => Some(csi_tilde_sequence(17, modifier)),
-        KeyCode::F7 => Some(csi_tilde_sequence(18, modifier)),
-        KeyCode::F8 => Some(csi_tilde_sequence(19, modifier)),
-        KeyCode::F9 => Some(csi_tilde_sequence(20, modifier)),
-        KeyCode::F10 => Some(csi_tilde_sequence(21, modifier)),
-        KeyCode::F11 => Some(csi_tilde_sequence(23, modifier)),
-        KeyCode::F12 => Some(csi_tilde_sequence(24, modifier)),
-        KeyCode::F13 => Some(csi_tilde_sequence(25, modifier)),
-        KeyCode::F14 => Some(csi_tilde_sequence(26, modifier)),
-        KeyCode::F15 => Some(csi_tilde_sequence(28, modifier)),
-        KeyCode::F16 => Some(csi_tilde_sequence(29, modifier)),
-        KeyCode::F17 => Some(csi_tilde_sequence(31, modifier)),
-        KeyCode::F18 => Some(csi_tilde_sequence(32, modifier)),
-        KeyCode::F19 => Some(csi_tilde_sequence(33, modifier)),
-        KeyCode::F20 => Some(csi_tilde_sequence(34, modifier)),
-        KeyCode::F21 => Some(csi_tilde_sequence(42, modifier)),
-        KeyCode::F22 => Some(csi_tilde_sequence(43, modifier)),
-        KeyCode::F23 => Some(csi_tilde_sequence(44, modifier)),
-        KeyCode::F24 => Some(csi_tilde_sequence(45, modifier)),
-        _ => None,
-    }
-}
-
-fn ctrl_code(code: KeyCode) -> Option<u8> {
-    let letter = match code {
-        KeyCode::KeyA => b'A',
-        KeyCode::KeyB => b'B',
-        KeyCode::KeyC => b'C',
-        KeyCode::KeyD => b'D',
-        KeyCode::KeyE => b'E',
-        KeyCode::KeyF => b'F',
-        KeyCode::KeyG => b'G',
-        KeyCode::KeyH => b'H',
-        KeyCode::KeyI => b'I',
-        KeyCode::KeyJ => b'J',
-        KeyCode::KeyK => b'K',
-        KeyCode::KeyL => b'L',
-        KeyCode::KeyM => b'M',
-        KeyCode::KeyN => b'N',
-        KeyCode::KeyO => b'O',
-        KeyCode::KeyP => b'P',
-        KeyCode::KeyQ => b'Q',
-        KeyCode::KeyR => b'R',
-        KeyCode::KeyS => b'S',
-        KeyCode::KeyT => b'T',
-        KeyCode::KeyU => b'U',
-        KeyCode::KeyV => b'V',
-        KeyCode::KeyW => b'W',
-        KeyCode::KeyX => b'X',
-        KeyCode::KeyY => b'Y',
-        KeyCode::KeyZ => b'Z',
-        KeyCode::Space | KeyCode::Digit2 => return Some(0x00),
-        KeyCode::Digit3 | KeyCode::BracketLeft => return Some(0x1b),
-        KeyCode::Digit4 | KeyCode::Backslash => return Some(0x1c),
-        KeyCode::Digit5 | KeyCode::BracketRight => return Some(0x1d),
-        KeyCode::Digit6 => return Some(0x1e),
-        KeyCode::Digit7 | KeyCode::Slash | KeyCode::Minus => return Some(0x1f),
-        KeyCode::Digit8 => return Some(0x7f),
-        _ => return None,
-    };
-    Some(letter - b'@')
 }
 
 // ── macOS app icon ────────────────────────────────────────────────────────────
