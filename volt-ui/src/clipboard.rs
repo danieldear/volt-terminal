@@ -324,7 +324,6 @@ mod platform {
     mod tests {
         use super::*;
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -345,11 +344,17 @@ mod platform {
                 // A fixed fixture script is an executable mock, not the backend
                 // evaluating clipboard bytes as a shell command.
                 fs::write(&executable, format!("#!/bin/sh\n{script}\n")).unwrap();
-                fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
                 Self { dir, executable }
             }
             fn command(&self) -> Command {
-                Command::new(&self.executable)
+                // Read the fixture through the stable system interpreter instead
+                // of exec'ing a file just written by this parallel test process.
+                // Linux can reject that exec with ETXTBSY while another test's
+                // fork still holds an inherited writable descriptor. Clipboard
+                // bytes remain raw stdin; they are never shell source.
+                let mut command = Command::new("/bin/sh");
+                command.arg(&self.executable);
+                command
             }
             fn execute(&self, input: Option<&[u8]>, cap: usize) -> Result<Vec<u8>> {
                 // Functional tests must allow loaded CI/process-startup scheduling.
