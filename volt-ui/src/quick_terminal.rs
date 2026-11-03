@@ -260,53 +260,6 @@ unsafe extern "C" fn hot_key_handler(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_uses_carbon_command_and_physical_grave() {
-        assert_eq!(GRAVE_KEYCODE, 50);
-        assert_eq!(COMMAND_MODIFIER, 256);
-        assert_eq!(EXCLUSIVE, 1);
-        assert_eq!(KEYBOARD_CLASS, 0x6b657962);
-        assert_eq!(HOT_KEY_ID_TYPE, 0x686b6964);
-    }
-
-    #[test]
-    fn only_our_pressed_hot_key_matches() {
-        assert!(matches_hot_key(KEYBOARD_CLASS, HOT_KEY_PRESSED, HOT_KEY_ID));
-        assert!(!matches_hot_key(KEYBOARD_CLASS, 6, HOT_KEY_ID));
-        assert!(!matches_hot_key(0, HOT_KEY_PRESSED, HOT_KEY_ID));
-        assert!(!matches_hot_key(
-            KEYBOARD_CLASS,
-            HOT_KEY_PRESSED,
-            EventHotKeyID {
-                signature: 0,
-                ..HOT_KEY_ID
-            }
-        ));
-        assert!(!matches_hot_key(
-            KEYBOARD_CLASS,
-            HOT_KEY_PRESSED,
-            EventHotKeyID {
-                id: 2,
-                ..HOT_KEY_ID
-            }
-        ));
-    }
-
-    #[test]
-    fn carbon_struct_layout_is_two_u32_fields() {
-        assert_eq!(std::mem::size_of::<EventHotKeyID>(), 8);
-        assert_eq!(std::mem::align_of::<EventHotKeyID>(), 4);
-        assert_eq!(std::mem::size_of::<EventTypeSpec>(), 8);
-        assert_eq!(std::mem::align_of::<EventTypeSpec>(), 4);
-        assert_eq!(std::mem::offset_of!(EventHotKeyID, id), 4);
-        assert_eq!(std::mem::offset_of!(EventTypeSpec, event_kind), 4);
-    }
-}
-
 /// Keep only the transient window out of native tab groups and AppKit restoration.
 pub(crate) fn configure_window(window: &winit::window::Window) -> anyhow::Result<()> {
     use objc::{msg_send, sel, sel_impl};
@@ -368,4 +321,51 @@ pub(crate) fn promote_window(window: &winit::window::Window) -> anyhow::Result<(
         let _: () = msg_send![native, setRestorable: objc::runtime::YES];
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_uses_carbon_command_and_physical_grave() {
+        assert_eq!(GRAVE_KEYCODE, 50);
+        assert_eq!(COMMAND_MODIFIER, 256);
+        assert_eq!(EXCLUSIVE, 1);
+        assert_eq!(KEYBOARD_CLASS, 0x6b657962);
+        assert_eq!(HOT_KEY_ID_TYPE, 0x686b6964);
+    }
+
+    #[test]
+    fn only_our_pressed_hot_key_matches() {
+        assert!(matches_hot_key(KEYBOARD_CLASS, HOT_KEY_PRESSED, HOT_KEY_ID));
+        assert!(!matches_hot_key(KEYBOARD_CLASS, 6, HOT_KEY_ID));
+        assert!(!matches_hot_key(0, HOT_KEY_PRESSED, HOT_KEY_ID));
+        assert!(!matches_hot_key(
+            KEYBOARD_CLASS,
+            HOT_KEY_PRESSED,
+            EventHotKeyID {
+                signature: 0,
+                ..HOT_KEY_ID
+            }
+        ));
+        assert!(!matches_hot_key(
+            KEYBOARD_CLASS,
+            HOT_KEY_PRESSED,
+            EventHotKeyID {
+                id: 2,
+                ..HOT_KEY_ID
+            }
+        ));
+    }
+
+    #[test]
+    fn carbon_struct_layout_is_two_u32_fields() {
+        assert_eq!(std::mem::size_of::<EventHotKeyID>(), 8);
+        assert_eq!(std::mem::align_of::<EventHotKeyID>(), 4);
+        assert_eq!(std::mem::size_of::<EventTypeSpec>(), 8);
+        assert_eq!(std::mem::align_of::<EventTypeSpec>(), 4);
+        assert_eq!(std::mem::offset_of!(EventHotKeyID, id), 4);
+        assert_eq!(std::mem::offset_of!(EventTypeSpec, event_kind), 4);
+    }
 }

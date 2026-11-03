@@ -83,6 +83,31 @@ fn main() {
                     custom_tab_bar,
                 )
                 .unwrap();
+                use native_text::accessibility::{AccessibilitySnapshot, Sensitivity};
+                bridge.publish_accessibility(AccessibilitySnapshot::terminal_output(
+                    "safe fixture",
+                    Sensitivity::KnownSafe,
+                    None,
+                ));
+                for sensitivity in [
+                    Sensitivity::Unknown,
+                    Sensitivity::NoEcho,
+                    Sensitivity::ManualSecure,
+                ] {
+                    assert!(AccessibilitySnapshot::terminal_output(
+                        "must stay private",
+                        sensitivity,
+                        None
+                    )
+                    .text()
+                    .is_empty());
+                }
+                let _ = bridge.accessibility_requested();
+                bridge.publish_accessibility(AccessibilitySnapshot::modal_summary(
+                    "Fixture",
+                    "Safe summary",
+                ));
+                bridge.invalidate_accessibility();
                 assert_ne!(unsafe { (&*view).class() }, original);
                 unsafe {
                     #[repr(C)]

@@ -215,7 +215,7 @@ fn base64(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     if bytes.len() > MAX_ENCODED_BYTES {
         return Err(Error::EncodedLimit);
     }
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return Err(Error::Base64);
     }
     let mut out = Vec::new();
@@ -325,7 +325,7 @@ fn preflight(bytes: &[u8]) -> Result<(u32, u32, usize), Error> {
                     || matches!(color, 0 | 4)
                     || length == 0
                     || length > 768
-                    || length % 3 != 0
+                    || !length.is_multiple_of(3)
                 {
                     return Err(Error::Decode);
                 }
@@ -668,8 +668,7 @@ impl Host {
         owner: Arc<std::sync::Mutex<volt_core::performer::Performer>>,
         alternate_screen: bool,
         epoch: u64,
-        row: u64,
-        column: u32,
+        position: (u64, u32),
         parameters: Vec<u8>,
         wake: impl FnOnce() + Send + 'static,
     ) {
@@ -690,6 +689,7 @@ impl Host {
                 next
             }
         };
+        let (row, column) = position;
         let anchor = Anchor {
             screen,
             row,
@@ -1121,11 +1121,18 @@ mod tests {
         );
         let mut host = Host::default();
         let (wake_tx, wake_rx) = std::sync::mpsc::channel();
-        host.request(owner.clone(), false, 1, 12, 3, payload.clone(), move || {
-            wake_tx.send(()).unwrap();
-        });
+        host.request(
+            owner.clone(),
+            false,
+            1,
+            (12, 3),
+            payload.clone(),
+            move || {
+                wake_tx.send(()).unwrap();
+            },
+        );
         assert!(!host.idle());
-        host.request(owner.clone(), true, 1, 0, 0, payload.clone(), || {
+        host.request(owner.clone(), true, 1, (0, 0), payload.clone(), || {
             panic!("second decode started")
         });
         assert_eq!(host.screens.len(), 1);
@@ -1152,7 +1159,7 @@ mod tests {
         )]));
         assert!(host.store.is_empty());
         let (wake_tx, wake_rx) = std::sync::mpsc::channel();
-        host.request(owner, false, 1, 0, 0, payload, move || {
+        host.request(owner, false, 1, (0, 0), payload, move || {
             wake_tx.send(()).unwrap();
         });
         host.reconcile(&std::collections::HashMap::new()); // removed pane/reset
@@ -1194,8 +1201,7 @@ mod tests {
             owner,
             false,
             1,
-            0,
-            0,
+            (0, 0),
             vec![0; MAX_ENCODED_BYTES + 1],
             || panic!("decoder started"),
         );

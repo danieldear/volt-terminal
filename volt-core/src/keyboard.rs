@@ -96,9 +96,18 @@ impl Key {
             "Slash" => Self::Slash,
             "Minus" => Self::Minus,
             c => {
-                let letter = c.strip_prefix("Key").filter(|l| l.len() == 1).map(|l| l.as_bytes()[0]);
-                let digit = c.strip_prefix("Digit").and_then(|d| d.parse::<u8>().ok()).filter(|d| *d <= 9);
-                let function = c.strip_prefix('F').and_then(|f| f.parse::<u8>().ok()).filter(|f| (1..=24).contains(f));
+                let letter = c
+                    .strip_prefix("Key")
+                    .filter(|l| l.len() == 1)
+                    .map(|l| l.as_bytes()[0]);
+                let digit = c
+                    .strip_prefix("Digit")
+                    .and_then(|d| d.parse::<u8>().ok())
+                    .filter(|d| *d <= 9);
+                let function = c
+                    .strip_prefix('F')
+                    .and_then(|f| f.parse::<u8>().ok())
+                    .filter(|f| (1..=24).contains(f));
                 match (letter, digit, function) {
                     (Some(l), _, _) if l.is_ascii_uppercase() => Self::Letter(l),
                     (_, Some(d), _) => Self::Digit(d),
@@ -201,9 +210,14 @@ pub fn special_sequence(
         Key::Delete => Some(csi_tilde_sequence(3, modifier)),
         Key::PageUp => Some(csi_tilde_sequence(5, modifier)),
         Key::PageDown => Some(csi_tilde_sequence(6, modifier)),
-        Key::F(n @ 1..=4) => Some(ss3_function_sequence(['P', 'Q', 'R', 'S'][n as usize - 1], modifier)),
+        Key::F(n @ 1..=4) => Some(ss3_function_sequence(
+            ['P', 'Q', 'R', 'S'][n as usize - 1],
+            modifier,
+        )),
         Key::F(n @ 5..=24) => {
-            const CODES: [u16; 20] = [15, 17, 18, 19, 20, 21, 23, 24, 25, 26, 28, 29, 31, 32, 33, 34, 42, 43, 44, 45];
+            const CODES: [u16; 20] = [
+                15, 17, 18, 19, 20, 21, 23, 24, 25, 26, 28, 29, 31, 32, 33, 34, 42, 43, 44, 45,
+            ];
             Some(csi_tilde_sequence(CODES[n as usize - 5], modifier))
         }
         _ => None,
@@ -237,14 +251,38 @@ mod tests {
         assert_eq!(k("Keyboard"), Key::Other);
         assert_eq!(ctrl_code(k("KeyC")), Some(3));
         assert_eq!(ctrl_code(k("BracketLeft")), Some(0x1b));
-        assert_eq!(special_sequence(k("Enter"), false, true, false, false), Some(b"\x1b\r".to_vec()));
-        assert_eq!(special_sequence(k("ArrowUp"), false, false, false, false), Some(b"\x1b[A".to_vec()));
-        assert_eq!(special_sequence(k("ArrowUp"), false, false, false, true), Some(b"\x1bOA".to_vec()));
-        assert_eq!(special_sequence(k("ArrowUp"), true, false, false, true), Some(b"\x1b[1;2A".to_vec()));
-        assert_eq!(special_sequence(k("Tab"), true, false, false, false), Some(b"\x1b[Z".to_vec()));
-        assert_eq!(special_sequence(k("F5"), false, false, false, false), Some(b"\x1b[15~".to_vec()));
-        assert_eq!(special_sequence(k("F24"), false, false, true, false), Some(b"\x1b[45;5~".to_vec()));
-        assert_eq!(special_sequence(k("KeyA"), false, false, false, false), None);
+        assert_eq!(
+            special_sequence(k("Enter"), false, true, false, false),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            special_sequence(k("ArrowUp"), false, false, false, false),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            special_sequence(k("ArrowUp"), false, false, false, true),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            special_sequence(k("ArrowUp"), true, false, false, true),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        assert_eq!(
+            special_sequence(k("Tab"), true, false, false, false),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(
+            special_sequence(k("F5"), false, false, false, false),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            special_sequence(k("F24"), false, false, true, false),
+            Some(b"\x1b[45;5~".to_vec())
+        );
+        assert_eq!(
+            special_sequence(k("KeyA"), false, false, false, false),
+            None
+        );
     }
     #[test]
     fn bounded_stack_set_modes_and_underflow() {

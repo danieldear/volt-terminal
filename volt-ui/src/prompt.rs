@@ -185,7 +185,6 @@ impl TextPrompt {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

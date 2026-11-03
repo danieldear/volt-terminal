@@ -313,8 +313,8 @@ mod tests {
     }
     #[test]
     fn prompt_hooks_report_failure_through_real_pty() {
-        use std::time::{Duration, Instant};
         use crate::{events::CoreEvent, pty::Pty};
+        use std::time::{Duration, Instant};
         let home = root().unwrap().join("pty-home");
         std::fs::create_dir_all(&home).unwrap();
         let exe = home.join("stub");

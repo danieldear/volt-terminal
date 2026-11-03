@@ -7568,8 +7568,7 @@ impl ApplicationHandler<VoltEvent> for App {
                         owner,
                         alt,
                         epoch,
-                        row,
-                        column,
+                        (row, column),
                         parameters,
                         move || {
                             let _ = proxy.send_event(VoltEvent::PtyData);
@@ -7993,8 +7992,7 @@ impl ApplicationHandler<VoltEvent> for App {
                     owner,
                     alt,
                     epoch,
-                    row,
-                    column,
+                    (row, column),
                     parameters,
                     move || {
                         let _ = proxy.send_event(VoltEvent::PtyData);
@@ -8165,9 +8163,6 @@ fn char_select_class(c: char) -> u8 {
     }
 }
 
-/// Upper bound for a single user-initiated paste into the terminal or editor.
-#[cfg(target_os = "macos")]
-
 /// Read at most one byte beyond the cap. On overflow, kill and reap the child
 /// before returning, so a large clipboard never grows memory without bound.
 #[cfg(target_os = "macos")]
@@ -8211,7 +8206,6 @@ fn read_bounded_command_output(
 
 /// Remove any embedded bracketed-paste terminator so pasted content cannot
 /// break out of the ESC[200~ … ESC[201~ envelope.
-#[cfg(target_os = "macos")]
 fn strip_bracketed_paste_end(data: &[u8]) -> Vec<u8> {
     const END: &[u8] = b"\x1b[201~";
     let mut out = Vec::with_capacity(data.len());
