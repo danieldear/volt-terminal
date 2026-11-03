@@ -7,7 +7,8 @@ of keyboard layout. No event taps or Accessibility permission are used.
 
 ## Opt in
 
-Add to `config.toml`, then reload settings or restart Volt:
+Enable **Global quick terminal (macOS)** in Settings, or add the following to
+`config.toml` and reload settings/restart Volt:
 
 ```toml
 [quick_terminal]
@@ -15,7 +16,8 @@ enabled = true
 ```
 
 Omitted or false means no global key registration and normal window lifecycle
-is unchanged. This setting is macOS-only in effect. No settings UI is added.
+is unchanged. The Settings toggle writes this same configuration; the global
+shortcut is macOS-only in effect.
 
 ## Host integration
 
