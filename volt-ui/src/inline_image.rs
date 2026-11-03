@@ -221,7 +221,7 @@ fn base64(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     out.try_reserve_exact(bytes.len() / 4 * 3)
         .map_err(|_| Error::Allocation)?;
-    for (i, q) in bytes.chunks_exact(4).enumerate() {
+    for (i, q) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let a = sextet(q[0])?;
         let b = sextet(q[1])?;
         let last = i == bytes.len() / 4 - 1;

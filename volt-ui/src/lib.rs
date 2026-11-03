@@ -29,6 +29,7 @@ mod keybindings;
 mod links;
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 mod shell_integration;
 
 pub mod settings;

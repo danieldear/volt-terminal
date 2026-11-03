@@ -3116,9 +3116,14 @@ impl MainState {
         // Process-wide IDs prevent a late result matching a newly created window
         // if the native platform recycles a WindowId after close.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let operation = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .ok()?;
+        let mut current = NEXT.load(Ordering::Relaxed);
+        let operation = loop {
+            let next = current.checked_add(1)?;
+            match NEXT.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(previous) => break previous,
+                Err(observed) => current = observed,
+            }
+        };
         self.clipboard_flight = Some(ClipboardFlight {
             operation,
             identity: self.clipboard_identity(),
@@ -4052,6 +4057,7 @@ impl MainState {
 }
 
 /// Detach only shortcut ownership; never remove/drop the live terminal state.
+#[cfg(any(target_os = "macos", test))]
 fn take_quick_window_for_promotion<'a, K: Eq + std::hash::Hash, V>(
     windows: &'a mut HashMap<K, V>,
     quick_window: &mut Option<K>,
