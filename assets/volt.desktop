@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Volt
+Comment=Fast, customizable terminal with project tasks
+Exec=volt
+TryExec=volt
+Icon=volt
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;
+StartupNotify=true

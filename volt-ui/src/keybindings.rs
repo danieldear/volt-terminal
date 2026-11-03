@@ -168,3 +168,451 @@ mod tests {
         }
     }
 }
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use volt_config::keybindings::{AdvancedBindingsConfig, BindingTarget};
+
+#[derive(Default)]
+struct SequenceNode {
+    edges: HashMap<(KeyCode, u8), usize>,
+    target: Option<CompiledTarget>,
+}
+#[derive(Clone, Copy)]
+enum CompiledTarget {
+    Action(Action),
+    Table(usize),
+}
+
+/// Compile once on config load. No strings, parsing, or allocation during dispatch.
+pub struct AdvancedBindings {
+    nodes: Vec<SequenceNode>,
+    timeout: Duration,
+}
+impl AdvancedBindings {
+    pub fn compile(config: &AdvancedBindingsConfig) -> Result<Self, String> {
+        config.validate()?;
+        let roots: HashMap<_, _> = config
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.name.as_str(), i + 1))
+            .collect();
+        let mut nodes: Vec<_> = (0..=config.tables.len())
+            .map(|_| SequenceNode::default())
+            .collect();
+        for (root, bindings) in std::iter::once(&config.bindings)
+            .chain(config.tables.iter().map(|t| &t.bindings))
+            .enumerate()
+        {
+            for binding in bindings {
+                let mut node = root;
+                for chord in &binding.sequence {
+                    let key = (key_code(&chord.key), chord.modifiers);
+                    node = if let Some(next) = nodes[node].edges.get(&key) {
+                        *next
+                    } else {
+                        let next = nodes.len();
+                        nodes.push(SequenceNode::default());
+                        nodes[node].edges.insert(key, next);
+                        next
+                    };
+                }
+                nodes[node].target = Some(match &binding.target {
+                    BindingTarget::Action(a) => CompiledTarget::Action(*a),
+                    BindingTarget::Table(name) => CompiledTarget::Table(roots[name.as_str()]),
+                });
+            }
+        }
+        Ok(Self {
+            nodes,
+            timeout: Duration::from_millis(config.timeout_ms),
+        })
+    }
+}
+
+/// Change focus_epoch whenever the focused pane/window/surface changes, even
+/// between two eligible terminals. Set eligible=false for modal/text/IME input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchContext {
+    pub focus_epoch: u64,
+    pub eligible: bool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    Escape,
+    Mismatch,
+    Timeout,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchResult {
+    /// Only this result permits legacy bindings / normal terminal input.
+    PassThrough,
+    Pending,
+    Action(Action),
+    /// The current press AND prior prefix are consumed; never replay either.
+    Cancelled(CancelReason),
+    /// Auto-repeat of a consumed press must not advance the sequence.
+    Consumed,
+}
+impl DispatchResult {
+    /// Host convenience for gating fallback; retained for integration callers.
+    #[allow(dead_code)] // The current internal host matches variants directly.
+    pub fn is_consumed(self) -> bool {
+        self != Self::PassThrough
+    }
+}
+
+/// Owns compiled bindings so reload cannot leave stale trie indices.
+/// Tables are exclusive, one-shot, non-stacking; table-to-table activation replaces
+/// the active table. Completion, mismatch, timeout, Escape, or reset returns idle.
+pub struct KeyboardDispatcher {
+    bindings: AdvancedBindings,
+    node: usize,
+    deadline: Option<Instant>,
+    context: Option<DispatchContext>,
+}
+impl KeyboardDispatcher {
+    pub fn new(bindings: AdvancedBindings) -> Self {
+        Self {
+            bindings,
+            node: 0,
+            deadline: None,
+            context: None,
+        }
+    }
+    pub fn reset(&mut self) {
+        self.node = 0;
+        self.deadline = None;
+    }
+    pub fn replace_bindings(&mut self, bindings: AdvancedBindings) {
+        self.reset();
+        self.bindings = bindings;
+    }
+    /// Call on focus/modal transitions, not just on the next key event.
+    pub fn set_context(&mut self, context: DispatchContext) {
+        if self.context != Some(context) || !context.eligible {
+            self.reset();
+        }
+        self.context = Some(context);
+    }
+    /// O(1), None while idle: hosts need no idle polling or periodic timer.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+    /// O(1). Expiration discards the prefix without producing input or actions.
+    pub fn expire(&mut self, now: Instant) -> bool {
+        if self.deadline.is_some_and(|d| now >= d) {
+            self.reset();
+            true
+        } else {
+            false
+        }
+    }
+    /// Feed key presses only. The host suppresses release events for consumed
+    /// presses; auto-repeat may trigger single-step root actions, never sequences.
+    pub fn dispatch(
+        &mut self,
+        key: PhysicalKey,
+        modifiers: u8,
+        repeat: bool,
+        now: Instant,
+        context: DispatchContext,
+    ) -> DispatchResult {
+        self.set_context(context);
+        if !context.eligible {
+            return DispatchResult::PassThrough;
+        }
+        if self.expire(now) {
+            return DispatchResult::Cancelled(CancelReason::Timeout);
+        }
+        let active = self.deadline.is_some();
+        if active && key == PhysicalKey::Code(KeyCode::Escape) {
+            self.reset();
+            return DispatchResult::Cancelled(CancelReason::Escape);
+        }
+        if active && repeat {
+            return DispatchResult::Consumed;
+        }
+        let next = match key {
+            PhysicalKey::Code(code) => self.bindings.nodes[self.node]
+                .edges
+                .get(&(code, modifiers))
+                .copied(),
+            _ => None,
+        };
+        let Some(next) = next else {
+            if active {
+                self.reset();
+                return DispatchResult::Cancelled(CancelReason::Mismatch);
+            }
+            return DispatchResult::PassThrough;
+        };
+        match self.bindings.nodes[next].target {
+            Some(CompiledTarget::Action(action)) => {
+                self.reset();
+                DispatchResult::Action(action)
+            }
+            target => {
+                // A repeat must not start a prefix or enter a table from idle.
+                if repeat {
+                    return DispatchResult::Consumed;
+                }
+                self.node = match target {
+                    Some(CompiledTarget::Table(root)) => root,
+                    _ => next,
+                };
+                self.deadline = Some(now + self.bindings.timeout);
+                DispatchResult::Pending
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod advanced_tests {
+    use super::*;
+    use volt_config::keybindings::{KeyTable, SequenceBinding};
+    const CTX: DispatchContext = DispatchContext {
+        focus_epoch: 1,
+        eligible: true,
+    };
+    fn binding(keys: &[&str], target: BindingTarget) -> SequenceBinding {
+        SequenceBinding {
+            sequence: keys
+                .iter()
+                .map(|s| s.to_string().try_into().unwrap())
+                .collect(),
+            target,
+        }
+    }
+    fn engine() -> KeyboardDispatcher {
+        let c = AdvancedBindingsConfig {
+            timeout_ms: 100,
+            bindings: vec![
+                binding(&["ctrl+k", "c"], BindingTarget::Action(Action::Copy)),
+                binding(&["ctrl+p"], BindingTarget::Table("pane".into())),
+                binding(&["ctrl+f"], BindingTarget::Action(Action::Find)),
+            ],
+            tables: vec![KeyTable {
+                name: "pane".into(),
+                bindings: vec![
+                    binding(&["h"], BindingTarget::Action(Action::FocusLeft)),
+                    binding(&["j", "j"], BindingTarget::Action(Action::FocusDown)),
+                    binding(&["p"], BindingTarget::Table("pane".into())),
+                ],
+            }],
+        };
+        KeyboardDispatcher::new(AdvancedBindings::compile(&c).unwrap())
+    }
+    fn press(d: &mut KeyboardDispatcher, k: KeyCode, m: u8, now: Instant) -> DispatchResult {
+        d.dispatch(PhysicalKey::Code(k), m, false, now, CTX)
+    }
+    #[test]
+    fn sequence_exact_modifiers_and_mismatch_never_retry_root() {
+        let mut d = engine();
+        let now = Instant::now();
+        assert_eq!(
+            press(&mut d, KeyCode::KeyK, 5, now),
+            DispatchResult::PassThrough
+        );
+        assert_eq!(
+            press(&mut d, KeyCode::KeyK, 1, now),
+            DispatchResult::Pending
+        );
+        assert_eq!(
+            press(&mut d, KeyCode::KeyC, 0, now),
+            DispatchResult::Action(Action::Copy)
+        );
+        assert!(d.deadline().is_none());
+        press(&mut d, KeyCode::KeyK, 1, now);
+        assert_eq!(
+            press(&mut d, KeyCode::KeyC, 1, now),
+            DispatchResult::Cancelled(CancelReason::Mismatch)
+        );
+        press(&mut d, KeyCode::KeyK, 1, now);
+        assert_eq!(
+            press(&mut d, KeyCode::KeyF, 1, now),
+            DispatchResult::Cancelled(CancelReason::Mismatch)
+        );
+        assert_eq!(
+            press(&mut d, KeyCode::KeyF, 1, now),
+            DispatchResult::Action(Action::Find)
+        );
+    }
+    #[test]
+    fn tables_are_exclusive_one_shot_and_replace_without_stack() {
+        let mut d = engine();
+        let now = Instant::now();
+        assert_eq!(
+            press(&mut d, KeyCode::KeyH, 0, now),
+            DispatchResult::PassThrough
+        );
+        assert_eq!(
+            press(&mut d, KeyCode::KeyP, 1, now),
+            DispatchResult::Pending
+        );
+        assert_eq!(
+            press(&mut d, KeyCode::KeyP, 0, now),
+            DispatchResult::Pending
+        );
+        assert_eq!(
+            press(&mut d, KeyCode::KeyH, 0, now),
+            DispatchResult::Action(Action::FocusLeft)
+        );
+        assert_eq!(
+            press(&mut d, KeyCode::KeyH, 0, now),
+            DispatchResult::PassThrough
+        );
+        press(&mut d, KeyCode::KeyP, 1, now);
+        assert_eq!(
+            press(&mut d, KeyCode::KeyJ, 0, now),
+            DispatchResult::Pending
+        );
+        assert_eq!(
+            press(&mut d, KeyCode::KeyJ, 0, now),
+            DispatchResult::Action(Action::FocusDown)
+        );
+        press(&mut d, KeyCode::KeyP, 1, now);
+        assert_eq!(
+            press(&mut d, KeyCode::KeyF, 1, now),
+            DispatchResult::Cancelled(CancelReason::Mismatch)
+        );
+    }
+    #[test]
+    fn timeout_boundary_escape_and_reset() {
+        let mut d = engine();
+        let now = Instant::now();
+        assert!(!d.expire(now));
+        press(&mut d, KeyCode::KeyK, 1, now);
+        assert_eq!(d.deadline(), Some(now + Duration::from_millis(100)));
+        assert!(!d.expire(now + Duration::from_millis(99)));
+        assert_eq!(
+            press(&mut d, KeyCode::KeyC, 0, now + Duration::from_millis(100)),
+            DispatchResult::Cancelled(CancelReason::Timeout)
+        );
+        press(&mut d, KeyCode::KeyP, 1, now);
+        assert_eq!(
+            press(&mut d, KeyCode::Escape, 15, now),
+            DispatchResult::Cancelled(CancelReason::Escape)
+        );
+        assert_eq!(
+            press(&mut d, KeyCode::Escape, 0, now),
+            DispatchResult::PassThrough
+        );
+        press(&mut d, KeyCode::KeyK, 1, now);
+        assert!(d.expire(now + Duration::from_millis(100)));
+        assert_eq!(
+            press(&mut d, KeyCode::KeyC, 0, now),
+            DispatchResult::PassThrough
+        );
+        press(&mut d, KeyCode::KeyK, 1, now);
+        d.reset();
+        assert!(d.deadline().is_none());
+    }
+    #[test]
+    fn focus_modal_reload_repeat_and_unidentified_keys() {
+        let mut d = engine();
+        let now = Instant::now();
+        press(&mut d, KeyCode::KeyK, 1, now);
+        assert_eq!(
+            d.dispatch(
+                PhysicalKey::Code(KeyCode::KeyC),
+                0,
+                false,
+                now,
+                DispatchContext {
+                    focus_epoch: 2,
+                    ..CTX
+                }
+            ),
+            DispatchResult::PassThrough
+        );
+        press(&mut d, KeyCode::KeyP, 1, now);
+        assert_eq!(
+            d.dispatch(
+                PhysicalKey::Code(KeyCode::KeyH),
+                0,
+                false,
+                now,
+                DispatchContext {
+                    eligible: false,
+                    ..CTX
+                }
+            ),
+            DispatchResult::PassThrough
+        );
+        assert!(d.deadline().is_none());
+        d.set_context(CTX);
+        assert_eq!(
+            d.dispatch(PhysicalKey::Code(KeyCode::KeyK), 1, true, now, CTX),
+            DispatchResult::Consumed
+        );
+        assert!(d.deadline().is_none());
+        press(&mut d, KeyCode::KeyK, 1, now);
+        assert_eq!(
+            d.dispatch(PhysicalKey::Code(KeyCode::KeyC), 0, true, now, CTX),
+            DispatchResult::Consumed
+        );
+        assert_eq!(
+            press(&mut d, KeyCode::KeyC, 0, now),
+            DispatchResult::Action(Action::Copy)
+        );
+        press(&mut d, KeyCode::KeyK, 1, now);
+        assert_eq!(
+            d.dispatch(
+                PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified),
+                0,
+                false,
+                now,
+                CTX
+            ),
+            DispatchResult::Cancelled(CancelReason::Mismatch)
+        );
+        press(&mut d, KeyCode::KeyK, 1, now);
+        d.replace_bindings(AdvancedBindings::compile(&AdvancedBindingsConfig::default()).unwrap());
+        assert_eq!(
+            press(&mut d, KeyCode::KeyC, 0, now),
+            DispatchResult::PassThrough
+        );
+    }
+    #[test]
+    fn compile_revalidates_programmatic_config() {
+        assert!(!DispatchResult::PassThrough.is_consumed());
+        assert!(DispatchResult::Cancelled(CancelReason::Mismatch).is_consumed());
+        assert!(DispatchResult::Action(Action::Unbind).is_consumed());
+        let c = AdvancedBindingsConfig {
+            timeout_ms: 0,
+            ..Default::default()
+        };
+        assert!(AdvancedBindings::compile(&c).is_err());
+    }
+    #[test]
+    fn shared_prefix_siblings_and_progress_deadline() {
+        let config = AdvancedBindingsConfig {
+            timeout_ms: 100,
+            bindings: vec![
+                binding(&["ctrl+k", "c", "a"], BindingTarget::Action(Action::Copy)),
+                binding(&["ctrl+k", "c", "b"], BindingTarget::Action(Action::Paste)),
+            ],
+            ..Default::default()
+        };
+        let mut d = KeyboardDispatcher::new(AdvancedBindings::compile(&config).unwrap());
+        let now = Instant::now();
+        assert_eq!(
+            press(&mut d, KeyCode::KeyK, 17, now),
+            DispatchResult::PassThrough
+        );
+        press(&mut d, KeyCode::KeyK, 1, now);
+        let later = now + Duration::from_millis(90);
+        assert_eq!(
+            press(&mut d, KeyCode::KeyC, 0, later),
+            DispatchResult::Pending
+        );
+        assert_eq!(d.deadline(), Some(later + Duration::from_millis(100)));
+        assert_eq!(
+            press(&mut d, KeyCode::KeyB, 0, later),
+            DispatchResult::Action(Action::Paste)
+        );
+    }
+}

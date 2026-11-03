@@ -1252,7 +1252,7 @@ mod tests {
             for i in 0..3000 {
                 text.push_str(&format!("line {i}\r\n"));
             }
-            vte::Parser::new().advance(&mut *p, text.as_bytes());
+            volt_core::parser::Parser::new().advance(&mut *p, text.as_bytes());
             assert!(
                 p.grid.scrollback_len() > 2000,
                 "fixture must exceed the old limit"
@@ -1269,7 +1269,7 @@ mod tests {
         let input = f.input("hit", Scope::Terminal);
         let mut p = input.performer.lock().unwrap();
         let text: String = (0..100).map(|i| format!("hit {i}\r\n")).collect();
-        vte::Parser::new().advance(&mut *p, text.as_bytes());
+        volt_core::parser::Parser::new().advance(&mut *p, text.as_bytes());
         let total = p.grid.scrollback_len() + p.grid.rows;
         let (rows, truncated) = terminal_snapshot(&p.grid, p.grid.cols * 2, || false);
         assert!(truncated);
@@ -1301,7 +1301,7 @@ mod tests {
     #[test]
     fn terminal_snapshot_keeps_one_oversized_newest_line() {
         let mut p = Performer::new(40, 1);
-        vte::Parser::new().advance(&mut p, b"newest long line");
+        volt_core::parser::Parser::new().advance(&mut p, b"newest long line");
         let (rows, truncated) = terminal_snapshot(&p.grid, 1, || false);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 0);
@@ -1316,7 +1316,7 @@ mod tests {
         {
             let mut p = input.performer.lock().unwrap();
             let text: String = (0..100).map(|i| format!("hit {i}\r\n")).collect();
-            vte::Parser::new().advance(&mut *p, text.as_bytes());
+            volt_core::parser::Parser::new().advance(&mut *p, text.as_bytes());
         }
         let o = search(input, &AtomicU64::new(0), 0);
         assert_eq!(o.rows.len(), OUTPUT_ROWS);

@@ -31,7 +31,7 @@ fn seeded_resize_edit_unicode_history_stress() {
         };
         let mut p = Performer::new(80, 24);
         p.set_scrollback_limit(128);
-        let mut parser = vte::Parser::new();
+        let mut parser = volt_core::parser::Parser::new();
         for step in 0..5000 {
             let n = next();
             match n % 12 {
@@ -80,7 +80,7 @@ fn seeded_resize_edit_unicode_history_stress() {
 #[test]
 fn malformed_stream_stays_bounded_and_reset_recovers() {
     let mut p = Performer::new(0, 0);
-    let mut parser = vte::Parser::new();
+    let mut parser = volt_core::parser::Parser::new();
     let stream = b"\xff\xfe\x1b[999999999999999999999999999;1H\x1bPignored\x1b\\\x1b]52;c;no-clipboard-access\x07\x18";
     for _ in 0..1000 {
         parser.advance(&mut p, stream);

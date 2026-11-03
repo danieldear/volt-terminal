@@ -1,5 +1,5 @@
+use volt_core::parser::Parser;
 use volt_core::{events::CoreEvent, performer::Performer};
-use vte::Parser;
 
 fn feed(p: &mut Performer, bytes: &[u8]) {
     Parser::new().advance(p, bytes);

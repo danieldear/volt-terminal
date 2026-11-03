@@ -1,7 +1,7 @@
 //! Preferences and onboarding state. No terminal output or credentials are exposed.
 use std::path::PathBuf;
 use volt_config::{
-    config::{PromptMode, WorkspaceLayout},
+    config::{ClipboardWritePolicy, PromptMode, WorkspaceLayout},
     preferences::Preferences,
     Config, ThemeRegistry,
 };
@@ -360,6 +360,8 @@ impl Settings {
             ],
             5 => shortcut_rows(c),
             6 => vec![
+                toggle("safe_paste", "Review unsafe paste", c.clipboard.confirm_unsafe_paste,
+                    "Review multiline shell input and control characters before sending"),
                 row(
                     "secure",
                     "Secure keyboard entry",
@@ -377,12 +379,20 @@ impl Settings {
                 row(
                     "clipboard",
                     "Terminal clipboard requests",
-                    "Disabled",
-                    "OSC 52 is not implemented; ordinary copy/paste remains available",
-                    Action(Outcome::Redraw),
+                    match c.clipboard.osc52_write {
+                        ClipboardWritePolicy::Ask => "Ask",
+                        ClipboardWritePolicy::Deny => "Deny",
+                        ClipboardWritePolicy::Allow => "Allow",
+                    },
+                    "OSC 52 writes only; reading your clipboard is never permitted",
+                    Choice(vec!["Ask".into(), "Deny".into(), "Allow".into()]),
                 ),
             ],
             7 => vec![
+                toggle("quick_terminal", "Global quick terminal (macOS)", c.quick_terminal.enabled,
+                    "Cmd+grave shows a persistent terminal; restart Volt after changing"),
+                toggle("inline_images", "Inline PNG images", c.inline_images.enabled,
+                    "Opt-in bounded OSC 1337 PNG images; no files, downloads or animations"),
                 toggle("restore", "Restore workspace layout", c.session.restore,
                     "Next launch: tabs, splits and local folders only; no commands or output. Custom tabs only"),
                 row(
@@ -1177,6 +1187,17 @@ impl Settings {
                         PromptMode::Existing
                     }
                 }
+                "quick_terminal" => c.quick_terminal.enabled = v == "On",
+                "inline_images" => c.inline_images.enabled = v == "On",
+                "safe_paste" => c.clipboard.confirm_unsafe_paste = v == "On",
+                "clipboard" => {
+                    c.clipboard.osc52_write = match v {
+                        "Ask" => ClipboardWritePolicy::Ask,
+                        "Deny" => ClipboardWritePolicy::Deny,
+                        "Allow" => ClipboardWritePolicy::Allow,
+                        _ => return Err(error()),
+                    }
+                }
                 "restore" => c.session.restore = v == "On",
                 "integration" => c.shell.integration = v == "On",
                 "workspace_enabled" => c.workspace.enabled = v == "On",
@@ -1227,10 +1248,16 @@ impl Settings {
                 self.draft.appearance.divider_opacity = defaults.appearance.divider_opacity;
             }
             3 => self.draft.workspace = defaults.workspace,
-            5 => self.draft.keybindings.clear(),
+            5 => {
+                self.draft.keybindings.clear();
+                self.draft.advanced_keybindings = defaults.advanced_keybindings;
+            }
+            6 => self.draft.clipboard = defaults.clipboard,
             7 => {
                 self.draft.editor = defaults.editor;
                 self.draft.session = defaults.session;
+                self.draft.quick_terminal = defaults.quick_terminal;
+                self.draft.inline_images = defaults.inline_images;
             }
             _ => {}
         }
@@ -1280,6 +1307,10 @@ fn shortcut_rows(c: &Config) -> Vec<Row> {
         (A::FocusRight, "Focus right", "super+alt+right"),
         (A::FocusUp, "Focus up", "super+alt+up"),
         (A::FocusDown, "Focus down", "super+alt+down"),
+        (A::MovePaneLeft, "Move pane left", "Unassigned"),
+        (A::MovePaneRight, "Move pane right", "Unassigned"),
+        (A::MovePaneUp, "Move pane up", "Unassigned"),
+        (A::MovePaneDown, "Move pane down", "Unassigned"),
         (
             A::SelectCommandOutput,
             "Select last command output",
@@ -1387,6 +1418,27 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn clipboard_security_controls_edit_draft_without_saving() {
+        let mut s = settings();
+        s.section(6);
+        let initial = s.initial.clipboard.clone();
+        assert_eq!(s.assign("safe_paste", "Off"), Outcome::Preview);
+        assert!(!s.draft.clipboard.confirm_unsafe_paste);
+        assert_eq!(s.assign("clipboard", "Deny"), Outcome::Preview);
+        assert_eq!(s.draft.clipboard.osc52_write, ClipboardWritePolicy::Deny);
+        assert_eq!(s.initial.clipboard.osc52_write, initial.osc52_write);
+        assert_eq!(
+            s.initial.clipboard.confirm_unsafe_paste,
+            initial.confirm_unsafe_paste
+        );
+        s.assign("clipboard", "Invalid");
+        assert_eq!(s.draft.clipboard.osc52_write, ClipboardWritePolicy::Deny);
+        s.reset_page();
+        assert_eq!(s.draft.clipboard.osc52_write, ClipboardWritePolicy::Ask);
+        assert!(s.draft.clipboard.confirm_unsafe_paste);
+    }
+
     #[test]
     fn toolkit_toggles_follow_visible_rows_and_draft_changes() {
         let mut s = settings();
@@ -1642,7 +1694,7 @@ mod tests {
     #[test]
     fn all_default_shortcuts_use_native_names() {
         let rows = shortcut_rows(&Config::default());
-        assert_eq!(rows.len(), 31);
+        assert_eq!(rows.len(), 35);
         if cfg!(target_os = "macos") {
             assert!(rows
                 .iter()

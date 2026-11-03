@@ -218,6 +218,14 @@ fn default_workspace_enabled() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
+    pub quick_terminal: QuickTerminalConfig,
+    #[serde(default)]
+    pub inline_images: InlineImagesConfig,
+    #[serde(default)]
+    pub advanced_keybindings: crate::keybindings::AdvancedBindingsConfig,
+    #[serde(default)]
+    pub clipboard: ClipboardConfig,
+    #[serde(default)]
     pub session: SessionConfig,
     #[serde(default)]
     pub setup: SetupConfig,
@@ -240,6 +248,46 @@ pub struct Config {
     #[serde(default)]
     pub editor: EditorConfig,
 }
+/// PNG terminal-output decoding is opt-in; filenames are never opened.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InlineImagesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardWritePolicy {
+    #[default]
+    Ask,
+    Deny,
+    Allow,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardConfig {
+    #[serde(default)]
+    pub osc52_write: ClipboardWritePolicy,
+    #[serde(default = "default_paste_confirmation")]
+    pub confirm_unsafe_paste: bool,
+}
+fn default_paste_confirmation() -> bool {
+    true
+}
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            osc52_write: ClipboardWritePolicy::Ask,
+            confirm_unsafe_paste: true,
+        }
+    }
+}
+/// macOS global quick terminal. Disabled unless explicitly enabled in TOML.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct QuickTerminalConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionConfig {
     /// Save layout only, never output or commands. Opt-in and off by default.
@@ -738,6 +786,19 @@ fn with_theme_line(text: &str, id: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quick_terminal_is_opt_in_and_round_trips() {
+        let omitted: super::Config = toml::from_str("").unwrap();
+        assert!(!omitted.quick_terminal.enabled);
+        let empty: super::Config = toml::from_str("[quick_terminal]\n").unwrap();
+        assert!(!empty.quick_terminal.enabled);
+        let enabled: super::Config = toml::from_str("[quick_terminal]\nenabled = true\n").unwrap();
+        assert!(enabled.quick_terminal.enabled);
+        let round_trip: super::Config =
+            toml::from_str(&toml::to_string(&enabled).unwrap()).unwrap();
+        assert!(round_trip.quick_terminal.enabled);
+    }
+
     #[test]
     fn partial_shell_configuration_preserves_login_default() {
         let shell: ShellConfig = toml::from_str("integration = true\nprompt = 'meow'").unwrap();

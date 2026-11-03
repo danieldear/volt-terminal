@@ -480,3 +480,12 @@ DEC 2026 synchronized output, negotiated extended keyboard input, command-output
 selection and opt-in workspace layout restoration are included in v0.1.14. See
 [behavior, boundaries and validation](docs/terminal-compatibility.md). Linux
 clipboard/desktop work is deferred pending a test system.
+
+## Product-readiness work in progress
+
+The current source branch adds clipboard safety and permissions, multi-key
+shortcuts, live pane movement, Linux clipboard/desktop integration, and opt-in
+inline PNGs/quick terminal. The conservative macOS accessibility bridge exposes
+read-only output; full actionable UI accessibility remains unfinished. These
+changes are not in the v0.1.16 release. See the [implementation and acceptance
+status](docs/product-readiness.md) before relying on unreleased features.

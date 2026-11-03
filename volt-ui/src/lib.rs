@@ -29,6 +29,7 @@ mod keybindings;
 mod links;
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 mod shell_integration;
 
 pub mod settings;
@@ -36,4 +37,11 @@ mod shell_startup;
 
 mod keyboard_protocol;
 
+mod clipboard;
+mod clipboard_safety;
 mod session;
+
+pub mod inline_image;
+
+#[cfg(target_os = "macos")]
+mod quick_terminal;

@@ -3,7 +3,9 @@ pub mod pipeline;
 pub mod renderer;
 
 pub use atlas::{AtlasRegion, CpuAtlas};
-pub use renderer::{InspectorInfo, PaneDivider, PromptOverlay, Renderer, TabEntry, TabStatus};
+pub use renderer::{
+    InlineImage, InspectorInfo, PaneDivider, PromptOverlay, Renderer, TabEntry, TabStatus,
+};
 pub mod symbols;
 
 pub mod workspace_card;

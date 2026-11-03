@@ -11,6 +11,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 ui-gpu-prototype = ["volt-renderer/ui-gpu-prototype"]
 
 [dependencies]
+png = "0.17"
 serde = { workspace = true }
 serde_json = "1"
 toml = "0.8"
@@ -35,4 +36,4 @@ objc = "0.2"
 muda = { version = "0.17", default-features = false }
 
 [dev-dependencies]
-vte = "0.15"
+vte = { version = "0.15", default-features = false }
